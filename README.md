@@ -2,7 +2,8 @@
 
 Holds one Flipper Zero app: **[universal_card_reader](universal_card_reader/)** —
 reads both NFC 13.56 MHz and LF RFID 125 kHz cards in a single FAP by alternating
-timed phases.
+timed phases. Contactless EMV bank cards get a full application-layer read (AID,
+PAN, expiry, cardholder name, transaction log), not just a UID.
 
 Build and flash from that directory, not from here:
 
