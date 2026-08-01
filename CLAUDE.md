@@ -15,7 +15,7 @@ a card is found, with an animated scanning UI.
 
 ## Verified firmware / SDK — re-check before you build (STEP 0)
 
-Last verified **2026-08-01**. Confirm these still hold (`device_info` on the
+Last verified **2026-08-02**. Confirm these still hold (`device_info` on the
 device, `api_symbols.csv` + `components.json` for the SDK) and update this block
 if anything changed. Do not skip: a mismatch here caused a wedged device and a
 crash that `APPCHK` did not catch.
@@ -35,6 +35,12 @@ ABI-identical.** Known drift, both of which this app is written to survive:
   is 15 not 12, `NfcProtocolInvalid` is 16 not 13.
 - `LFRFIDProtocol`: Momentum has 26 entries vs 24 and inserts `Indala224`
   mid-enum, shifting later ids.
+- `MfClassicPollerMode`: Momentum inserts `MfClassicPollerModeDictAttackCUID`
+  at id 3 → `DictAttackEnhanced` shifts. This app survives it by using read
+  mode only (`MfClassicPollerModeRead`, id 0) and never requesting a dict attack.
+- `MfClassicPollerEventDataKeyRequest`: Momentum inserts `key_type` before
+  `key_provided`. This app survives it by never touching `key_request_data` —
+  it is only used by the dict-attack modes above.
 
 Everything else checked (`nfc_scanner.h`, `nfc_generic_event.h`, the poller
 headers, `nfc_device.h`) is identical or additive-only.
@@ -45,7 +51,9 @@ headers, `nfc_device.h`) is identical or additive-only.
 universal_card_reader/          <- the app; run ufbt HERE, not at repo root
   application.fam              appid universal_card_reader, entry universal_card_reader_app,
                                Tools category, stack_size 8*1024
-  universal_card_reader.c      whole app, single file (~730 lines)
+  universal_card_reader.c      app/phase machinery, poller callback, views
+  card_info.c / card_info.h    card report renderer + minimal NDEF parser
+  emv.c / emv.h                read-only EMV (bank card) APDU chain
   icon.png / make_icon.py      10x10 1-bit icon, regenerate with Pillow
   README.md                    user-facing docs + the fork-ABI explanation
 ```
@@ -62,21 +70,29 @@ you are about to remove somewhere safe first.
 
 ## Architecture
 
-Single view + `ViewDispatcher`. Phase timing lives in the defines at the top:
-`NFC_PHASE_MS` 1200, `LF_PHASE_MS` 1600, `READ_TIMEOUT_MS` 2500,
-`ANIM_PERIOD_MS` 80.
+Two views + `ViewDispatcher`: the animated scan view (`ReaderViewScan`) and a
+scrollable TextBox info view (`ReaderViewInfo`) that renders the report built
+by `card_info_format_nfc()` / `card_info_format_lf()` into `app->info_text`
+(raw pointer — the string must stay alive and unmodified while shown, so
+`text_box_reset()` precedes every rebuild). Phase timing lives in the defines
+at the top: `NFC_PHASE_MS` 1200, `LF_PHASE_MS` 1600, `READ_TIMEOUT_MS` 2500,
+`ANIM_PERIOD_MS` 80; per-protocol read bounds come from
+`reader_read_timeout_for()`.
 
 `reader_start_nfc_phase()` / `reader_start_lf_phase()` are the only entry points
-that touch a radio; both begin with `reader_stop_all()`. Flow is
-scan → detect → poll the transport protocol for the UID → done.
+that touch a radio; both begin with `reader_stop_all()` and switch back to
+`ReaderViewScan`. Flow is scan → detect → poll the most-derived safe protocol
+(`reader_poll_protocol()`, e.g. MfClassic / MfUltralight / ISO14443-4A with the
+EMV chain) for the full card data → render in the TextBox info screen.
 
 **Three invariants that are load-bearing — breaking any of them wedges the device:**
 
-1. **No fork-sensitive enum values.** `reader_base_protocols[]` plus
-   `protocol_base()` / `protocol_is_base()` resolve a card's transport via
-   `nfc_protocol_has_parent()`. Never reintroduce `NfcProtocolInvalid` or
-   `NfcProtocolNum`; the verified device (Momentum) numbers them differently from
-   the SDK we compile against.
+1. **No fork-sensitive enum values.** `reader_poll_protocol()` picks the
+   most-derived pollable protocol from a compile-time whitelist (ids 0..11),
+   and `dev_has()` in card_info.c guards every `nfc_device_get_data()` call —
+   both via firmware-evaluated `nfc_protocol_has_parent()`. Never reintroduce
+   `NfcProtocolInvalid` or `NfcProtocolNum`; the verified device (Momentum)
+   numbers them differently from the SDK we compile against.
 2. **Generation-stamped events.** `EVENT_MAKE(id, gen)` / `EVENT_ID` / `EVENT_GEN`
    pack `app->gen` into the high bits; `app->gen++` on every phase change and the
    handler drops mismatches. **Keep every `ReaderCustomEvent` value below 256** —

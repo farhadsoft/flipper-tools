@@ -15,11 +15,10 @@
 
 #include <furi.h>
 #include <math.h>
-#include <stdarg.h>
 #include <gui/gui.h>
-#include <gui/elements.h>
 #include <gui/view.h>
 #include <gui/view_dispatcher.h>
+#include <gui/modules/text_box.h>
 #include <input/input.h>
 
 #include <nfc/nfc.h>
@@ -33,11 +32,14 @@
 #include <nfc/protocols/iso15693_3/iso15693_3_poller.h>
 #include <nfc/protocols/felica/felica_poller.h>
 #include <nfc/protocols/st25tb/st25tb_poller.h>
+#include <nfc/protocols/mf_ultralight/mf_ultralight_poller.h>
+#include <nfc/protocols/mf_classic/mf_classic_poller.h>
 
 #include <lfrfid/lfrfid_worker.h>
 #include <lfrfid/protocols/lfrfid_protocols.h>
 #include <toolbox/protocols/protocol_dict.h>
 #include "emv.h"
+#include "card_info.h"
 
 #define TAG "UniCardReader"
 
@@ -48,13 +50,6 @@
 
 #define READ_TIMEOUT_MS 2500
 #define EMV_READ_TIMEOUT_MS 6000
-
-#define RESULT_MAX_LINES     20
-#define RESULT_LINE_LEN      26
-#define RESULT_VISIBLE_LINES 5
-
-#define BAND_NFC "NFC 13.56MHz"
-#define BAND_LF  "LF 125kHz"
 
 /*
  * Worker threads and the phase timer keep running for a short while after the
@@ -72,7 +67,6 @@
 typedef enum {
     ReaderStateScanning,
     ReaderStateReading,
-    ReaderStateDone,
     ReaderStateError,
 } ReaderState;
 
@@ -86,21 +80,24 @@ typedef enum {
     ReaderEventError,
 } ReaderCustomEvent;
 
+// Views registered with the dispatcher.
+typedef enum {
+    ReaderViewScan = 0,
+    ReaderViewInfo = 1,
+} ReaderView;
+
 typedef struct {
     ReaderState state;
     uint8_t frame; // animation counter, bumped every ANIM_PERIOD_MS
-    bool lf; // true while the LF phase is active / an LF card was read
-    char band[16];
-    char type_name[48];
-    char lines[RESULT_MAX_LINES][RESULT_LINE_LEN];
-    uint8_t line_count;
-    uint8_t scroll;
+    bool lf; // true while the LF phase is active
 } ReaderModel;
 
 typedef struct {
     Gui* gui;
     ViewDispatcher* view_dispatcher;
     View* view;
+    TextBox* text_box;
+    FuriString* info_text; // backing store for the TextBox; must outlive the text pointer
     FuriTimer* phase_timer;
     FuriTimer* anim_timer;
 
@@ -109,10 +106,11 @@ typedef struct {
     NfcScanner* scanner;
     NfcPoller* poller;
     NfcDevice* device;
-    NfcProtocol display_protocol; // most-derived protocol, used for the name
-    NfcProtocol base_protocol; // transport protocol used for polling
-    bool emv_capable; // true when base_protocol speaks ISO14443-4A (APDUs)
-    EmvData emv; // filled by emv_read() when emv_capable
+    NfcProtocol display_protocol; // most-derived protocol, used for the name/chain
+    NfcProtocol poll_protocol; // protocol the poller actually runs (ids 0..11 only)
+    EmvData emv; // filled by emv_read() when poll_protocol is ISO14443-4A
+    uint8_t mfc_pass; // MfClassic key pass: 0 = key A, 1 = key B
+    uint8_t mfc_sector; // MfClassic next sector to offer a key for
 
     // LF side
     ProtocolDict* dict;
@@ -121,7 +119,7 @@ typedef struct {
     bool lf_thread_running; // the worker thread exists and must be joined
     ProtocolId lf_protocol;
 
-    // Filled by worker callbacks, consumed on the GUI thread.
+    // Filled by the LF worker callback path, consumed on the GUI thread.
     uint8_t scratch_id[ID_MAX_LEN];
     size_t scratch_id_len;
 
@@ -139,10 +137,10 @@ typedef struct {
  * feeding the mismatched value back into nfc_poller_alloc() trips
  * furi_check(protocol < NfcProtocolNum).
  *
- * The transport-layer protocols below sit at the head of the enum and have the
- * same values everywhere, so we resolve the transport with
- * nfc_protocol_has_parent() — evaluated by the firmware, against ids we know
- * are valid — and never touch a sentinel.
+ * The protocols below sit at the head of the enum and have the same values on
+ * official and Momentum (ids 0..11 verified), so relationships are resolved
+ * with nfc_protocol_has_parent() — evaluated by the firmware, against ids we
+ * know are valid — and sentinels are never touched.
  */
 static const NfcProtocol reader_base_protocols[] = {
     NfcProtocolIso14443_3a,
@@ -152,16 +150,6 @@ static const NfcProtocol reader_base_protocols[] = {
     NfcProtocolSt25tb,
 };
 
-// The transport protocol to poll for `p`, or `p` itself if it is one already.
-static NfcProtocol protocol_base(NfcProtocol p) {
-    for(size_t i = 0; i < COUNT_OF(reader_base_protocols); i++) {
-        if(p == reader_base_protocols[i] || nfc_protocol_has_parent(p, reader_base_protocols[i])) {
-            return reader_base_protocols[i];
-        }
-    }
-    return p;
-}
-
 // True for a transport protocol, false for anything layered on top of one.
 static bool protocol_is_base(NfcProtocol p) {
     for(size_t i = 0; i < COUNT_OF(reader_base_protocols); i++) {
@@ -170,10 +158,49 @@ static bool protocol_is_base(NfcProtocol p) {
     return false;
 }
 
-// True when the card speaks ISO14443-4A, i.e. it can take APDUs. Evaluated by
-// the firmware; NfcProtocolIso14443_4a is id 2 in the stock SDK and in Momentum.
-static bool protocol_is_iso14443_4a(NfcProtocol p) {
-    return p == NfcProtocolIso14443_4a || nfc_protocol_has_parent(p, NfcProtocolIso14443_4a);
+// Pollable protocols, most-derived first. Anything the scanner returns that is
+// not in this list (Ntag4xx/Type4Tag/Emv on Momentum, future fork additions)
+// resolves to an ancestor from this list and never reaches nfc_poller_alloc.
+// Iso14443_4b and Slix are deliberately absent: their poller event enums are
+// unverified, so those cards fall back to their transports (3b / ISO15693-3).
+static const NfcProtocol reader_pollable_protocols[] = {
+    NfcProtocolMfUltralight,
+    NfcProtocolMfClassic,
+    NfcProtocolIso14443_4a,
+    NfcProtocolIso15693_3,
+    NfcProtocolFelica,
+    NfcProtocolIso14443_3a,
+    NfcProtocolIso14443_3b,
+    NfcProtocolSt25tb,
+};
+
+// The most-derived protocol we can safely poll for `p`.
+static NfcProtocol reader_poll_protocol(NfcProtocol p) {
+    for(size_t i = 0; i < COUNT_OF(reader_pollable_protocols); i++) {
+        NfcProtocol q = reader_pollable_protocols[i];
+        if(p == q || nfc_protocol_has_parent(p, q)) return q;
+    }
+    return NfcProtocolIso14443_3a; // unreachable for scanner output
+}
+
+// Per-protocol read bound: in-callback work (EMV APDU chain, Classic key
+// passes, ISO15693 full block dump) needs longer than a bare transport
+// activation.
+static uint32_t reader_read_timeout_for(NfcProtocol p) {
+    switch(p) {
+    case NfcProtocolMfClassic:
+        return 12000; // 2 key passes x up to 80 sector requests
+    case NfcProtocolMfUltralight:
+        return 8000;
+    case NfcProtocolIso15693_3:
+        return 8000; // full block dump inside activate
+    case NfcProtocolFelica:
+        return 6000;
+    case NfcProtocolIso14443_4a:
+        return EMV_READ_TIMEOUT_MS; // APDU chain in-callback
+    default:
+        return READ_TIMEOUT_MS; // plain transports
+    }
 }
 
 /* ------------------------------ drawing ----------------------------- */
@@ -235,44 +262,6 @@ static void draw_cross(Canvas* canvas, int x, int y) {
     canvas_draw_line(canvas, x + 11, y, x + 1, y + 10);
 }
 
-/* -------------------------- result screen lines ---------------------- */
-
-static void result_reset(ReaderModel* m) {
-    m->line_count = 0;
-    m->scroll = 0;
-}
-
-// Formats one more line into the result screen. A no-op once the line list
-// is full, so a chatty card cannot overflow ReaderModel::lines.
-static void result_addf(ReaderModel* m, const char* fmt, ...) {
-    if(m->line_count >= RESULT_MAX_LINES) return;
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(m->lines[m->line_count], RESULT_LINE_LEN, fmt, args);
-    va_end(args);
-    m->line_count++;
-}
-
-// Prints "<label> <hex>" with no separators between bytes, wrapping after 10
-// bytes per line; continuation lines are prefixed with two spaces.
-static void result_add_hex(ReaderModel* m, const char* label, const uint8_t* d, size_t len) {
-    const size_t per_line = 10;
-    size_t i = 0;
-    do {
-        if(m->line_count >= RESULT_MAX_LINES) return;
-        char* line = m->lines[m->line_count++];
-        int n = snprintf(line, RESULT_LINE_LEN, "%s ", i == 0 ? label : " ");
-        if(n < 0) n = 0;
-        if((size_t)n >= RESULT_LINE_LEN) n = (int)RESULT_LINE_LEN - 1;
-
-        size_t end = i + per_line;
-        if(end > len) end = len;
-        for(; i < end && (size_t)n + 2 < RESULT_LINE_LEN; i++) {
-            n += snprintf(line + (size_t)n, RESULT_LINE_LEN - (size_t)n, "%02X", d[i]);
-        }
-    } while(i < len);
-}
-
 static void reader_draw_callback(Canvas* canvas, void* model) {
     ReaderModel* m = model;
     canvas_clear(canvas);
@@ -312,20 +301,6 @@ static void reader_draw_callback(Canvas* canvas, void* model) {
         }
         if(x + w > 112) w = 112 - x;
         if(w > 0) canvas_draw_box(canvas, x, 55, w, 4);
-        break;
-    }
-
-    case ReaderStateDone: {
-        canvas_set_font(canvas, FontSecondary);
-        for(uint8_t i = 0; i < RESULT_VISIBLE_LINES; i++) {
-            uint8_t idx = m->scroll + i;
-            if(idx >= m->line_count) break;
-            canvas_draw_str(canvas, 2, 24 + i * 9, m->lines[idx]);
-        }
-        if(m->line_count > RESULT_VISIBLE_LINES) {
-            elements_scrollbar_pos(
-                canvas, 126, 15, 49, m->scroll, m->line_count - RESULT_VISIBLE_LINES + 1);
-        }
         break;
     }
 
@@ -383,90 +358,155 @@ static void reader_stop_all(ReaderApp* app) {
     reader_stop_lf(app);
 }
 
-static void reader_set_scanning(ReaderApp* app, const char* band, bool lf) {
+static void reader_set_scanning(ReaderApp* app, bool lf) {
     with_view_model(
         app->view,
         ReaderModel * m,
         {
             m->state = ReaderStateScanning;
             m->lf = lf;
-            strncpy(m->band, band, sizeof(m->band) - 1);
-            m->band[sizeof(m->band) - 1] = '\0';
         },
         true);
 }
 
 /* --------------------------- nfc callbacks -------------------------- */
 
-// Runs on the NFC worker thread. All four base protocols use 0 = Error,
-// 1 = Ready; FeliCa additionally treats Incomplete as usable.
+// Common tail of every poller path: snapshot the card into the device (a deep
+// copy, so the data outlives the poller) and hand over to the GUI thread.
+// Runs on the NFC worker thread.
+static NfcCommand reader_nfc_done(ReaderApp* app, NfcProtocol polled) {
+    nfc_device_set_data(app->device, polled, nfc_poller_get_data(app->poller));
+    FURI_LOG_I(TAG, "NFC read: %s", nfc_device_get_protocol_name(app->display_protocol));
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, EVENT_MAKE(ReaderEventNfcRead, app->gen));
+    return NfcCommandStop;
+}
+
+// Runs on the NFC worker thread. The callback must answer the poller's
+// requests (mode, keys, auth context) and stop on a terminal event; the exact
+// set differs per protocol. Only compile-time protocol ids 0..11 ever reach
+// this switch (see reader_poll_protocol).
 static NfcCommand reader_poller_callback(NfcGenericEvent event, void* context) {
     ReaderApp* app = context;
-    bool ready = false;
 
     switch(event.protocol) {
     case NfcProtocolIso14443_3a:
-        ready =
-            ((Iso14443_3aPollerEvent*)event.event_data)->type == Iso14443_3aPollerEventTypeReady;
-        break;
-    case NfcProtocolIso14443_4a:
-        ready =
-            ((Iso14443_4aPollerEvent*)event.event_data)->type == Iso14443_4aPollerEventTypeReady;
+        if(((Iso14443_3aPollerEvent*)event.event_data)->type == Iso14443_3aPollerEventTypeReady) {
+            return reader_nfc_done(app, event.protocol);
+        }
         break;
     case NfcProtocolIso14443_3b:
-        ready =
-            ((Iso14443_3bPollerEvent*)event.event_data)->type == Iso14443_3bPollerEventTypeReady;
+        if(((Iso14443_3bPollerEvent*)event.event_data)->type == Iso14443_3bPollerEventTypeReady) {
+            return reader_nfc_done(app, event.protocol);
+        }
         break;
     case NfcProtocolIso15693_3:
-        ready =
-            ((Iso15693_3PollerEvent*)event.event_data)->type == Iso15693_3PollerEventTypeReady;
+        // Ready means inventory + system info + all blocks were read already.
+        if(((Iso15693_3PollerEvent*)event.event_data)->type == Iso15693_3PollerEventTypeReady) {
+            return reader_nfc_done(app, event.protocol);
+        }
+        break;
+    case NfcProtocolSt25tb:
+        if(((St25tbPollerEvent*)event.event_data)->type == St25tbPollerEventTypeReady) {
+            return reader_nfc_done(app, event.protocol);
+        }
         break;
     case NfcProtocolFelica: {
-        FelicaPollerEventType t = ((FelicaPollerEvent*)event.event_data)->type;
-        ready = (t == FelicaPollerEventTypeReady) || (t == FelicaPollerEventTypeIncomplete);
+        FelicaPollerEvent* e = event.event_data;
+        switch(e->type) {
+        case FelicaPollerEventTypeReady:
+        case FelicaPollerEventTypeIncomplete: // partial dump still worth showing
+            return reader_nfc_done(app, event.protocol);
+        case FelicaPollerEventTypeRequestAuthContext:
+            // alloc does not initialise skip_auth (malloc garbage) and the
+            // activate handler branches on it.
+            e->data->auth_context->skip_auth = true;
+            break;
+        default:
+            break; // Error: keep polling until the timeout
+        }
         break;
     }
-    case NfcProtocolSt25tb:
-        ready = ((St25tbPollerEvent*)event.event_data)->type == St25tbPollerEventTypeReady;
+    case NfcProtocolIso14443_4a:
+        if(((Iso14443_4aPollerEvent*)event.event_data)->type == Iso14443_4aPollerEventTypeReady) {
+            // The read-only EMV chain must run here:
+            // iso14443_4a_poller_send_block() is only legal inside the callback.
+            memset(&app->emv, 0, sizeof(app->emv));
+            emv_read((Iso14443_4aPoller*)event.instance, &app->emv);
+            return reader_nfc_done(app, event.protocol);
+        }
         break;
+    case NfcProtocolMfUltralight: {
+        MfUltralightPollerEvent* e = event.event_data;
+        switch(e->type) {
+        case MfUltralightPollerEventTypeAuthRequest:
+            // The firmware reads skip_auth uninitialised otherwise (verified).
+            e->data->auth_context.skip_auth = true;
+            break;
+        case MfUltralightPollerEventTypeReadSuccess:
+        case MfUltralightPollerEventTypeReadFailed: // partial data still worth showing
+            return reader_nfc_done(app, event.protocol);
+        default:
+            break; // RequestMode: the firmware pre-sets Read
+        }
+        break;
+    }
+    case NfcProtocolMfClassic: {
+        MfClassicPollerEvent* e = event.event_data;
+        switch(e->type) {
+        case MfClassicPollerEventTypeRequestMode:
+            // The firmware furi_crash()es on an uninitialised mode. Read mode
+            // only: the DictAttack modes are ABI-unsafe on Momentum.
+            e->data->poller_mode.mode = MfClassicPollerModeRead;
+            e->data->poller_mode.data = NULL;
+            break;
+        case MfClassicPollerEventTypeRequestReadSector: {
+            // Offer the factory-default transport key (FF FF FF FF FF FF, the
+            // NXP shipping default, for reading your own blank/personal cards)
+            // for every sector: key A pass first, then a key B pass over the
+            // sectors still unread. key_provided = false ends the read; the
+            // firmware then emits Success. Never touch key_request_data (only
+            // used by dict-attack modes, ABI-unsafe on Momentum).
+            MfClassicPollerEventDataReadSectorRequest* r = &e->data->read_sector_request_data;
+            static const uint8_t transport_key[MF_CLASSIC_KEY_SIZE] =
+                {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+            const MfClassicData* d = (const MfClassicData*)nfc_poller_get_data(app->poller);
+            uint8_t sectors = mf_classic_get_total_sectors_num(d->type);
+            for(;;) {
+                if(app->mfc_sector >= sectors) {
+                    if(app->mfc_pass == 0) {
+                        app->mfc_pass = 1;
+                        app->mfc_sector = 0;
+                        continue;
+                    }
+                    r->key_provided = false;
+                    break;
+                }
+                if(app->mfc_pass == 1 && mf_classic_is_sector_read(d, app->mfc_sector)) {
+                    app->mfc_sector++;
+                    continue;
+                }
+                r->sector_num = app->mfc_sector++;
+                memcpy(r->key.data, transport_key, MF_CLASSIC_KEY_SIZE);
+                r->key_type = app->mfc_pass == 0 ? MfClassicKeyTypeA : MfClassicKeyTypeB;
+                r->key_provided = true;
+                break;
+            }
+            break;
+        }
+        case MfClassicPollerEventTypeSuccess:
+        case MfClassicPollerEventTypeFail:
+            return reader_nfc_done(app, event.protocol);
+        default:
+            break; // CardDetected/CardLost/DataUpdate/...: keep polling
+        }
+        break;
+    }
     default:
         break;
     }
 
-    if(!ready) {
-        return NfcCommandContinue; // keep polling until a card activates
-    }
-
-    const NfcDeviceData* data = nfc_poller_get_data(app->poller);
-    nfc_device_set_data(app->device, event.protocol, data);
-
-    size_t len = 0;
-    const uint8_t* uid = nfc_device_get_uid(app->device, &len);
-    if(len > ID_MAX_LEN) len = ID_MAX_LEN;
-    memcpy(app->scratch_id, uid, len);
-    app->scratch_id_len = len;
-
-    // Run the read-only EMV chain now, while still inside the poller
-    // callback: iso14443_4a_poller_send_block() is only legal here.
-    memset(&app->emv, 0, sizeof(app->emv));
-    if(event.protocol == NfcProtocolIso14443_4a) {
-        emv_read((Iso14443_4aPoller*)event.instance, &app->emv);
-    }
-
-    FuriString* hex = furi_string_alloc();
-    for(size_t i = 0; i < len; i++) {
-        furi_string_cat_printf(hex, "%02X", app->scratch_id[i]);
-    }
-    FURI_LOG_I(
-        TAG,
-        "NFC read: %s, UID %s",
-        nfc_device_get_protocol_name(app->display_protocol),
-        furi_string_get_cstr(hex));
-    furi_string_free(hex);
-
-    view_dispatcher_send_custom_event(
-        app->view_dispatcher, EVENT_MAKE(ReaderEventNfcRead, app->gen));
-    return NfcCommandStop;
+    return NfcCommandContinue; // keep polling until a terminal event or the timeout
 }
 
 // Runs on the NFC worker thread.
@@ -488,9 +528,7 @@ static void reader_scanner_callback(NfcScannerEvent event, void* context) {
     }
 
     app->display_protocol = best;
-    app->base_protocol = protocol_base(best);
-    app->emv_capable = protocol_is_iso14443_4a(best);
-    if(app->emv_capable) app->base_protocol = NfcProtocolIso14443_4a;
+    app->poll_protocol = reader_poll_protocol(best);
     FURI_LOG_I(TAG, "NFC detected: %s", nfc_device_get_protocol_name(best));
     view_dispatcher_send_custom_event(
         app->view_dispatcher, EVENT_MAKE(ReaderEventNfcScanned, app->gen));
@@ -528,7 +566,9 @@ static void reader_start_nfc_phase(ReaderApp* app) {
     reader_stop_all(app);
     app->gen++;
     app->lf_phase = false;
-    reader_set_scanning(app, BAND_NFC, false);
+    reader_set_scanning(app, false);
+    // Rescan from the info screen (Back) must land on the scan view again.
+    view_dispatcher_switch_to_view(app->view_dispatcher, ReaderViewScan);
 
     FURI_LOG_D(TAG, "phase: NFC (gen %lu)", (unsigned long)app->gen);
     app->scanner = nfc_scanner_alloc(app->nfc);
@@ -540,7 +580,8 @@ static void reader_start_lf_phase(ReaderApp* app) {
     reader_stop_all(app);
     app->gen++;
     app->lf_phase = true;
-    reader_set_scanning(app, BAND_LF, true);
+    reader_set_scanning(app, true);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ReaderViewScan);
 
     FURI_LOG_D(TAG, "phase: LF (gen %lu)", (unsigned long)app->gen);
     lfrfid_worker_start_thread(app->worker);
@@ -550,58 +591,15 @@ static void reader_start_lf_phase(ReaderApp* app) {
     furi_timer_start(app->phase_timer, furi_ms_to_ticks(LF_PHASE_MS));
 }
 
-/* --------------------------- EMV formatting -------------------------- */
-
-// Tag 9A, YYMMDD packed BCD. Each nibble is already a decimal digit, so
-// printing the bytes in hex reproduces the decimal date; displayed DD/MM/YY.
-static void format_emv_date(const uint8_t* bcd, char* out, size_t cap) {
-    snprintf(out, cap, "%02X/%02X/%02X", (unsigned)bcd[2], (unsigned)bcd[1], (unsigned)bcd[0]);
-}
-
-// Tag 9F02, 6 packed-BCD bytes (12 digits, n12). Strips leading zeros down to
-// a minimum of 3 digits, then inserts '.' before the last two (minor units):
-// "000000000100" -> "1.00", "000000001234" -> "12.34".
-static void format_emv_amount(const uint8_t* bcd, char* out, size_t cap) {
-    char digits[13];
-    for(size_t i = 0; i < 6; i++) {
-        digits[i * 2] = (char)('0' + (bcd[i] >> 4));
-        digits[i * 2 + 1] = (char)('0' + (bcd[i] & 0x0F));
-    }
-    digits[12] = '\0';
-
-    size_t start = 0;
-    while(start < 9 && digits[start] == '0') start++; // keep >= 3 digits
-    size_t len = 12 - start;
-    const char* d = digits + start;
-
-    snprintf(out, cap, "%.*s.%.*s", (int)(len - 2), d, 2, d + len - 2);
-}
-
-// Tag 5F2A, ISO 4217 numeric. Unknown codes print as the raw number.
-static const char* format_emv_currency(uint16_t code, char* fallback, size_t fallback_cap) {
-    static const struct {
-        uint16_t code;
-        const char* name;
-    } table[] = {
-        {978, "EUR"},
-        {826, "GBP"},
-        {840, "USD"},
-        {752, "SEK"},
-        {578, "NOK"},
-        {208, "DKK"},
-        {985, "PLN"},
-        {203, "CZK"},
-        {348, "HUF"},
-        {756, "CHF"},
-    };
-    for(size_t i = 0; i < COUNT_OF(table); i++) {
-        if(table[i].code == code) return table[i].name;
-    }
-    snprintf(fallback, fallback_cap, "%u", (unsigned)code);
-    return fallback;
-}
-
 /* --------------------------- view callbacks ------------------------- */
+
+// Back from the info screen: rescan immediately. Runs on the GUI thread, so
+// starting the NFC phase here is legal. VIEW_IGNORE because the phase start
+// already switched the view.
+static uint32_t reader_info_previous_callback(void* context) {
+    reader_start_nfc_phase(context);
+    return VIEW_IGNORE;
+}
 
 static bool reader_custom_event_callback(void* context, uint32_t event) {
     ReaderApp* app = context;
@@ -647,97 +645,32 @@ static bool reader_custom_event_callback(void* context, uint32_t event) {
         app->gen++;
 
         with_view_model(app->view, ReaderModel * m, { m->state = ReaderStateReading; }, true);
-        app->poller = nfc_poller_alloc(app->nfc, app->base_protocol);
+        // Restart every per-read state so a rescan begins cleanly.
+        app->mfc_pass = 0;
+        app->mfc_sector = 0;
+        memset(&app->emv, 0, sizeof(app->emv)); // no stale bank data from a previous card
+        app->poller = nfc_poller_alloc(app->nfc, app->poll_protocol);
         nfc_poller_start(app->poller, reader_poller_callback, app);
         // Bounded read: a card removed now must not leave us stuck on "Reading".
-        // EMV cards get a longer bound: the command chain runs inside the
-        // poller callback, and nfc_poller_stop() joins that thread, so a
-        // short timeout would block the GUI thread mid-chain.
+        // Longer bounds cover in-callback work (EMV APDU chain, Classic key
+        // passes): nfc_poller_stop() joins the worker thread, so a short
+        // timeout would block the GUI thread mid-read.
         furi_timer_start(
-            app->phase_timer,
-            furi_ms_to_ticks(app->emv_capable ? EMV_READ_TIMEOUT_MS : READ_TIMEOUT_MS));
+            app->phase_timer, furi_ms_to_ticks(reader_read_timeout_for(app->poll_protocol)));
         return true;
 
-    case ReaderEventNfcRead: {
+    case ReaderEventNfcRead:
         if(!app->poller) return true;
         reader_stop_all(app);
         app->gen++;
-        const char* name = nfc_device_get_protocol_name(app->display_protocol);
-        with_view_model(
-            app->view,
-            ReaderModel * m,
-            {
-                m->state = ReaderStateDone;
-                m->lf = false;
-                strncpy(m->band, BAND_NFC, sizeof(m->band) - 1);
-                m->band[sizeof(m->band) - 1] = '\0';
-                strncpy(m->type_name, name, sizeof(m->type_name) - 1);
-                m->type_name[sizeof(m->type_name) - 1] = '\0';
-
-                result_reset(m);
-                result_addf(m, "Band: 13.56 MHz");
-                result_addf(m, "Type: %s", name);
-                result_add_hex(m, "UID:", app->scratch_id, app->scratch_id_len);
-
-                if(app->emv.ppse_ok) {
-                    for(uint8_t i = 0; i < app->emv.aid_count; i++) {
-                        result_add_hex(
-                            m, i == 0 ? "AID:" : "AID+", app->emv.aid[i], app->emv.aid_len[i]);
-                    }
-                    if(app->emv.label[0]) result_addf(m, "App: %s", app->emv.label);
-
-                    if(app->emv.pan[0]) {
-                        result_addf(m, "PAN: %s", app->emv.pan);
-                    } else {
-                        result_addf(m, "PAN: not available");
-                        result_addf(m, "over contactless");
-                    }
-
-                    if(app->emv.expiry[0]) {
-                        result_addf(m, "Expiry: %s", app->emv.expiry);
-                    } else {
-                        result_addf(m, "Expiry: not disclosed");
-                    }
-
-                    if(app->emv.name[0]) {
-                        result_addf(m, "Name: %s", app->emv.name);
-                    } else {
-                        result_addf(m, "Name: not disclosed");
-                    }
-
-                    if(app->emv.log_count) {
-                        result_addf(m, "Txn log: %u records", (unsigned)app->emv.log_count);
-                        for(uint8_t r = 0; r < app->emv.log_rows; r++) {
-                            const EmvLogRow* row = &app->emv.log[r];
-                            char date_str[12];
-                            char amount_str[16];
-                            char cur_fallback[8];
-                            const char* cur_str = "--";
-                            if(row->has_date) {
-                                format_emv_date(row->date, date_str, sizeof(date_str));
-                            } else {
-                                snprintf(date_str, sizeof(date_str), "--/--/--");
-                            }
-                            if(row->has_amount) {
-                                format_emv_amount(row->amount, amount_str, sizeof(amount_str));
-                            } else {
-                                snprintf(amount_str, sizeof(amount_str), "--");
-                            }
-                            if(row->has_currency) {
-                                cur_str = format_emv_currency(
-                                    row->currency, cur_fallback, sizeof(cur_fallback));
-                            }
-                            result_addf(m, "%s %s %s", date_str, amount_str, cur_str);
-                        }
-                        if(app->emv.log_rows == 0) result_addf(m, "(log format not given)");
-                    }
-                } else if(app->emv_capable) {
-                    result_addf(m, "No EMV app on card");
-                }
-            },
-            true);
+        text_box_reset(app->text_box); // drop the stale text pointer before rebuilding
+        furi_string_reset(app->info_text);
+        card_info_format_nfc(app->info_text, app->device, app->display_protocol, &app->emv);
+        text_box_set_font(app->text_box, TextBoxFontText);
+        text_box_set_focus(app->text_box, TextBoxFocusStart);
+        text_box_set_text(app->text_box, furi_string_get_cstr(app->info_text));
+        view_dispatcher_switch_to_view(app->view_dispatcher, ReaderViewInfo);
         return true;
-    }
 
     case ReaderEventLfRead: {
         if(!app->lf_phase || !app->lf_reading) return true;
@@ -758,23 +691,14 @@ static bool reader_custom_event_callback(void* context, uint32_t event) {
             TAG, "LF read: %s, ID %s", name ? name : "Unknown", furi_string_get_cstr(lf_hex));
         furi_string_free(lf_hex);
 
-        with_view_model(
-            app->view,
-            ReaderModel * m,
-            {
-                m->state = ReaderStateDone;
-                m->lf = true;
-                strncpy(m->band, BAND_LF, sizeof(m->band) - 1);
-                m->band[sizeof(m->band) - 1] = '\0';
-                strncpy(m->type_name, name ? name : "Unknown", sizeof(m->type_name) - 1);
-                m->type_name[sizeof(m->type_name) - 1] = '\0';
-
-                result_reset(m);
-                result_addf(m, "Band: 125 kHz");
-                result_addf(m, "Type: %s", name ? name : "Unknown");
-                result_add_hex(m, "ID:", app->scratch_id, app->scratch_id_len);
-            },
-            true);
+        text_box_reset(app->text_box);
+        furi_string_reset(app->info_text);
+        card_info_format_lf(
+            app->info_text, name ? name : "Unknown", app->scratch_id, app->scratch_id_len);
+        text_box_set_font(app->text_box, TextBoxFontText);
+        text_box_set_focus(app->text_box, TextBoxFocusStart);
+        text_box_set_text(app->text_box, furi_string_get_cstr(app->info_text));
+        view_dispatcher_switch_to_view(app->view_dispatcher, ReaderViewInfo);
         return true;
     }
 
@@ -796,24 +720,7 @@ static bool reader_input_callback(InputEvent* event, void* context) {
     ReaderState state;
     with_view_model(app->view, ReaderModel * m, { state = m->state; }, false);
 
-    if(state == ReaderStateDone && (event->key == InputKeyUp || event->key == InputKeyDown)) {
-        with_view_model(
-            app->view,
-            ReaderModel * m,
-            {
-                if(event->key == InputKeyDown) {
-                    if(m->line_count > RESULT_VISIBLE_LINES &&
-                       m->scroll < m->line_count - RESULT_VISIBLE_LINES)
-                        m->scroll++;
-                } else if(m->scroll > 0) {
-                    m->scroll--;
-                }
-            },
-            true);
-        return true;
-    }
-
-    if(event->key == InputKeyOk && (state == ReaderStateDone || state == ReaderStateError)) {
+    if(event->key == InputKeyOk && state == ReaderStateError) {
         reader_start_nfc_phase(app);
         return true;
     }
@@ -845,9 +752,20 @@ static ReaderApp* reader_app_alloc(void) {
 
     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
     view_dispatcher_set_custom_event_callback(app->view_dispatcher, reader_custom_event_callback);
-    view_dispatcher_add_view(app->view_dispatcher, 0, app->view);
+    view_dispatcher_add_view(app->view_dispatcher, ReaderViewScan, app->view);
+
+    app->text_box = text_box_alloc();
+    view_dispatcher_add_view(
+        app->view_dispatcher, ReaderViewInfo, text_box_get_view(app->text_box));
+    view_set_previous_callback(
+        text_box_get_view(app->text_box), reader_info_previous_callback);
+    // text_box_set_text() stores the raw pointer, so this string must stay
+    // alive and unmodified while the info view is shown.
+    app->info_text = furi_string_alloc();
+    furi_string_reserve(app->info_text, 8192);
+
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
-    view_dispatcher_switch_to_view(app->view_dispatcher, 0);
+    view_dispatcher_switch_to_view(app->view_dispatcher, ReaderViewScan);
 
     app->phase_timer =
         furi_timer_alloc(reader_phase_timer_callback, FuriTimerTypeOnce, app);
@@ -882,8 +800,12 @@ static void reader_app_free(ReaderApp* app) {
     furi_timer_stop(app->phase_timer);
     furi_timer_free(app->phase_timer);
 
-    view_dispatcher_remove_view(app->view_dispatcher, 0);
+    view_dispatcher_remove_view(app->view_dispatcher, ReaderViewScan);
     view_free(app->view);
+    text_box_reset(app->text_box); // release the pointer into info_text first
+    view_dispatcher_remove_view(app->view_dispatcher, ReaderViewInfo);
+    text_box_free(app->text_box);
+    furi_string_free(app->info_text);
     view_dispatcher_free(app->view_dispatcher);
     furi_record_close(RECORD_GUI);
     free(app);

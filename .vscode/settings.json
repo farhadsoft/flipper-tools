@@ -1,0 +1,3 @@
+{
+    "sonarlint.pathToCompileCommands": "${workspaceFolder}\\universal_card_reader\\.vscode\\compile_commands.json"
+}
