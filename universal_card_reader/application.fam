@@ -1,0 +1,16 @@
+App(
+    appid="universal_card_reader",
+    name="Universal Card Reader",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="universal_card_reader_app",
+    requires=["gui"],
+    # 8 KB: the GUI thread runs the animated draw callback plus every
+    # nfc_*/lfrfid_worker_* start/stop call, which is deep enough that 4 KB
+    # risks a stack overflow.
+    stack_size=8 * 1024,
+    fap_category="Tools",
+    fap_description="Reads any NFC (13.56MHz) or LF RFID (125kHz) card.",
+    fap_author="farhadsoft",
+    fap_version="1.1",
+    fap_icon="icon.png",
+)

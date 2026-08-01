@@ -1,0 +1,181 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+**For general Flipper Zero FAP rules (build commands, crash/furi_check traps, log
+capture, UI conventions) see `~/.claude/CLAUDE.md`. Only project-specific detail
+lives here.**
+
+# Universal Card Reader
+
+One FAP that reads **both** card families: NFC 13.56 MHz (ISO14443-3A/3B,
+ISO15693-3, FeliCa, ST25TB and everything layered on them) and LF RFID 125 kHz.
+The two radios cannot run together, so it alternates timed phases and loops until
+a card is found, with an animated scanning UI.
+
+## Verified firmware / SDK — re-check before you build (STEP 0)
+
+Last verified **2026-08-01**. Confirm these still hold (`device_info` on the
+device, `api_symbols.csv` + `components.json` for the SDK) and update this block
+if anything changed. Do not skip: a mismatch here caused a wedged device and a
+crash that `APPCHK` did not catch.
+
+| | Device | ufbt SDK |
+|---|---|---|
+| Target | `hardware_target` 7 | `hw_target` f7 |
+| Firmware | `mntm-dev`, commit `42630e91`, built 31-12-2025 | official `1.4.3`, channel `release` |
+| Fork | **`Momentum`** (Next-Flip/Momentum-Firmware) | Official |
+| API | 87.1 | 87.1 |
+| Port | COM3 (VID_0483 / PID_5740) | — |
+
+**The API versions match exactly, so the FAP loads — but the forks are not
+ABI-identical.** Known drift, both of which this app is written to survive:
+
+- `NfcProtocol`: Momentum adds `Ntag4xx`, `Type4Tag`, `Emv` → `NfcProtocolNum`
+  is 15 not 12, `NfcProtocolInvalid` is 16 not 13.
+- `LFRFIDProtocol`: Momentum has 26 entries vs 24 and inserts `Indala224`
+  mid-enum, shifting later ids.
+
+Everything else checked (`nfc_scanner.h`, `nfc_generic_event.h`, the poller
+headers, `nfc_device.h`) is identical or additive-only.
+
+## Layout — one app, in a subdirectory
+
+```
+universal_card_reader/          <- the app; run ufbt HERE, not at repo root
+  application.fam              appid universal_card_reader, entry universal_card_reader_app,
+                               Tools category, stack_size 8*1024
+  universal_card_reader.c      whole app, single file (~730 lines)
+  icon.png / make_icon.py      10x10 1-bit icon, regenerate with Pillow
+  README.md                    user-facing docs + the fork-ABI explanation
+```
+
+Installs to `/ext/apps/Tools/universal_card_reader.fap` (from `fap_category`),
+i.e. **Apps → Tools** on the device.
+
+The repo directory is named after an earlier NFC-only app that lived at the root
+and was deleted once this one superseded it — that is the only reason the folder
+and the app have different names. Nothing should be added back at the root.
+
+**Not a git repository** — there is no undo for deletions here. Copy anything
+you are about to remove somewhere safe first.
+
+## Architecture
+
+Single view + `ViewDispatcher`. Phase timing lives in the defines at the top:
+`NFC_PHASE_MS` 1200, `LF_PHASE_MS` 1600, `READ_TIMEOUT_MS` 2500,
+`ANIM_PERIOD_MS` 80.
+
+`reader_start_nfc_phase()` / `reader_start_lf_phase()` are the only entry points
+that touch a radio; both begin with `reader_stop_all()`. Flow is
+scan → detect → poll the transport protocol for the UID → done.
+
+**Three invariants that are load-bearing — breaking any of them wedges the device:**
+
+1. **No fork-sensitive enum values.** `reader_base_protocols[]` plus
+   `protocol_base()` / `protocol_is_base()` resolve a card's transport via
+   `nfc_protocol_has_parent()`. Never reintroduce `NfcProtocolInvalid` or
+   `NfcProtocolNum`; the verified device (Momentum) numbers them differently from
+   the SDK we compile against.
+2. **Generation-stamped events.** `EVENT_MAKE(id, gen)` / `EVENT_ID` / `EVENT_GEN`
+   pack `app->gen` into the high bits; `app->gen++` on every phase change and the
+   handler drops mismatches. **Keep every `ReaderCustomEvent` value below 256** —
+   the upper bits are the generation. `ReaderEventAnimTick` is exempt from the check.
+3. **The LF phase owns the LF worker thread.** `lfrfid_worker_start_thread()` is
+   in `reader_start_lf_phase()`, not in `reader_app_alloc()`, and
+   `reader_stop_lf()` calls `lfrfid_worker_stop_thread()` to *join* before NFC may
+   start. `lfrfid_worker_stop()` alone does not wait.
+
+`protocol_dict_alloc(lfrfid_protocols, LFRFIDProtocolMax)` passes our
+compile-time count against the firmware's array. Safe when the fork has more
+protocols (they are simply not detected); LF ids always round-trip through the
+firmware's own array, so names stay correct.
+
+## Testing this app
+
+Verified device: Momentum `mntm-dev`, API 87.1, **COM3**. Helper pattern:
+a pyserial capture script with a hard deadline, `--cmd` for pre-capture CLI
+commands and a small `--cmd-delay` so `log` attaches immediately after.
+
+- With an NFC card on the antenna the NFC phase wins in ~300 ms every time, so
+  **the LF path is only exercised with the card removed.** Confirm alternation by
+  capturing ~25 s at `log debug` and checking `phase: LF (gen N)` /
+  `phase: NFC (gen N+1)` alternate, then that `top` still answers.
+- `input send ok short` triggers an in-app rescan — the only way to catch the
+  read logs, which otherwise all happen before a log session can attach.
+- `top` should show `LfrfidWorker` **only** during the LF phase and
+  `NfcScanWorker`/`NfcWorker` only during the NFC phase. Overlap means invariant 3
+  is broken.
+
+Status logs are `FURI_LOG_I` (detection, read with UID/ID hex, read timeout);
+phase changes and stale-event drops are `FURI_LOG_D`, so capture at `debug` when
+debugging phase logic.
+
+**Known:** the test card is an ISO14443-4A with a random UID (first byte `0x08`),
+so its UID legitimately differs on every read. A real 125 kHz LF read has not yet
+been verified — no LF card available.
+
+---
+
+# context-mode — MANDATORY routing rules
+
+You have context-mode MCP tools available. These rules are NOT optional — they protect your context window from flooding. A single unrouted command can dump 56 KB into context and waste the entire session.
+
+## BLOCKED commands — do NOT attempt these
+
+### curl / wget — BLOCKED
+Any Bash command containing `curl` or `wget` is intercepted and replaced with an error message. Do NOT retry.
+Instead use:
+- `ctx_fetch_and_index(url, source)` to fetch and index web pages
+- `ctx_execute(language: "javascript", code: "const r = await fetch(...)")` to run HTTP calls in sandbox
+
+### Inline HTTP — BLOCKED
+Any Bash command containing `fetch('http`, `requests.get(`, `requests.post(`, `http.get(`, or `http.request(` is intercepted and replaced with an error message. Do NOT retry with Bash.
+Instead use:
+- `ctx_execute(language, code)` to run HTTP calls in sandbox — only stdout enters context
+
+### WebFetch — BLOCKED
+WebFetch calls are denied entirely. The URL is extracted and you are told to use `ctx_fetch_and_index` instead.
+Instead use:
+- `ctx_fetch_and_index(url, source)` then `ctx_search(queries)` to query the indexed content
+
+## REDIRECTED tools — use sandbox equivalents
+
+### Bash (>20 lines output)
+Bash is ONLY for: `git`, `mkdir`, `rm`, `mv`, `cd`, `ls`, `npm install`, `pip install`, and other short-output commands.
+For everything else, use:
+- `ctx_batch_execute(commands, queries)` — run multiple commands + search in ONE call
+- `ctx_execute(language: "shell", code: "...")` — run in sandbox, only stdout enters context
+
+### Read (for analysis)
+If you are reading a file to **Edit** it → Read is correct (Edit needs content in context).
+If you are reading to **analyze, explore, or summarize** → use `ctx_execute_file(path, language, code)` instead. Only your printed summary enters context. The raw file content stays in the sandbox.
+
+### Grep (large results)
+Grep results can flood context. Use `ctx_execute(language: "shell", code: "grep ...")` to run searches in sandbox. Only your printed summary enters context.
+
+## Tool selection hierarchy
+
+1. **GATHER**: `ctx_batch_execute(commands, queries)` — Primary tool. Runs all commands, auto-indexes output, returns search results. ONE call replaces 30+ individual calls.
+2. **FOLLOW-UP**: `ctx_search(queries: ["q1", "q2", ...])` — Query indexed content. Pass ALL questions as array in ONE call.
+3. **PROCESSING**: `ctx_execute(language, code)` | `ctx_execute_file(path, language, code)` — Sandbox execution. Only stdout enters context.
+4. **WEB**: `ctx_fetch_and_index(url, source)` then `ctx_search(queries)` — Fetch, chunk, index, query. Raw HTML never enters context.
+5. **INDEX**: `ctx_index(content, source)` — Store content in FTS5 knowledge base for later search.
+
+## Subagent routing
+
+When spawning subagents (Agent/Task tool), the routing block is automatically injected into their prompt. Bash-type subagents are upgraded to general-purpose so they have access to MCP tools. You do NOT need to manually instruct subagents about context-mode.
+
+## Output constraints
+
+- Keep responses under 500 words.
+- Write artifacts (code, configs, PRDs) to FILES — never return them as inline text. Return only: file path + 1-line description.
+- When indexing content, use descriptive source labels so others can `ctx_search(source: "label")` later.
+
+## ctx commands
+
+| Command | Action |
+|---------|--------|
+| `ctx stats` | Call the `ctx_stats` MCP tool and display the full output verbatim |
+| `ctx doctor` | Call the `ctx_doctor` MCP tool, run the returned shell command, display as checklist |
+| `ctx upgrade` | Call the `ctx_upgrade` MCP tool, run the returned shell command, display as checklist |
