@@ -997,11 +997,12 @@ bool emv_read(Iso14443_4aPoller* poller, EmvData* out) {
 
 /* -------------------------- save / load --------------------------- */
 
-#define EMV_FILE_TYPE    "Universal EMV Card"
-#define EMV_FILE_VERSION 2
+#define EMV_FILE_TYPE        "Universal EMV Card"
+#define EMV_FILE_VERSION     3 // v3 adds the ISO14443-4A transport block (UID/ATQA/SAK/ATS)
+#define EMV_FILE_MIN_VERSION 2 // v2 (financial fields only) still loads, just cannot emulate
 
-bool emv_save(const EmvData* data, const char* path) {
-    if(!data || !path) return false;
+bool emv_save(const EmvData* data, const NfcDevice* device, const char* path) {
+    if(!data || !device || !path) return false;
 
     Storage* storage = furi_record_open(RECORD_STORAGE);
     FlipperFormat* ff = flipper_format_file_alloc(storage);
@@ -1074,6 +1075,22 @@ bool emv_save(const EmvData* data, const char* path) {
             }
         }
 
+        // ISO14443-4A transport, so a loaded file can emulate at transport
+        // level. Written with the firmware's own protocol saver - the same key
+        // layout a .nfc file uses - except UID, which is device-level there
+        // and so is written explicitly. Skipped when the device somehow holds
+        // no 4A data; such a file still loads, it just cannot emulate.
+        NfcProtocol stored = nfc_device_get_protocol(device);
+        if(stored == NfcProtocolIso14443_4a ||
+           nfc_protocol_has_parent(stored, NfcProtocolIso14443_4a)) {
+            const Iso14443_4aData* transport =
+                (const Iso14443_4aData*)nfc_device_get_data(device, NfcProtocolIso14443_4a);
+            size_t uid_len = 0;
+            const uint8_t* uid = iso14443_4a_get_uid(transport, &uid_len);
+            if(!flipper_format_write_hex(ff, "UID", uid, uid_len)) break;
+            if(!iso14443_4a_save(transport, ff)) break;
+        }
+
         ok = true;
     } while(0);
 
@@ -1084,8 +1101,8 @@ bool emv_save(const EmvData* data, const char* path) {
     return ok;
 }
 
-bool emv_load(EmvData* data, const char* path) {
-    if(!data || !path) return false;
+bool emv_load(EmvData* data, NfcDevice* device, const char* path) {
+    if(!data || !device || !path) return false;
 
     memset(data, 0, sizeof(*data));
 
@@ -1102,7 +1119,7 @@ bool emv_load(EmvData* data, const char* path) {
         uint32_t version = 0;
         bool header_ok = flipper_format_read_header(ff, filetype, &version) &&
                          furi_string_equal_str(filetype, EMV_FILE_TYPE) &&
-                         version == EMV_FILE_VERSION;
+                         version >= EMV_FILE_MIN_VERSION && version <= EMV_FILE_VERSION;
         furi_string_free(filetype);
         if(!header_ok) break;
 
@@ -1196,6 +1213,29 @@ bool emv_load(EmvData* data, const char* path) {
                     row->has_currency = true;
                 }
             }
+        }
+
+        // ISO14443-4A transport block (v3 files). Optional and non-fatal: v2
+        // files predate it, and a malformed block must not cost the financial
+        // fields, so any failure just leaves has_transport clear. The block
+        // mirrors a .nfc file's 4A section, so the firmware's own loader
+        // parses it; version 3 > NFC_LSB_ATQA_FORMAT_VERSION, so its ATQA
+        // un-swap matches the MSB-first order iso14443_3a_save() wrote.
+        if(flipper_format_key_exist(ff, "UID")) {
+            Iso14443_4aData* transport = iso14443_4a_alloc();
+            do {
+                uint32_t uid_len = 0;
+                if(!flipper_format_get_value_count(ff, "UID", &uid_len)) break;
+                if(uid_len == 0 || uid_len > ISO14443_3A_MAX_UID_SIZE) break;
+                uint8_t uid[ISO14443_3A_MAX_UID_SIZE];
+                if(!flipper_format_read_hex(ff, "UID", uid, (uint16_t)uid_len)) break;
+                if(!iso14443_4a_set_uid(transport, uid, uid_len)) break;
+                if(!iso14443_4a_load(transport, ff, version)) break;
+                nfc_device_set_data(
+                    device, NfcProtocolIso14443_4a, (const NfcDeviceData*)transport);
+                data->has_transport = true;
+            } while(false);
+            iso14443_4a_free(transport);
         }
 
         data->ppse_ok = true;

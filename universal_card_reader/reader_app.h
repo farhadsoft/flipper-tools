@@ -106,7 +106,7 @@ typedef enum {
     ReaderCardNone,
     ReaderCardNfc,
     ReaderCardLf,
-    ReaderCardEmvFile, // EMV fields loaded from a .emv file; no NfcDevice behind them
+    ReaderCardEmvFile, // EMV fields loaded from a .emv file; v3 files also restore the 4A transport into device
 } ReaderCardKind;
 
 typedef struct {

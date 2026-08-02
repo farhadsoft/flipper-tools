@@ -71,12 +71,15 @@ və kartın özəl açarları secure elementdən çıxarılmır.
 **Yadda saxlama:** EMV kartları app-ın öz data qovluğuna
 (`/ext/apps_data/universal_card_reader/EMV_<UID>.emv`) yazılır və PAN,
 son istifadə tarixi, kart sahibi, AID-lər, Track2 və jurnal kimi oxunan
-bütün maliyyə sahələrini saxlayır.
+bütün maliyyə sahələrini, üstəlik ISO14443-4A nəqliyyat məlumatını
+(UID/ATQA/SAK/ATS) saxlayır — beləcə yüklənmiş fayl da canlı oxunmuş kart
+kimi emulyasiya edilə bilir.
 
 **Emulyasiya:** EMV kartı üçün Emulate seçiləndə app ISO14443-4A
-nəqliyyat səviyyəsində emulyasiya başladır (yaxalanmış UID/ATS ilə).
-Tətbiq səviyyəsində EMV terminal emulyasiyası **yoxdur**; yəni PAN və
-jurnal başqa bir oxuyucuya ötürülmür.
+nəqliyyat səviyyəsində emulyasiya başladır (yaxalanmış UID/ATS ilə, canlı
+oxunmuşdan və ya `.emv` faylından yüklənmişdən asılı olmayaraq). Tətbiq
+səviyyəsində EMV terminal emulyasiyası **yoxdur**; yəni PAN və jurnal
+başqa bir oxuyucuya ötürülmür.
 
 > **Qeyd:** Nəticə ekranının sonunda `[Policy] Bank card: emulation disabled;
 > save stores UID/ATS only.` sətri görünə bilər. Bu bildiriş köhnəlib:
@@ -95,9 +98,10 @@ köçürülmür, silinmir.
 skan ekranında birbaşa **OK** düyməsi ilə açılır: firmware-in öz fayl
 seçici dialoqu yalnız bu qovluğu göstərir. Seçilən fayl nəticə ekranında
 elə canlı oxunmuş kart kimi göstərilir; nəqliyyat məlumatı olan fayllar
-(`.nfc`/`.rfid`) **Emulate** ilə işə salına bilər, təkcə EMV sahələri olan
-`.emv` faylları isə (arxasında heç bir nəqliyyat məlumatı olmadığı üçün)
-emulyasiya üçün bloklanır.
+(`.nfc`/`.rfid`/transport-lu `.emv`) **Emulate** ilə işə salına bilər.
+Köhnə `.emv` faylları (bu dəyişiklikdən əvvəl saxlanmış, yalnız EMV
+sahələri olan) arxasında nəqliyyat məlumatı olmadığı üçün emulyasiya
+üçün bloklanır — nəticə ekranında bu aydın göstərilir.
 
 ## Məhdudiyyətlər
 
@@ -114,6 +118,14 @@ emulyasiya üçün bloklanır.
   close` işləmir; bərpa üçün cihazı yenidən başlatmaq (`power reboot` CLI
   əmri və ya fiziki reset) lazımdır. Canlı oxunmuş kartı birbaşa
   emulyasiya etmək bu problemi göstərməyib.
+- **Yüklənmiş (fayldan açılmış) EMV/ISO14443-4A kartını Emulate etmək də
+  eyni sinif firmware problemi ilə üzləşə bilər** — yuxarıdakı Mifare
+  Classic qeydinin ISO14443-4A üçün təsdiqlənmiş forması: canlı oxunmuş
+  kartın birbaşa emulyasiyası dəfələrlə problemsiz işləyib, lakin `.emv`
+  faylından yüklənib emulyasiya edilən eyni kart bir dəfə cihazı
+  reboot edən bir crash-a səbəb olub (uzun USB kəsilməsi ilə). Bərpa üçün
+  `power reboot` və ya cihazın enumerasiyasını gözləmək kifayətdir;
+  app-in özündə bu firmware zəngini kəsmək üçün heç bir hook yoxdur.
 
 ## Qurma
 

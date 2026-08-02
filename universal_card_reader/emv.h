@@ -1,6 +1,7 @@
 #pragma once
 
 #include <nfc/protocols/iso14443_4a/iso14443_4a_poller.h>
+#include <nfc/nfc_device.h>
 #include <stdbool.h>
 
 #define EMV_MAX_AIDS      4
@@ -50,6 +51,13 @@ typedef struct {
     bool ppse_ok;       // SELECT PPSE returned 9000 and yielded >= 1 AID
     bool aid_selected;  // SELECT AID returned 9000
     bool gpo_ok;        // GET PROCESSING OPTIONS returned 9000
+
+    // Set by emv_load() when the file carried a valid ISO14443-4A transport
+    // block (v3): the UID/ATQA/SAK/ATS were set into the NfcDevice passed to
+    // emv_load(), so the card can be emulated at transport level. Always
+    // false for a live read (transport lives only in the NfcDevice then) and
+    // for v2 files, which predate the transport block.
+    bool has_transport;
 } EmvData;
 
 /**
@@ -61,14 +69,24 @@ typedef struct {
 bool emv_read(Iso14443_4aPoller* poller, EmvData* out);
 
 /**
- * Save EMV data to a .emv file in FlipperFormat.
- * Stores PAN, expiry, name, AIDs, track2, transaction log, and all financial fields.
+ * Save EMV data to a .emv file in FlipperFormat (version 3).
+ * Stores PAN, expiry, name, AIDs, track2, transaction log, and all financial
+ * fields. When `device` holds ISO14443-4A data (always true for a card
+ * reader_is_payment_card() accepts), the transport (UID/ATQA/SAK/ATS) is
+ * appended with the firmware's own iso14443_4a_save(), i.e. the same key
+ * layout a .nfc file uses, so a loaded file can emulate at transport level.
  * Returns true on success.
  */
-bool emv_save(const EmvData* data, const char* path);
+bool emv_save(const EmvData* data, const NfcDevice* device, const char* path);
 
 /**
  * Load EMV data from a .emv file in FlipperFormat.
+ * Accepts v2 (financial fields only) and v3 (plus the ISO14443-4A transport
+ * block). When the transport block is present and parses, it is set into
+ * `device` at protocol ISO14443-4A and out->has_transport is set; the caller
+ * may then emulate exactly like a live ISO14443-4A read. A missing or
+ * malformed transport block is not fatal: the financial fields still load
+ * and has_transport stays false.
  * Returns true on success.
  */
-bool emv_load(EmvData* data, const char* path);
+bool emv_load(EmvData* data, NfcDevice* device, const char* path);

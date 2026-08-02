@@ -200,11 +200,12 @@ static void reader_do_save(ReaderApp* app) {
         ok = lfrfid_dict_file_save(app->dict, app->lf_protocol, furi_string_get_cstr(path));
     } else if(reader_is_payment_card(app)) {
         // EMV / bank card: save ALL data (PAN, expiry, name, AIDs, track2, log)
-        // to a dedicated .emv file, not just the base ISO14443-4A UID.
+        // to a dedicated .emv file, plus the ISO14443-4A transport (UID/ATS)
+        // so the saved file can be emulated after a Load.
         size_t uid_len = 0;
         const uint8_t* uid = nfc_device_get_uid(app->device, &uid_len);
         reader_build_path(path, READER_SAVE_DIR, "EMV", uid, uid_len, ".emv");
-        ok = emv_save(&app->emv, furi_string_get_cstr(path));
+        ok = emv_save(&app->emv, app->device, furi_string_get_cstr(path));
     } else {
         size_t uid_len = 0;
         const uint8_t* uid = nfc_device_get_uid(app->device, &uid_len);
@@ -278,9 +279,15 @@ static void reader_do_load(ReaderApp* app) {
             reader_report_show(app, nfc_device_get_protocol_name(app->display_protocol));
         }
     } else if(furi_string_end_with_str(path, ".emv")) {
-        ok = emv_load(&app->emv, full);
+        ok = emv_load(&app->emv, app->device, full);
         if(ok) {
             app->card = ReaderCardEmvFile;
+            if(app->emv.has_transport) {
+                // v3 file: the 4A transport was restored into the device, so
+                // Emulate can run exactly like a live ISO14443-4A read.
+                app->display_protocol = NfcProtocolIso14443_4a;
+                app->poll_protocol = NfcProtocolIso14443_4a;
+            }
             reader_report_begin(app);
             card_info_format_emv(app->info_text, &app->emv);
             reader_report_show(app, "EMV file");
@@ -318,7 +325,23 @@ static void reader_do_emulate(ReaderApp* app) {
         return;
     }
     if(app->card == ReaderCardEmvFile) {
-        reader_show_notice(app, "Blocked", "no transport data", "in .emv file");
+        // .emv v2 files (and v3 files whose transport block failed to parse)
+        // carry no UID/ATS, so the listener would have nothing to present.
+        if(!app->emv.has_transport) {
+            reader_show_notice(app, "Blocked", "no transport data", "in .emv file");
+            return;
+        }
+        // v3 file: emulate the restored ISO14443-4A transport, same as the
+        // live payment-card path below.
+        if(!reader_protocol_emulatable(app->poll_protocol)) {
+            reader_show_notice(
+                app,
+                "Blocked",
+                "No emulation for",
+                nfc_device_get_protocol_name(app->poll_protocol));
+            return;
+        }
+        reader_start_nfc_emulation(app);
         return;
     }
 

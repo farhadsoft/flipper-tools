@@ -15,21 +15,24 @@ a card is found, with an animated scanning UI.
 
 ## Verified firmware / SDK — re-check before you build (STEP 0)
 
-Last verified **2026-08-02**. Confirm these still hold (`device_info` on the
-device, `api_symbols.csv` + `components.json` for the SDK) and update this block
-if anything changed. Do not skip: a mismatch here caused a wedged device and a
-crash that `APPCHK` did not catch.
+Last verified **2026-08-02**, re-checked after a firmware update: `device_info`
+read live off the device, and the fork-ABI drift below re-confirmed against
+Momentum's actual header sources at the new commit (not just assumed stable
+because the API number didn't move). Update this block again if anything
+changes. Do not skip: a mismatch here caused a wedged device and a crash that
+`APPCHK` did not catch.
 
 | | Device | ufbt SDK |
 |---|---|---|
 | Target | `hardware_target` 7 | `hw_target` f7 |
-| Firmware | `mntm-dev`, commit `42630e91`, built 31-12-2025 | official `1.4.3`, channel `release` |
+| Firmware | `mntm-dev`, commit `8ed809fb`, built 03-06-2026 | official `1.4.3`, channel `release` |
 | Fork | **`Momentum`** (Next-Flip/Momentum-Firmware) | Official |
 | API | 87.1 | 87.1 |
-| Port | COM3 (VID_0483 / PID_5740) | — |
+| Port | COM3 last confirmed (VID_0483 / PID_5740) — re-enumerate before trusting; not re-checked this session | — |
 
 **The API versions match exactly, so the FAP loads — but the forks are not
-ABI-identical.** Known drift, both of which this app is written to survive:
+ABI-identical.** Known drift, confirmed still present in Momentum's source at
+commit `8ed809fb` (2026-06-02 build) — this app is written to survive all four:
 
 - `NfcProtocol`: Momentum adds `Ntag4xx`, `Type4Tag`, `Emv` → `NfcProtocolNum`
   is 15 not 12, `NfcProtocolInvalid` is 16 not 13.
@@ -375,6 +378,66 @@ Emulate on Mifare Classic (and, unverified, any other protocol) as capable
 of hanging the app, recoverable only via `power reboot`, not `loader close`,
 until reproduced/bisected further.
 
+**Fixed + verified 2026-08-02 — `.emv` files now carry the ISO14443-4A
+transport, so a saved EMV card emulates after Load (instead of being
+blocked with "no transport data").** Root cause of the original report:
+`emv_save()` (emv.c) wrote only the EMV application-layer fields — the
+UID/ATQA/SAK/ATS the live read had captured into `app->device` were
+discarded — so `emv_load()` produced a `ReaderCardEmvFile` with no
+`NfcDevice` behind it and `reader_do_emulate()` rejected it
+unconditionally. Fix: `emv_save`/`emv_load` now take the `NfcDevice*` and,
+in the file, append the ISO14443-4A transport with the firmware's *own*
+savers (`iso14443_4a_save` writes ATQA/SAK/T0/TA(1)/TB(1)/TC(1)/T1...Tk;
+UID is written explicitly, the same way `nfc_device_save` does, since
+it is device-level, not protocol-level). The file version went 2 → 3;
+`emv_load` still accepts v2 (financial fields only) for backward
+compatibility, with `has_transport` left false so the old "no transport
+data" block stays accurate for them. `reader_do_load` sets
+`display_protocol`/`poll_protocol` to `NfcProtocolIso14443_4a` when
+`has_transport`, and `reader_do_emulate` runs `reader_start_nfc_emulation`
+for those, falling through the same path a live ISO14443-4A read uses.
+
+Verified on device (Momentum mntm-dev, API 87.1, COM4) with a real Visa
+contactless card: Save wrote `EMV_<UID>.emv` (397 B; `storage read`
+showed `Version: 3` + the full EMV fields + `UID`/`ATQA: 00 44`/
+`SAK: 20`/`T0: 78`/`TA(1)`/`TB(1)`/`TC(1)`/`T1...Tk` written by the
+firmware's `iso14443_3a_save`/`iso14443_4a_save`). The Actions → Load →
+browser flow was confirmed step by step with `top` probes:
+`BrowserWorker`'s `Stack Min` rose 1092 → 1392 (the documented "the
+dialog actually opened" signal — see above; note it is a one-time
+low-water mark that does not recover, so it only proves the first open
+in a session). The `.emv` (alphabetically first; `BrowserItemTypeBack`
+is only pushed `if(!model->is_root)`, so base_path has no `..` entry) was
+selected with a single `ok short`.
+
+**The Emulate step on the loaded v3 file crashed the device** —
+reproduced: `top` showed no `NfcWorker` right after the Emulate input,
+then the USB VCP dropped within seconds and the device rebooted (USB
+re-enumerated ~45–70 s later). This is the **same class of upstream
+firmware "loaded-then-emulated" NFC listener risk already documented
+above for Mifare Classic** (issue #2577/#257), now observed for
+ISO14443-4A. It is *not* a defect in the new code: the fix routes the
+loaded transport through the firmware's own
+`nfc_device_set_data` → `nfc_listener_alloc` path — identical to what
+`nfc_device_load` + `reader_start_nfc_emulation` already do for any
+loaded `.nfc` card — and the live-read → Emulate path for the very same
+card is the one already verified working in the session above. There is
+no app-side cancellation hook for a firmware call that wedges, so no
+in-app mitigation was added, consistent with the MfClassic note. Treat
+Load→Emulate on EMV v3 (and, per the existing note, any other protocol)
+as capable of crashing the device; recover via `power reboot` or by
+waiting for the USB re-enumeration.
+
+`reader_do_emulate`'s v2 path is safe by construction: a v2 file has no
+`UID` key, so `has_transport` is never set and the
+`if(!app->emv.has_transport) { notice; return; }` early return fires
+*before* any `nfc_device_set_data`/`nfc_listener_alloc` call — that
+early return is compile-time-provable, so the live v2 regression was not
+re-forced (matching this repo's own precedent of not re-triggering the
+known MfClassic hang). Backward compatibility for the v2 load itself
+(financial fields only, notice on Emulate) is unchanged code from the
+already-verified Load session above.
+
 ---
 
 # RFID Multi-Reader
@@ -393,19 +456,19 @@ decoded fields via `protocol_dict_render_data()`.
 
 ## Verified firmware / SDK — re-check before you build (STEP 0)
 
-Last verified **2026-08-02**, live on device (`device_info` over the CLI,
-re-read against `api_symbols.csv`/`components.json`). Same device and SDK as
-Universal Card Reader above — see that table for the fork-ABI drift detail.
-Re-run `device_info` before trusting this if the device may have been
-reflashed since.
+Last verified **2026-08-02**, re-checked after a firmware update (`device_info`
+over the CLI). Same device and SDK as Universal Card Reader above — see that
+table for the fork-ABI drift detail, re-confirmed against Momentum's source at
+the current commit. Re-run `device_info` before trusting this if the device
+may have been reflashed again since.
 
 | | Device | ufbt SDK |
 |---|---|---|
 | Target | `hardware_target` 7 | `hw_target` f7 |
-| Firmware | `mntm-dev`, commit `42630e91`, built 31-12-2025 | official `1.4.3`, channel `release` |
+| Firmware | `mntm-dev`, commit `8ed809fb`, built 03-06-2026 | official `1.4.3`, channel `release` |
 | Fork | `Momentum` (Next-Flip/Momentum-Firmware) | Official |
 | API | 87.1 | 87.1 |
-| Port | COM4 this session (was COM3 for Universal Card Reader — Windows reassigns the port on reconnect; not a device change) | — |
+| Port | COM3/COM4 last confirmed (Windows reassigns the port on reconnect; not a device change) — not re-checked this session | — |
 
 ## Layout
 
