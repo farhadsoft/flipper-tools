@@ -257,6 +257,151 @@ invariant 5.
 
 ---
 
+# RFID Multi-Reader
+
+Second FAP in this repo, `rfid_multi_reader/`. Universal **read-only** RFID
+reader: 125 kHz LF, 13.56 MHz HF/NFC (both built-in), plus a UHF (860-960 MHz)
+menu row that explains an external module is required. No save, no
+emulation - read + display only. Radio work sits behind a plugin vtable
+(`RfidBackend`, in `rfid_backend.h`) so a future UHF-over-GPIO implementation
+is a new `backend_uhf.c` body with zero core changes.
+
+**`universal_card_reader/` is not touched by this app.** Its proven NFC
+extraction, phase-alternation and crash-avoidance patterns were ported into
+`rfid_multi_reader`'s backends; its raw-hex-only LF output was replaced with
+decoded fields via `protocol_dict_render_data()`.
+
+## Verified firmware / SDK — re-check before you build (STEP 0)
+
+Last verified **2026-08-02**, live on device (`device_info` over the CLI,
+re-read against `api_symbols.csv`/`components.json`). Same device and SDK as
+Universal Card Reader above — see that table for the fork-ABI drift detail.
+Re-run `device_info` before trusting this if the device may have been
+reflashed since.
+
+| | Device | ufbt SDK |
+|---|---|---|
+| Target | `hardware_target` 7 | `hw_target` f7 |
+| Firmware | `mntm-dev`, commit `42630e91`, built 31-12-2025 | official `1.4.3`, channel `release` |
+| Fork | `Momentum` (Next-Flip/Momentum-Firmware) | Official |
+| API | 87.1 | 87.1 |
+| Port | COM4 this session (was COM3 for Universal Card Reader — Windows reassigns the port on reconnect; not a device change) | — |
+
+## Layout
+
+```
+rfid_multi_reader/              <- the app; run ufbt HERE, not at repo root
+  application.fam               appid rfid_multi_reader, entry rfid_multi_reader_app,
+                                Tools category, stack_size 8*1024
+  rfid_backend.h                the whole plugin contract (RfidBackend vtable)
+  rfid_app.h                    shared types/constants; no NFC/LFRFID header (keeps
+                                the core decoupled from radio specifics)
+  rfid_multi_reader.c           app lifetime, event router, menu, phase/rotation logic
+  ui.c / ui.h                   drawing + the only with_view_model call site
+  backend_hf.c / .h             13.56 MHz HF/NFC: scan/poll/describe + PPSE payment probe
+  backend_lf.c / .h             125 kHz LF: scan/read/describe with decoded fields
+  backend_uhf.c / .h            stub: available() = false, "external module" notice
+  icon.png / make_icon.py       10x10 1-bit icon (emitter + waves), regenerate with Pillow
+```
+
+Installs to `/ext/apps/Tools/rfid_multi_reader.fap`, i.e. **Apps → Tools**.
+
+## Architecture
+
+Three views + `ViewDispatcher`: a Submenu band menu (`RfidViewMenu`, the
+start view), a custom animated status View (`RfidViewStatus`, reused for
+Scanning/Reading/Notice sub-states via `RfidState`), and a TextBox info view
+(`RfidViewInfo`). No actions submenu (no Save/Emulate/Rescan - read-only): Back
+on the report goes straight to the band menu, and re-picking the same row is
+the rescan.
+
+`rfid_start_scan()`/`rfid_advance_phase()` in `rfid_multi_reader.c` drive an
+`app->rotation[]` array built per mode by `rfid_build_rotation()` (Auto = HF
+then LF, in that order; HF-only/LF-only = one entry; UHF is never in a
+rotation - `RfidEventMenuUhf` goes straight to `rfid_show_notice()` and never
+touches `app->mode`). `rfid_stop_all()` calls every registered backend's
+`scan_stop()`, not just the active one - the one guarantee that two radios
+can never be up at once. Timing: `HF_PHASE_MS` 1200, `LF_PHASE_MS` 1600,
+`ANIM_PERIOD_MS` 80, `NOTICE_MS` 1800 (`rfid_app.h`); per-backend read bounds
+come from each backend's `read_timeout_ms()`.
+
+Same five invariants as Universal Card Reader apply here (fork-sensitive
+enums, generation-stamped events, LF-worker-thread ownership/join, Back owned
+by the ViewDispatcher navigation callback not a `previous_callback`, timer
+callback never touching the view model) - see that app's section above for
+the full reasoning; `rfid_app.h`'s comments carry the short form. One more,
+specific to the vtable split: **`RfidEventDetected`'s state guard
+(`if(app->state != RfidStateScanning) return true;`) is load-bearing**,
+the same way the gen check is - the NFC scanner re-detects in a loop, and a
+duplicate Detected posted *after* `app->gen++` still passes the gen check.
+
+## Testing this app
+
+Same device/port/`cap.py` mechanics as Universal Card Reader above. Two
+CLI behaviours worth knowing, confirmed this session:
+
+- **`top` and `log debug` are both live, continuously-refreshing streams**
+  that do not return to the prompt until `Ctrl+C` (`\x03`) - any `--cmd` sent
+  to `cap.py` *after* one of them in the same invocation is not processed as
+  a command. Snapshot `top` with `--cmd "top" --cmd $'\x03'` (short
+  `--cmd-delay`) to capture one refresh and stop. To catch a log line fired
+  synchronously by an input press (e.g. a single-band `phase:` line), start
+  `log debug` *before* the input in a fresh capture and accept you may still
+  miss a one-shot line fired within the first fraction of a second; a
+  repeating line (Auto-mode phase alternation) is far more reliable to catch
+  this way.
+- **`loader close` force-closes the running app from any UI state**,
+  including one input navigation left in an unexpected place (e.g. bounced
+  between two views by miscounted Back presses). Prefer it over chained
+  `input send back short` for test cleanup/recovery.
+- `top`'s thread list does **not** show a distinctly-named NFC/LF worker
+  thread on this firmware even while a scan is genuinely active and reading
+  a real card (confirmed by comparison against `universal_card_reader` mid
+  read) - unlike that app's own testing notes, absence of such a thread in
+  `top` is not by itself evidence a scan failed to start. Use the state
+  machine instead: in single-band mode (`rotation_len == 1`, no phase timer)
+  a lone `Back` returns to the menu if scanning is genuinely in progress, or
+  exits the app outright if a notice had already auto-dismissed - a quick,
+  reliable way to tell the two apart remotely.
+
+**Verified 2026-08-02, on device, with a real payment (EMV/ISO14443-4A)
+card** - the only physical RFID object available in this session: full
+scan → detect → read → describe → report pipeline, `HF only` and `Auto`
+(Auto's first phase is HF and wins detection in ~150-300 ms, well inside
+`HF_PHASE_MS`, so Auto could not be observed reaching LF this session - see
+below). Report contained correct `Band`/`Type: EMV`/`UID`/`ATQA`/`SAK`/
+`ATS hist`/`Frame max`, and **`Payment: EMV application present` fired** -
+the PPSE probe succeeded where Universal Card Reader's fuller EMV chain
+never did on any card tested in this repo. `Chain: ISO14443-4A <- ISO14443-3A`
+confirmed the fork-only-id degradation design works exactly as intended:
+Momentum's `Emv` protocol id (14, not in the SDK enum this app compiles
+against) is simply absent from `hf_chain_order[]`, yet `Type:` still shows
+the firmware's own name and the chain still resolves through
+`nfc_protocol_has_parent()`. `Stack Min` for the app thread was 7424/8188
+bytes after a full read+report cycle - comfortable headroom, no need to
+raise `stack_size` past `8 * 1024`. Menu navigation (all 4 rows), the UHF
+notice (auto-dismiss timing confirmed via the single-Back state-machine
+trick above), and clean exit (`uptime` refused while open, answered again
+after Back x2, uptime kept climbing across the whole session - no resets)
+all confirmed too.
+
+**Not verified on device (no such card was available this session):** LF
+decoded-field rendering (`lf_scan_start()`/`lfrfid_worker` engagement *is*
+confirmed live - firmware log `[D][LfRfidWorker] Read started` - but no
+125 kHz card was present to reach `protocol_dict_render_data()`); the
+HF sections for ISO14443-3B, ISO15693-3, FeliCa, ST25TB, MfUltralight and
+MfClassic (code-reviewed against the SDK headers and ported from
+`card_info.c`'s hardware-proven renderers, but not exercised - no such cards
+were available); Auto-mode's phase-timeout → `rfid_advance_phase()` →
+LF-start transition specifically (needs the antenna clear of any HF card,
+which this session's fixed physical card made impossible; the two halves it
+connects - HF `scan_start`/`scan_stop` and LF `scan_start`/`scan_stop` - are
+each independently confirmed working). Test all of the above with the
+matching cards, and Auto alternation with the antenna clear, before relying
+on them.
+
+---
+
 # context-mode — MANDATORY routing rules
 
 You have context-mode MCP tools available. These rules are NOT optional — they protect your context window from flooding. A single unrouted command can dump 56 KB into context and waste the entire session.

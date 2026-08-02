@@ -1,0 +1,16 @@
+App(
+    appid="rfid_multi_reader",
+    name="RFID Multi-Reader",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="rfid_multi_reader_app",
+    requires=["gui"],
+    # GUI thread runs the animated draw callback plus every nfc_*/lfrfid_worker_*
+    # start/stop and the whole report build. No FlipperFormat writer (no save),
+    # so 8 KB is the starting point — confirm with `top` Stack Min on device.
+    stack_size=8 * 1024,
+    fap_category="Tools",
+    fap_description="Universal RFID reader: 125 kHz LF + 13.56 MHz HF. Read-only.",
+    fap_author="farhadsoft",
+    fap_version="1.0",
+    fap_icon="icon.png",
+)
