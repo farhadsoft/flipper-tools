@@ -1100,11 +1100,11 @@ bool emv_load(EmvData* data, const char* path) {
 
         FuriString* filetype = furi_string_alloc();
         uint32_t version = 0;
-        if(!flipper_format_read_header(ff, filetype, &version)) {
-            furi_string_free(filetype);
-            break;
-        }
+        bool header_ok = flipper_format_read_header(ff, filetype, &version) &&
+                         furi_string_equal_str(filetype, EMV_FILE_TYPE) &&
+                         version == EMV_FILE_VERSION;
         furi_string_free(filetype);
+        if(!header_ok) break;
 
         // AIDs
         uint32_t aid_count = 0;

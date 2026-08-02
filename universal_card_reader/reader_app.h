@@ -14,6 +14,7 @@
 #include <nfc/protocols/nfc_protocol.h>
 #include <lfrfid/lfrfid_worker.h>
 #include <toolbox/protocols/protocol_dict.h>
+#include <storage/storage.h>
 #include "emv.h"
 
 #define TAG "UniCardReader"
@@ -30,6 +31,15 @@
 #define MFUL_READ_TIMEOUT_MS     8000
 #define ISO15693_READ_TIMEOUT_MS 8000  // full block dump inside activate
 #define FELICA_READ_TIMEOUT_MS   6000
+
+// Saved cards live under the app's own data folder, not the shared /ext/nfc
+// and /ext/lfrfid trees, so the Load browser only ever lists this app's files.
+// Files saved by earlier versions stay where they are; they are not migrated.
+#define READER_SAVE_DIR EXT_PATH("apps_data/universal_card_reader")
+// Same path without the /ext prefix, for the save notice: notice_l1 is 32
+// bytes and the screen fits ~27 characters, so the full path would be cut
+// mid-word. 31 chars + NUL fills the buffer exactly.
+#define READER_SAVE_DIR_UI "apps_data/universal_card_reader"
 
 /*
  * Worker threads and the phase timer keep running for a short while after the
@@ -68,6 +78,7 @@ typedef enum {
     ReaderEventActionSave,
     ReaderEventActionEmulate,
     ReaderEventActionRescan,
+    ReaderEventActionLoad,
     ReaderEventActionExit,
     ReaderEventNoticeDone, // NOTICE_MS elapsed
 } ReaderCustomEvent;
@@ -95,6 +106,7 @@ typedef enum {
     ReaderCardNone,
     ReaderCardNfc,
     ReaderCardLf,
+    ReaderCardEmvFile, // EMV fields loaded from a .emv file; no NfcDevice behind them
 } ReaderCardKind;
 
 typedef struct {

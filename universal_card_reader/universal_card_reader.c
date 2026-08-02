@@ -15,6 +15,7 @@
 
 #include <input/input.h>
 
+#include <dialogs/dialogs.h>
 #include <lfrfid/lfrfid_dict_file.h>
 #include <lfrfid/protocols/lfrfid_protocols.h>
 #include <storage/storage.h>
@@ -23,6 +24,7 @@
 #include "reader_ui.h"
 #include "reader_nfc.h"
 #include "reader_lf.h"
+#include "card_info.h"
 
 /* ----------------------------- helpers ------------------------------ */
 
@@ -59,13 +61,15 @@ static void reader_build_path(
     furi_string_cat_str(out, ext);
 }
 
-// nfc_device_save()/lfrfid_dict_file_save() open the file with
-// *_open_always(), which does not create the directory.
-static bool reader_ensure_dir(const char* dir) {
+// storage_simply_mkdir() creates one level and returns true when the path
+// already exists, so every parent is created explicitly. Called from both
+// reader_do_save() and reader_do_load(): the file browser silently walks up
+// to /ext when its base_path is missing, so this is correctness, not hygiene.
+static void reader_ensure_dirs(void) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
-    bool ok = storage_simply_mkdir(storage, dir); // true when it already exists
+    storage_simply_mkdir(storage, EXT_PATH("apps_data"));
+    storage_simply_mkdir(storage, READER_SAVE_DIR);
     furi_record_close(RECORD_STORAGE);
-    return ok;
 }
 
 /* --------------------------- phase lifecycle ------------------------ */
@@ -174,48 +178,149 @@ static void reader_action_callback(void* context, uint32_t index) {
 
 
 static void reader_do_save(ReaderApp* app) {
-    if(app->card == ReaderCardNone) return;
+    if(app->card == ReaderCardNone) {
+        reader_show_notice(app, "No card", "read or load one", "");
+        return;
+    }
+    if(app->card == ReaderCardEmvFile) {
+        reader_show_notice(app, "From file", "already saved", "");
+        return;
+    }
+
+    reader_ensure_dirs();
 
     FuriString* path = furi_string_alloc();
     bool ok = false;
-    const char* dir;
 
     if(app->card == ReaderCardLf) {
-        dir = EXT_PATH("lfrfid");
         const char* name = protocol_dict_get_name(app->dict, app->lf_protocol);
         reader_build_path(
-            path, dir, name ? name : "Unknown", app->scratch_id, app->scratch_id_len, ".rfid");
-        ok = reader_ensure_dir(dir) &&
-             lfrfid_dict_file_save(app->dict, app->lf_protocol, furi_string_get_cstr(path));
+            path, READER_SAVE_DIR, name ? name : "Unknown", app->scratch_id,
+            app->scratch_id_len, ".rfid");
+        ok = lfrfid_dict_file_save(app->dict, app->lf_protocol, furi_string_get_cstr(path));
     } else if(reader_is_payment_card(app)) {
         // EMV / bank card: save ALL data (PAN, expiry, name, AIDs, track2, log)
         // to a dedicated .emv file, not just the base ISO14443-4A UID.
-        dir = EXT_PATH("nfc");
         size_t uid_len = 0;
         const uint8_t* uid = nfc_device_get_uid(app->device, &uid_len);
-        reader_build_path(
-            path, dir, "EMV", uid, uid_len, ".emv");
-        ok = reader_ensure_dir(dir) && emv_save(&app->emv, furi_string_get_cstr(path));
+        reader_build_path(path, READER_SAVE_DIR, "EMV", uid, uid_len, ".emv");
+        ok = emv_save(&app->emv, furi_string_get_cstr(path));
     } else {
-        dir = EXT_PATH("nfc");
         size_t uid_len = 0;
         const uint8_t* uid = nfc_device_get_uid(app->device, &uid_len);
         reader_build_path(
-            path, dir, nfc_device_get_protocol_name(app->display_protocol), uid, uid_len, ".nfc");
-        ok = reader_ensure_dir(dir) && nfc_device_save(app->device, furi_string_get_cstr(path));
+            path, READER_SAVE_DIR, nfc_device_get_protocol_name(app->display_protocol), uid,
+            uid_len, ".nfc");
+        ok = nfc_device_save(app->device, furi_string_get_cstr(path));
     }
 
     const char* full = furi_string_get_cstr(path);
     const char* base = strrchr(full, '/');
     base = base ? base + 1 : full;
     FURI_LOG_I(TAG, "save %s: %s", ok ? "ok" : "FAILED", full);
-    reader_show_notice(app, ok ? "Saved" : "Save failed", dir, base);
+    reader_show_notice(app, ok ? "Saved" : "Save failed", READER_SAVE_DIR_UI, base);
+    furi_string_free(path);
+}
+
+// GUI thread only. dialog_file_browser_show() blocks this thread until the
+// user picks or cancels, so every radio must be down and — critically — the
+// animation timer must be stopped first: view_dispatcher_send_custom_event()
+// blocks FuriWaitForever on a 16-deep queue, so an 80 ms tick left running
+// fills it in ~1.3 s and then blocks the TimersSrv thread for the whole
+// dialog. See invariant 6 in CLAUDE.md.
+static void reader_do_load(ReaderApp* app) {
+    bool from_scan = (app->current_view == ReaderViewScan);
+
+    reader_stop_all(app);
+    app->gen++;
+    furi_timer_stop(app->anim_timer);
+    reader_ensure_dirs();
+
+    FuriString* path = furi_string_alloc_set_str(READER_SAVE_DIR);
+    DialogsFileBrowserOptions opts;
+    dialog_file_browser_set_basic_options(&opts, "*", NULL); // initialises every field
+    opts.base_path = READER_SAVE_DIR;
+    opts.hide_ext = false; // the extension picks the loader; show it
+
+    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+    bool picked = dialog_file_browser_show(dialogs, path, path, &opts);
+    furi_record_close(RECORD_DIALOGS);
+
+    if(!picked) {
+        furi_string_free(path);
+        if(from_scan) {
+            reader_start_nfc_phase(app);
+        } else {
+            reader_switch_view(app, ReaderViewInfo);
+        }
+        return;
+    }
+
+    const char* full = furi_string_get_cstr(path);
+    bool ok = false;
+
+    if(furi_string_end_with_str(path, ".nfc")) {
+        ok = nfc_device_load(app->device, full);
+        if(ok) {
+            memset(&app->emv, 0, sizeof(app->emv)); // no stale bank data from a previous card
+            // display_protocol comes from the firmware's own device table, so it may be
+            // a fork-only protocol (Momentum NfcProtocolEmv/Ntag4xx/Type4Tag) for a file
+            // dropped in over USB - safe here since it is only used for the name/chain
+            // (card_info's dev_has()) and as input to reader_poll_protocol(), which
+            // resolves it via nfc_protocol_has_parent() (firmware-evaluated) to the same
+            // compile-time-whitelisted id a live scan would have produced. Never compare
+            // display_protocol itself against a sentinel.
+            app->display_protocol = nfc_device_get_protocol(app->device);
+            app->poll_protocol = reader_poll_protocol(app->display_protocol);
+            app->card = ReaderCardNfc;
+            reader_report_begin(app);
+            card_info_format_nfc(app->info_text, app->device, app->display_protocol, &app->emv);
+            reader_report_show(app, nfc_device_get_protocol_name(app->display_protocol));
+        }
+    } else if(furi_string_end_with_str(path, ".emv")) {
+        ok = emv_load(&app->emv, full);
+        if(ok) {
+            app->card = ReaderCardEmvFile;
+            reader_report_begin(app);
+            card_info_format_emv(app->info_text, &app->emv);
+            reader_report_show(app, "EMV file");
+        }
+    } else if(furi_string_end_with_str(path, ".rfid")) {
+        ProtocolId id = lfrfid_dict_file_load(app->dict, full);
+        ok = (id != PROTOCOL_NO);
+        if(ok) {
+            app->lf_protocol = id;
+            size_t size = protocol_dict_get_data_size(app->dict, id);
+            if(size > ID_MAX_LEN) size = ID_MAX_LEN;
+            protocol_dict_get_data(app->dict, id, app->scratch_id, size);
+            app->scratch_id_len = size;
+            app->card = ReaderCardLf;
+            const char* name = protocol_dict_get_name(app->dict, id);
+            reader_report_begin(app);
+            card_info_format_lf(
+                app->info_text, name ? name : "Unknown", app->scratch_id, app->scratch_id_len);
+            reader_report_show(app, name ? name : "Unknown");
+        }
+    }
+
+    FURI_LOG_I(TAG, "load %s: %s", ok ? "ok" : "FAILED", full);
+    if(!ok) {
+        const char* base = strrchr(full, '/');
+        reader_show_notice(app, "Load failed", base ? base + 1 : full, "");
+    }
     furi_string_free(path);
 }
 
 
 static void reader_do_emulate(ReaderApp* app) {
-    if(app->card == ReaderCardNone) return;
+    if(app->card == ReaderCardNone) {
+        reader_show_notice(app, "No card", "read or load one", "");
+        return;
+    }
+    if(app->card == ReaderCardEmvFile) {
+        reader_show_notice(app, "Blocked", "no transport data", "in .emv file");
+        return;
+    }
 
     if(app->card == ReaderCardLf) {
         reader_start_lf_emulation(app);
@@ -293,6 +398,7 @@ static bool reader_custom_event_callback(void* context, uint32_t event) {
     case ReaderEventActionSave:    reader_do_save(app);                     return true;
     case ReaderEventActionEmulate: reader_do_emulate(app);                  return true;
     case ReaderEventActionRescan:  reader_start_nfc_phase(app);             return true;
+    case ReaderEventActionLoad:    reader_do_load(app);                     return true;
     case ReaderEventActionExit:    reader_handle_exit(app);                 return true;
     case ReaderEventNoticeDone:    reader_switch_view(app, ReaderViewInfo); return true;
     default:                       return false;
@@ -323,6 +429,14 @@ static bool reader_input_callback(InputEvent* event, void* context) {
             return true;
         }
         return true; // swallow everything else while the notice is up
+    }
+
+    if(event->key == InputKeyOk && state == ReaderStateScanning) {
+        // Routed through the dispatcher like every other action so the radio
+        // teardown stays inside reader_custom_event_callback().
+        view_dispatcher_send_custom_event(
+            app->view_dispatcher, EVENT_MAKE(ReaderEventActionLoad, app->gen));
+        return true;
     }
 
     if(event->key == InputKeyOk && state == ReaderStateError) {
@@ -364,6 +478,9 @@ static ReaderApp* reader_app_alloc(void) {
     // alive and unmodified while the info view is shown.
     app->info_text = furi_string_alloc();
     furi_string_reserve(app->info_text, 8192);
+    furi_string_set_str(app->info_text, "No card loaded.\n\nOK on the scan screen\nopens saved cards.\n");
+    text_box_set_font(app->text_box, TextBoxFontText);
+    text_box_set_text(app->text_box, furi_string_get_cstr(app->info_text));
 
     app->actions = submenu_alloc();
     view_dispatcher_add_view(
@@ -373,6 +490,7 @@ static ReaderApp* reader_app_alloc(void) {
         app->actions, "Emulate", ReaderEventActionEmulate, reader_action_callback, app);
     submenu_add_item(
         app->actions, "Rescan", ReaderEventActionRescan, reader_action_callback, app);
+    submenu_add_item(app->actions, "Load", ReaderEventActionLoad, reader_action_callback, app);
     submenu_add_item(app->actions, "Exit", ReaderEventActionExit, reader_action_callback, app);
 
     app->phase_timer =

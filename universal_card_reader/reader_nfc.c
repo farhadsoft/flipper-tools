@@ -57,13 +57,15 @@ static const NfcProtocol reader_pollable_protocols[] = {
     NfcProtocolSt25tb,
 };
 
-// The most-derived protocol we can safely poll for `p`.
-static NfcProtocol reader_poll_protocol(NfcProtocol p) {
+// The most-derived protocol we can safely poll for `p`. Declared in
+// reader_nfc.h: reader_do_load() reuses it so a loaded .nfc file's
+// poll_protocol satisfies the same invariant as a live scan's.
+NfcProtocol reader_poll_protocol(NfcProtocol p) {
     for(size_t i = 0; i < COUNT_OF(reader_pollable_protocols); i++) {
         NfcProtocol q = reader_pollable_protocols[i];
         if(p == q || nfc_protocol_has_parent(p, q)) return q;
     }
-    return NfcProtocolIso14443_3a; // unreachable for scanner output
+    return NfcProtocolIso14443_3a; // unreachable: every protocol id's chain ends at a base transport, all 5 of which are in the list above
 }
 
 // Protocols nfc_listener_alloc() can actually emulate. Two things must both

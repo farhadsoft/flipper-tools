@@ -104,7 +104,7 @@ Since the module split, `reader_ui.c` is the only file that calls
 exported wrappers (`reader_set_state()`, `reader_get_state()`,
 `reader_bump_frame()`, `reader_set_notice()`).
 
-**Five invariants that are load-bearing — breaking any of them wedges or freezes the device:**
+**Six invariants that are load-bearing — breaking any of them wedges or freezes the device:**
 
 1. **No fork-sensitive enum values.** `reader_poll_protocol()` (in `reader_nfc.c`) picks the
    most-derived pollable protocol from a compile-time whitelist (ids 0..11),
@@ -146,6 +146,15 @@ exported wrappers (`reader_set_state()`, `reader_get_state()`,
    not just the Notice path. Read a plain `ReaderApp` field instead
    (`app->notice_active`), the same way `app->gen` / `app->lf_phase` are
    already read cross-thread elsewhere in this app — see below.
+6. **Any blocking modal call must stop `anim_timer` first.**
+   `view_dispatcher_send_custom_event()` blocks `FuriWaitForever` on a
+   16-deep queue; an 80 ms tick left running while the GUI thread is blocked
+   inside a modal (`dialog_file_browser_show()`, today's only example) fills
+   that queue in ~1.3 s and then blocks the TimersSrv thread for the whole
+   modal. `reader_do_load()` calls `furi_timer_stop(app->anim_timer)` before
+   `dialog_file_browser_show()` for exactly this reason — never add a second
+   blocking dialog call without the same guard, and never move the stop
+   after the call.
 
 `protocol_dict_alloc(lfrfid_protocols, LFRFIDProtocolMax)` passes our
 compile-time count against the firmware's array. Safe when the fork has more
@@ -154,7 +163,11 @@ firmware's own array, so names stay correct.
 
 ## Testing this app
 
-Verified device: Momentum `mntm-dev`, API 87.1, **COM3**. Helper script:
+Verified device: Momentum `mntm-dev`, API 87.1, **COM3** (seen as **COM4**
+mid-session after a reboot — Windows reassigns the port on reconnect, not a
+device change; re-enumerate with `python -c "import serial.tools.list_ports
+as lp; [print(p.device, p.hwid) for p in lp.comports()]"` if a capture can't
+open the port). Helper script:
 `cap.py` at the repo root — a pyserial capture with a hard deadline,
 `--cmd`/`--cmd-delay` for pre-capture CLI commands (repeatable) so `log`
 attaches immediately after, `--deadline` for the capture window, `--out` to
@@ -185,6 +198,26 @@ verbatim. It prints the resolved path to stderr before opening the port.
 - `top` should show `LfrfidWorker` **only** during the LF phase and
   `NfcScanWorker`/`NfcWorker` only during the NFC phase. Overlap means invariant 3
   is broken.
+- **`top` and `log <level>` are both live, continuously-refreshing streams
+  that do not return to the prompt.** Any `--cmd` queued after one of them in
+  the same `cap.py` invocation is silently dropped, not executed — send
+  every triggering input *before* attaching `log`/`top`, never after. To
+  confirm an action fired, prefer a filesystem/thread-list oracle
+  (`storage list`, `top`'s thread table) over trying to catch the log line
+  live.
+- **`loader close` is not always a reliable recovery.** It force-closes an
+  app that is merely on an unexpected *view* (confirmed working for ordinary
+  navigation mix-ups), but it cannot interrupt a GUI thread genuinely
+  blocked inside a synchronous SDK call — confirmed live 2026-08-02 (see the
+  Emulate hang below): `loader close` reported success repeatedly while
+  `loader info` kept showing the app running. `power reboot` over the CLI
+  recovers even that case (device re-enumerates in ~5 s) without needing a
+  physical button-combo reset.
+- **Load's file browser is scoped to `READER_SAVE_DIR`** — confirmed via
+  `top`: `dialogs BrowserWorker`'s `Stack Min` only grows once the browser
+  has actually opened, a reliable non-visual signal the dialog is live
+  before selecting anything (useful generally: there is no way to read the
+  screen over the CLI).
 
 Status logs are `FURI_LOG_I` (detection, read with UID/ID hex, read timeout);
 phase changes and stale-event drops are `FURI_LOG_D`, so capture at `debug` when
@@ -254,6 +287,93 @@ confirmed on device by `top` showing the app thread `Blocked` at an unchanging
 after launch, with zero `phase:` log lines even at `log debug`. Fixed by
 reading a plain field (`app->notice_active`) instead of the model — see
 invariant 5.
+
+**Verified 2026-08-02 — Save retargeted to the app data folder, Load added.**
+`back short` → `ok short` (Save) on a live-read EMV/payment card wrote
+`/ext/apps_data/universal_card_reader/EMV_<UID>.emv`; `storage list
+/ext/nfc` before and after was byte-for-byte the same set of files — nothing
+in the old shared tree moved or was touched. `storage list /ext/apps_data`
+confirms the app-data convention matches a dozen other installed apps
+(`nfc`, `subghz`, `metroflip`, …) already using that same
+`/ext/apps_data/<appid>` root.
+
+Load (via the Actions menu and the scan-screen **OK** shortcut) opens the
+browser scoped to that folder (`dialogs BrowserWorker`'s `Stack Min` growing
+from its 1092-byte idle baseline to 1360–1392 is the non-visual "the dialog
+is actually open" signal used throughout this session, since there is no
+way to read the screen over the CLI) and round-trips a saved `.nfc` file:
+loaded a Mifare Classic dump, deleted it from disk, pressed Save, and the
+identical file reappeared — proof the load → `app->device`/`app->card` →
+save pipeline is intact end to end. Cancelling the browser (**Back**) with
+no selection correctly returns to the report (confirmed by a second
+**Back** opening the actions menu rather than exiting the app — exiting is
+what a stray Back on the *scan* screen does, so surviving it proves Load's
+cancel path went to `ReaderViewInfo`, matching `from_scan == false` for an
+Actions-menu trigger). A `.emv` file whose FlipperFormat header does not say
+`Universal EMV Card`/version 2 (a real `.nfc` file copied over a `.emv`
+extension) is rejected by the hardened `emv_load()` header check without a
+crash — `top` stayed clean (stable `Stack Min`, no stray threads) through
+the whole attempt. `Stack Min` for the app thread ranged 11080–11216 of
+12284 bytes across every Save/Load cycle this session — comfortable margin,
+same ballpark as the pre-Load baseline above.
+
+**Not independently isolated this session:** the scan-screen-specific
+anim-timer hazard (invariant 6) needs Load triggered *from `ReaderViewScan`*
+with `anim_timer` still ticking, held open ≥10 s. The live EMV/payment card
+used throughout this session never left the antenna, so every Rescan
+re-detected and re-read it within roughly 1–2 s — far too narrow a window
+to land a scripted `input send` inside reliably (same constraint already
+noted above for LF). The fix itself was re-confirmed by inspection
+(`furi_timer_stop(app->anim_timer)` unconditionally precedes
+`dialog_file_browser_show()` in `reader_do_load()`) and indirectly
+corroborated: this session held that same dialog open for double-digit
+seconds several times via the Actions-menu path with no TimersSrv-blocked
+symptom. Isolate the scan-screen case specifically with the antenna clear,
+the same way LF needs it.
+
+**Found and fixed 2026-08-02 — `reader_do_load()`'s `.nfc` branch set
+`poll_protocol` directly from `display_protocol`.** A live read sets
+`poll_protocol = reader_poll_protocol(best)`, which walks a protocol up to
+the nearest entry in the pollable/emulatable whitelist; a loaded file was
+instead copying the *most-derived* id straight across. Harmless for a
+protocol that maps to itself in that whitelist (Mifare Classic, tested
+below), but for anything that doesn't — e.g. a Desfire dump, which resolves
+through `Iso14443_4a` — Emulate's `reader_protocol_emulatable()` check would
+silently fail against the wrong id. `reader_poll_protocol()` is now declared
+in `reader_nfc.h` and reused from `reader_do_load()` so a loaded card
+satisfies the exact same invariant a live one does.
+
+**Known firmware-level risk, confirmed live 2026-08-02 — Emulate on a
+*loaded* Mifare Classic file can hang the app, not just misbehave.**
+Loaded the Mifare Classic dump above, triggered Emulate; the GUI thread
+never returned. `top` kept reporting the app thread `Blocked` with no
+`NfcWorker` ever appearing and a *stable* `Stack Min` (i.e. not spinning —
+parked, most likely inside `nfc_listener_alloc()`/`nfc_listener_start()`),
+and — notably — `loader close` reported "was closed" repeatedly while
+`loader info` kept saying the app was still running: the hang is inside a
+blocking SDK call the loader's normal close path cannot interrupt. Recovered
+with `power reboot` over the CLI (no physical button combo needed); the
+retarget/fix work above was re-verified intact afterward. This matches a
+long-documented, still-recurring class of upstream issue — official
+firmware [flipperdevices/flipperzero-firmware#2577](https://github.com/flipperdevices/flipperzero-firmware/issues/2577)
+("Emulating of SAVED Mifare Classic not working", fixed once in 2023 and
+reported recurring since) and
+[DarkFlippers/unleashed-firmware#257](https://github.com/DarkFlippers/unleashed-firmware/issues/257)
+("NFC stuck in emulation… must reset") — not a regression introduced by this
+change: `reader_start_nfc_emulation()` is untouched, pre-existing code using
+the standard `nfc_listener_alloc()`/`nfc_listener_start()` pattern, and the
+*same* live-read → Emulate path is the one already verified working above.
+The risk is specifically **loaded-then-emulated** data on this class of
+card. Whether it is deterministic for this exact dump or intermittent (as
+the upstream reports themselves describe — some tags/cards, not others) was
+not cleanly isolated: a second attempt after rebuilding showed no immediate
+`top`/uptime symptom, but the app was later found unresponsive to
+`loader close` again before that could be confirmed either way. There is
+nothing the app can do to interrupt a firmware call that gives it no
+cancellation hook, so no in-app mitigation was added — but treat Load→
+Emulate on Mifare Classic (and, unverified, any other protocol) as capable
+of hanging the app, recoverable only via `power reboot`, not `loader close`,
+until reproduced/bisected further.
 
 ---
 

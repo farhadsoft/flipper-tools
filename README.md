@@ -4,7 +4,7 @@ Flipper Zero üçün RFID/NFC alətləri toplusu.
 
 Hazırda iş sahəsində bir FAP var: **[universal_card_reader](universal_card_reader/)** —
 tək bir tətbiqdə həm 13.56 MHz NFC, həm də 125 kHz LF RFID kartları
-oxuyur.
+oxuyur, saxlayır, yenidən yükləyir (Load) və emulyasiya edir.
 
 ## Repo strukturu
 

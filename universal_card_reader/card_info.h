@@ -22,3 +22,6 @@ void card_info_format_nfc(
     const EmvData* emv);
 
 void card_info_format_lf(FuriString* out, const char* protocol_name, const uint8_t* id, size_t id_len);
+
+// Report for EMV data restored from a .emv file: no NfcDevice behind it.
+void card_info_format_emv(FuriString* out, const EmvData* emv);

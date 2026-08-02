@@ -2,7 +2,7 @@
 
 Flipper Zero FAP-i — `application.fam` təsviri: **Reads any NFC (13.56MHz) or LF RFID (125kHz) card.**
 
-- **Versiya:** 1.3 (`application.fam`də `fap_version`)
+- **Versiya:** 1.4 (`application.fam`də `fap_version`)
 - **Kateqoriya:** Tools
 - **Yığma stack:** 12 KB
 - **Müəllif:** farhadsoft
@@ -68,9 +68,10 @@ və s.) üçün app ISO14443-4A səviyyəsində aşağıdakı **yalnız oxuma**
 Yazma, yeniləmə və ya PIN/cripto əməliyyatları aparılmır. CVV/CVC2, PIN
 və kartın özəl açarları secure elementdən çıxarılmır.
 
-**Yadda saxlama:** EMV kartları `/ext/nfc/EMV_<UID>.emv` faylına yazılır
-və PAN, son istifadə tarixi, kart sahibi, AID-lər, Track2 və jurnal kimi
-oxunan bütün maliyyə sahələrini saxlayır.
+**Yadda saxlama:** EMV kartları app-ın öz data qovluğuna
+(`/ext/apps_data/universal_card_reader/EMV_<UID>.emv`) yazılır və PAN,
+son istifadə tarixi, kart sahibi, AID-lər, Track2 və jurnal kimi oxunan
+bütün maliyyə sahələrini saxlayır.
 
 **Emulyasiya:** EMV kartı üçün Emulate seçiləndə app ISO14443-4A
 nəqliyyat səviyyəsində emulyasiya başladır (yaxalanmış UID/ATS ilə).
@@ -82,6 +83,22 @@ jurnal başqa bir oxuyucuya ötürülmür.
 > hazırkı kodda EMV məlumatları `.emv` faylında saxlanılır və Emulate
 > ISO14443-4A səviyyəsində işləyir.
 
+## Kartları yadda saxlamaq və yükləmək (Save / Load)
+
+Bütün yadda saxlanan kartlar (`.nfc`, `.emv`, `.rfid`) tək bir qovluqda —
+`/ext/apps_data/universal_card_reader/` altında — app-ın öz data
+qovluğunda saxlanılır, bayaqkı paylaşılan `/ext/nfc` və `/ext/lfrfid`
+qovluqlarından ayrı. Həmin köhnə qovluqlardakı fayllar toxunulmaz qalır —
+köçürülmür, silinmir.
+
+**Load** əməliyyatlar menyusunda (Save/Emulate/Rescan-dan sonra) və ya
+skan ekranında birbaşa **OK** düyməsi ilə açılır: firmware-in öz fayl
+seçici dialoqu yalnız bu qovluğu göstərir. Seçilən fayl nəticə ekranında
+elə canlı oxunmuş kart kimi göstərilir; nəqliyyat məlumatı olan fayllar
+(`.nfc`/`.rfid`) **Emulate** ilə işə salına bilər, təkcə EMV sahələri olan
+`.emv` faylları isə (arxasında heç bir nəqliyyat məlumatı olmadığı üçün)
+emulyasiya üçün bloklanır.
+
 ## Məhdudiyyətlər
 
 - Mifare Classic sektorları yalnız nəqliyyat açarı `FF FF FF FF FF FF`
@@ -90,6 +107,13 @@ jurnal başqa bir oxuyucuya ötürülmür.
   protokoluna qayıdaraq oxunur.
 - UHF / 2.45 GHz Flipper-in daxili avadanlığı ilə dəstəklənmir.
 - EMV emulyasiyası yalnız ISO14443-4A nəqliyyat səviyyəsindədir.
+- **Yüklənmiş (fayldan açılmış) Mifare Classic kartını Emulate etmək bəzən
+  app-i asıla bilər** — bu, firmware səviyyəsində tanınan, uzun müddətdir
+  davam edən bir problemdir (bax: rəsmi firmware issue #2577, Unleashed
+  issue #257), bu app-in kodundan qaynaqlanmır. Asılma zamanı `loader
+  close` işləmir; bərpa üçün cihazı yenidən başlatmaq (`power reboot` CLI
+  əmri və ya fiziki reset) lazımdır. Canlı oxunmuş kartı birbaşa
+  emulyasiya etmək bu problemi göstərməyib.
 
 ## Qurma
 
@@ -126,8 +150,10 @@ Menyu ikonu `icon.png` faylıdır; lazım gələrsə `make_icon.py` ilə
 3. Kart oxunanda nəticə ekranı açılır; məzmun çoxdursa **Yuxarı** /
    **Aşağı** ilə sürüşdürün.
 4. Nəticə ekranında **Geri** düyməsi əməliyyatlar menyusunu açır:
-   **Save**, **Emulate**, **Rescan**, **Exit**.
-5. Skan ekranında **Geri** app-dən çıxar.
+   **Save**, **Emulate**, **Rescan**, **Load**, **Exit**.
+5. Əvvəllər yadda saxlanmış kartı açmaq üçün **Load** seçin (və ya skan
+   ekranından birbaşa **OK** basın) və siyahıdan faylı seçin.
+6. Skan ekranında **Geri** app-dən çıxar.
 
 ## Fayl strukturu
 

@@ -100,8 +100,10 @@ void reader_draw_callback(Canvas* canvas, void* model) {
         draw_centered(canvas, 53, active);
 
         int idle_w = canvas_string_width(canvas, idle);
-        canvas_draw_str(canvas, (SCREEN_W - idle_w) / 2 - 8, 63, idle);
-        draw_dots(canvas, (SCREEN_W + idle_w) / 2 - 2, 62, m->frame);
+        canvas_draw_str(canvas, 2, 63, idle);
+        draw_dots(canvas, idle_w + 5, 62, m->frame);
+        const char* hint = "OK:load";
+        canvas_draw_str(canvas, SCREEN_W - canvas_string_width(canvas, hint) - 2, 63, hint);
         break;
     }
 

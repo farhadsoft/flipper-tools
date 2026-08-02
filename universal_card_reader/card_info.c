@@ -446,7 +446,7 @@ static void card_info_mf_classic(FuriString* out, const NfcDevice* device) {
 
 static void card_info_emv(FuriString* out, const NfcDevice* device, const EmvData* emv) {
     if(!emv->aid_selected && !emv->ppse_ok) {
-        if(dev_has(device, NfcProtocolIso14443_4a)) {
+        if(device && dev_has(device, NfcProtocolIso14443_4a)) {
             out_addf(out, "No EMV app on card\n");
         }
         return;
@@ -580,4 +580,14 @@ void card_info_format_lf(FuriString* out, const char* protocol_name, const uint8
     out_addf(out, "ID: ");
     out_hex(out, id, id_len);
     out_addf(out, "\n");
+}
+
+// Report for EMV data restored from a .emv file: there is no NfcDevice behind
+// it, so only the EMV block is rendered. emv_load() sets ppse_ok, so
+// card_info_emv() never reaches its device-dependent branch.
+void card_info_format_emv(FuriString* out, const EmvData* emv) {
+    out_truncated = false;
+    out_addf(out, "Band: 13.56 MHz\n");
+    out_addf(out, "Type: EMV (from file)\n");
+    card_info_emv(out, NULL, emv);
 }
