@@ -445,7 +445,7 @@ static void card_info_mf_classic(FuriString* out, const NfcDevice* device) {
 }
 
 static void card_info_emv(FuriString* out, const NfcDevice* device, const EmvData* emv) {
-    if(!emv->ppse_ok) {
+    if(!emv->aid_selected && !emv->ppse_ok) {
         if(dev_has(device, NfcProtocolIso14443_4a)) {
             out_addf(out, "No EMV app on card\n");
         }

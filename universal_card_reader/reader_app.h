@@ -25,7 +25,7 @@
 #define NOTICE_MS      1600 // save result / blocked-action message dwell time
 
 #define READ_TIMEOUT_MS 2500
-#define EMV_READ_TIMEOUT_MS 6000
+#define EMV_READ_TIMEOUT_MS 8000 // fallback tries 10 AIDs before GPO/records
 #define MFC_READ_TIMEOUT_MS      12000 // 2 key passes x up to 80 sector requests
 #define MFUL_READ_TIMEOUT_MS     8000
 #define ISO15693_READ_TIMEOUT_MS 8000  // full block dump inside activate

@@ -857,13 +857,107 @@ static void
     }
 }
 
+/* ----------------------- fallback: well-known AIDs ----------------------- */
+
+// Tried in order when SELECT PPSE returns anything other than 9000 with >= 1
+// AID. Covers the six major payment networks and their sub-applications; a
+// card that answers 9000 to any of these has a live EMV application even if
+// it does not expose its PPSE directory.
+typedef struct {
+    const uint8_t* aid;
+    uint8_t len;
+} KnownAid;
+
+static const uint8_t k_aid_visa[] = {0xA0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10};
+static const uint8_t k_aid_visa_debit[] = {0xA0, 0x00, 0x00, 0x00, 0x03, 0x20, 0x10};
+static const uint8_t k_aid_visa_electron[] = {0xA0, 0x00, 0x00, 0x00, 0x03, 0x20, 0x20};
+static const uint8_t k_aid_mc_credit[] = {0xA0, 0x00, 0x00, 0x00, 0x04, 0x10, 0x10};
+static const uint8_t k_aid_mc_debit[] = {0xA0, 0x00, 0x00, 0x00, 0x04, 0x30, 0x60};
+static const uint8_t k_aid_amex[] = {0xA0, 0x00, 0x00, 0x00, 0x25, 0x01, 0x08, 0x01};
+static const uint8_t k_aid_discover[] = {0xA0, 0x00, 0x00, 0x01, 0x52, 0x30, 0x10};
+static const uint8_t k_aid_jcb[] = {0xA0, 0x00, 0x00, 0x00, 0x65, 0x10, 0x10};
+static const uint8_t k_aid_unionpay[] = {0xA0, 0x00, 0x00, 0x03, 0x33, 0x01, 0x01, 0x01};
+static const uint8_t k_aid_visa_interlink[] = {0xA0, 0x00, 0x00, 0x00, 0x03, 0x60, 0x10};
+
+static const KnownAid k_known_aids[] = {
+    {k_aid_visa, sizeof(k_aid_visa)},
+    {k_aid_visa_debit, sizeof(k_aid_visa_debit)},
+    {k_aid_visa_electron, sizeof(k_aid_visa_electron)},
+    {k_aid_visa_interlink, sizeof(k_aid_visa_interlink)},
+    {k_aid_mc_credit, sizeof(k_aid_mc_credit)},
+    {k_aid_mc_debit, sizeof(k_aid_mc_debit)},
+    {k_aid_amex, sizeof(k_aid_amex)},
+    {k_aid_discover, sizeof(k_aid_discover)},
+    {k_aid_jcb, sizeof(k_aid_jcb)},
+    {k_aid_unionpay, sizeof(k_aid_unionpay)},
+};
+
+// Tries every well-known AID when PPSE yielded nothing. Populates out->aid[]
+// with the first (or all) that answer 9000, so emv_select_aid() can pick it
+// up on the next pass. Returns true when at least one AID was added.
+static bool
+    emv_try_fallback_aids(Iso14443_4aPoller* poller, BitBuffer* tx, BitBuffer* rx, EmvData* out) {
+    FURI_LOG_I(TAG, "PPSE failed, trying %u known AIDs", (unsigned)COUNT_OF(k_known_aids));
+
+    for(size_t i = 0; i < COUNT_OF(k_known_aids); i++) {
+        const KnownAid* ka = &k_known_aids[i];
+        uint8_t apdu[5 + EMV_AID_MAX_LEN + 1];
+        apdu[0] = 0x00;
+        apdu[1] = 0xA4;
+        apdu[2] = 0x04;
+        apdu[3] = 0x00;
+        apdu[4] = ka->len;
+        memcpy(&apdu[5], ka->aid, ka->len);
+        apdu[5 + ka->len] = 0x00;
+
+        const uint8_t* body;
+        size_t body_len;
+        uint16_t sw = 0;
+        bool ok = emv_apdu(poller, tx, rx, apdu, 5 + ka->len + 1, &body, &body_len, &sw);
+
+        char aid_hex[EMV_AID_MAX_LEN * 2 + 1];
+        hex_str(ka->aid, ka->len, aid_hex, sizeof(aid_hex));
+        FURI_LOG_I(TAG, "fallback SELECT AID %s sw=%04X", aid_hex, (unsigned)sw);
+
+        if(ok && sw == 0x9000) {
+            ppse_add_aid(out, ka->aid, ka->len);
+            // Also harvest label/PDOL/log from this AID's FCI directly, since
+            // emv_select_aid() will skip it (already selected, re-selecting may
+            // give a different response on some cards).
+            const uint8_t* v;
+            size_t vlen;
+            if(out->label[0] == '\0') {
+                if(tlv_find(body, body_len, 0x50, &v, &vlen)) {
+                    emv_set_label(out->label, sizeof(out->label), v, vlen);
+                } else if(tlv_find(body, body_len, 0x9F12, &v, &vlen)) {
+                    emv_set_label(out->label, sizeof(out->label), v, vlen);
+                }
+            }
+            // Return on first hit: emv_select_aid() will re-select it and do
+            // the full GPO/record chain from there.
+            return true;
+        }
+    }
+    return false;
+}
+
+
 bool emv_read(Iso14443_4aPoller* poller, EmvData* out) {
     memset(out, 0, sizeof(*out));
 
     BitBuffer* tx = bit_buffer_alloc(256);
     BitBuffer* rx = bit_buffer_alloc(256);
 
-    if(emv_select_ppse(poller, tx, rx, out)) {
+    // Step 1: try PPSE (the standard contactless directory).
+    emv_select_ppse(poller, tx, rx, out);
+
+    // Step 2: if PPSE yielded no AIDs, fall back to well-known AIDs.
+    if(out->aid_count == 0) {
+        emv_try_fallback_aids(poller, tx, rx, out);
+    }
+
+    // Step 3: select, GPO, records, log — same chain for both paths.
+    if(out->aid_count > 0) {
         uint8_t pdol[EMV_PDOL_MAX];
         size_t pdol_len = 0;
         if(emv_select_aid(poller, tx, rx, out, pdol, &pdol_len)) {
@@ -887,17 +981,18 @@ bool emv_read(Iso14443_4aPoller* poller, EmvData* out) {
     }
     FURI_LOG_I(
         TAG,
-        "result: PAN %s exp %s label '%s' log %u/%u",
+        "result: PAN %s exp %s label '%s' log %u/%u aids=%u",
         pan_masked,
         out->expiry[0] ? out->expiry : "(none)",
         out->label,
         (unsigned)out->log_rows,
-        (unsigned)out->log_count);
+        (unsigned)out->log_count,
+        (unsigned)out->aid_count);
     FURI_LOG_D(TAG, "unmasked PAN %s", out->pan);
 
     bit_buffer_free(tx);
     bit_buffer_free(rx);
-    return out->ppse_ok;
+    return out->aid_selected;
 }
 
 /* -------------------------- save / load --------------------------- */
