@@ -20,6 +20,8 @@
 
 #include <furi.h>
 #include <toolbox/bit_buffer.h>
+#include <flipper_format/flipper_format.h>
+#include <storage/storage.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -299,7 +301,6 @@ static void emv_harvest_track2(const uint8_t* v, size_t len, EmvData* out) {
             yymm[yymm_n++] = (char)('0' + nibble);
         }
     }
-
     if(out->pan[0] == '\0' && pan_n > 0) {
         memcpy(out->pan, pan_digits, pan_n + 1);
     }
@@ -310,6 +311,11 @@ static void emv_harvest_track2(const uint8_t* v, size_t len, EmvData* out) {
         out->expiry[3] = yymm[0];
         out->expiry[4] = yymm[1];
         out->expiry[5] = '\0';
+    }
+    // Store raw Track 2 equivalent data for save/emulation
+    if(out->track2_len == 0 && len > 0 && len <= EMV_TRACK2_MAX_LEN) {
+        memcpy(out->track2, v, len);
+        out->track2_len = (uint8_t)len;
     }
 }
 
@@ -352,6 +358,46 @@ static void emv_harvest_level(const uint8_t* data, size_t len, EmvData* out, uin
             break;
         case 0x50:
             if(out->label[0] == '\0') emv_set_label(out->label, sizeof(out->label), val, val_len);
+            break;
+        case 0x5F30:
+            // Service code, 3 digits BCD
+            if(out->service_code[0] == '\0' && val_len >= 2) {
+                snprintf(
+                    out->service_code,
+                    sizeof(out->service_code),
+                    "%02X%01X",
+                    (unsigned)val[0],
+                    (unsigned)(val[1] >> 4));
+            }
+            break;
+        case 0x9F12:
+            if(out->app_pref_name[0] == '\0') {
+                size_t n = val_len < EMV_APP_PREF_NAME_LEN ? val_len : EMV_APP_PREF_NAME_LEN;
+                memcpy(out->app_pref_name, val, n);
+                out->app_pref_name[n] = '\0';
+            }
+            break;
+        case 0x5F28:
+            // Issuer country code, ISO 3166, BCD 2 bytes
+            if(out->issuer_country[0] == '\0' && val_len >= 2) {
+                unsigned cc = (unsigned)(val[0] << 8) | val[1];
+                if(cc > 999) cc = 999;
+                snprintf(
+                    out->issuer_country,
+                    sizeof(out->issuer_country),
+                    "%03u",
+                    cc);
+            }
+            break;
+        case 0x5F34:
+            // Card sequence number
+            if(out->card_seq_num[0] == '\0' && val_len >= 1) {
+                size_t n = val_len < EMV_CARD_SEQ_NUM_LEN ? val_len : EMV_CARD_SEQ_NUM_LEN;
+                for(size_t k = 0; k < n; k++) {
+                    out->card_seq_num[k] = (char)('0' + ((val[k] >> 4) & 0x0F));
+                }
+                out->card_seq_num[n] = '\0';
+            }
             break;
         default:
             break;
@@ -852,4 +898,219 @@ bool emv_read(Iso14443_4aPoller* poller, EmvData* out) {
     bit_buffer_free(tx);
     bit_buffer_free(rx);
     return out->ppse_ok;
+}
+
+/* -------------------------- save / load --------------------------- */
+
+#define EMV_FILE_TYPE    "Universal EMV Card"
+#define EMV_FILE_VERSION 2
+
+bool emv_save(const EmvData* data, const char* path) {
+    if(!data || !path) return false;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    FlipperFormat* ff = flipper_format_file_alloc(storage);
+    bool ok = false;
+
+    do {
+        if(!flipper_format_file_open_always(ff, path)) break;
+        if(!flipper_format_write_header_cstr(ff, EMV_FILE_TYPE, EMV_FILE_VERSION)) break;
+
+        // AIDs
+        uint32_t aid_count = data->aid_count;
+        if(!flipper_format_write_uint32(ff, "AID Count", &aid_count, 1)) break;
+        for(uint8_t i = 0; i < data->aid_count; i++) {
+            char key[16];
+            snprintf(key, sizeof(key), "AID %u", (unsigned)i);
+            if(!flipper_format_write_hex(ff, key, data->aid[i], data->aid_len[i])) break;
+        }
+
+        // Text fields
+        if(data->label[0]) {
+            if(!flipper_format_write_string_cstr(ff, "Label", data->label)) break;
+        }
+        if(data->pan[0]) {
+            if(!flipper_format_write_string_cstr(ff, "PAN", data->pan)) break;
+        }
+        if(data->expiry[0]) {
+            if(!flipper_format_write_string_cstr(ff, "Expiry", data->expiry)) break;
+        }
+        if(data->name[0]) {
+            if(!flipper_format_write_string_cstr(ff, "Cardholder", data->name)) break;
+        }
+        if(data->service_code[0]) {
+            if(!flipper_format_write_string_cstr(ff, "Service Code", data->service_code)) break;
+        }
+        if(data->app_pref_name[0]) {
+            if(!flipper_format_write_string_cstr(ff, "App Preferred Name", data->app_pref_name)) break;
+        }
+        if(data->issuer_country[0]) {
+            if(!flipper_format_write_string_cstr(ff, "Issuer Country", data->issuer_country)) break;
+        }
+        if(data->card_seq_num[0]) {
+            if(!flipper_format_write_string_cstr(ff, "Card Sequence", data->card_seq_num)) break;
+        }
+
+        // Track 2 raw data
+        if(data->track2_len > 0) {
+            if(!flipper_format_write_hex(ff, "Track2", data->track2, data->track2_len)) break;
+        }
+
+        // Transaction log
+        uint32_t log_count = data->log_rows;
+        if(log_count > 0) {
+            if(!flipper_format_write_uint32(ff, "Log Count", &log_count, 1)) break;
+            for(uint8_t r = 0; r < data->log_rows; r++) {
+                const EmvLogRow* row = &data->log[r];
+                char key_date[20], key_amt[20], key_cur[20];
+                snprintf(key_date, sizeof(key_date), "Log %u Date", (unsigned)r);
+                snprintf(key_amt, sizeof(key_amt), "Log %u Amount", (unsigned)r);
+                snprintf(key_cur, sizeof(key_cur), "Log %u Currency", (unsigned)r);
+                if(row->has_date) {
+                    if(!flipper_format_write_hex(ff, key_date, row->date, 3)) break;
+                }
+                if(row->has_amount) {
+                    if(!flipper_format_write_hex(ff, key_amt, row->amount, 6)) break;
+                }
+                if(row->has_currency) {
+                    uint32_t cur = row->currency;
+                    if(!flipper_format_write_uint32(ff, key_cur, &cur, 1)) break;
+                }
+            }
+        }
+
+        ok = true;
+    } while(0);
+
+    flipper_format_file_close(ff);
+    flipper_format_free(ff);
+    furi_record_close(RECORD_STORAGE);
+    FURI_LOG_I(TAG, "emv_save %s: %s", ok ? "ok" : "FAILED", path);
+    return ok;
+}
+
+bool emv_load(EmvData* data, const char* path) {
+    if(!data || !path) return false;
+
+    memset(data, 0, sizeof(*data));
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    FlipperFormat* ff = flipper_format_file_alloc(storage);
+    bool ok = false;
+
+    FuriString* tmp = furi_string_alloc();
+
+    do {
+        if(!flipper_format_file_open_existing(ff, path)) break;
+
+        FuriString* filetype = furi_string_alloc();
+        uint32_t version = 0;
+        if(!flipper_format_read_header(ff, filetype, &version)) {
+            furi_string_free(filetype);
+            break;
+        }
+        furi_string_free(filetype);
+
+        // AIDs
+        uint32_t aid_count = 0;
+        if(flipper_format_read_uint32(ff, "AID Count", &aid_count, 1)) {
+            data->aid_count = (uint8_t)(aid_count < EMV_MAX_AIDS ? aid_count : EMV_MAX_AIDS);
+            for(uint8_t i = 0; i < data->aid_count; i++) {
+                char key[16];
+                snprintf(key, sizeof(key), "AID %u", (unsigned)i);
+                uint8_t buf[EMV_AID_MAX_LEN];
+                if(flipper_format_read_hex(ff, key, buf, EMV_AID_MAX_LEN)) {
+                    // We need the actual length - read via key_exist + count
+                    uint32_t count = 0;
+                    if(flipper_format_get_value_count(ff, key, &count)) {
+                        data->aid_len[i] = (uint8_t)(count < EMV_AID_MAX_LEN ? count : EMV_AID_MAX_LEN);
+                        memcpy(data->aid[i], buf, data->aid_len[i]);
+                    }
+                }
+            }
+        }
+
+        // Text fields
+        if(flipper_format_read_string(ff, "Label", tmp)) {
+            strncpy(data->label, furi_string_get_cstr(tmp), EMV_LABEL_MAX_LEN);
+            data->label[EMV_LABEL_MAX_LEN] = '\0';
+        }
+        furi_string_reset(tmp);
+        if(flipper_format_read_string(ff, "PAN", tmp)) {
+            strncpy(data->pan, furi_string_get_cstr(tmp), sizeof(data->pan) - 1);
+            data->pan[sizeof(data->pan) - 1] = '\0';
+        }
+        furi_string_reset(tmp);
+        if(flipper_format_read_string(ff, "Expiry", tmp)) {
+            strncpy(data->expiry, furi_string_get_cstr(tmp), sizeof(data->expiry) - 1);
+            data->expiry[sizeof(data->expiry) - 1] = '\0';
+        }
+        furi_string_reset(tmp);
+        if(flipper_format_read_string(ff, "Cardholder", tmp)) {
+            strncpy(data->name, furi_string_get_cstr(tmp), EMV_NAME_MAX_LEN);
+            data->name[EMV_NAME_MAX_LEN] = '\0';
+        }
+        furi_string_reset(tmp);
+        if(flipper_format_read_string(ff, "Service Code", tmp)) {
+            strncpy(data->service_code, furi_string_get_cstr(tmp), EMV_SERVICE_CODE_LEN);
+            data->service_code[EMV_SERVICE_CODE_LEN] = '\0';
+        }
+        furi_string_reset(tmp);
+        if(flipper_format_read_string(ff, "App Preferred Name", tmp)) {
+            strncpy(data->app_pref_name, furi_string_get_cstr(tmp), EMV_APP_PREF_NAME_LEN);
+            data->app_pref_name[EMV_APP_PREF_NAME_LEN] = '\0';
+        }
+        furi_string_reset(tmp);
+        if(flipper_format_read_string(ff, "Issuer Country", tmp)) {
+            strncpy(data->issuer_country, furi_string_get_cstr(tmp), EMV_ISSUER_COUNTRY_LEN);
+            data->issuer_country[EMV_ISSUER_COUNTRY_LEN] = '\0';
+        }
+        furi_string_reset(tmp);
+        if(flipper_format_read_string(ff, "Card Sequence", tmp)) {
+            strncpy(data->card_seq_num, furi_string_get_cstr(tmp), EMV_CARD_SEQ_NUM_LEN);
+            data->card_seq_num[EMV_CARD_SEQ_NUM_LEN] = '\0';
+        }
+
+        // Track 2
+        uint32_t t2_count = 0;
+        if(flipper_format_get_value_count(ff, "Track2", &t2_count) && t2_count <= EMV_TRACK2_MAX_LEN) {
+            if(flipper_format_read_hex(ff, "Track2", data->track2, (uint16_t)t2_count)) {
+                data->track2_len = (uint8_t)t2_count;
+            }
+        }
+
+        // Transaction log
+        uint32_t log_count = 0;
+        if(flipper_format_read_uint32(ff, "Log Count", &log_count, 1)) {
+            data->log_rows = (uint8_t)(log_count < EMV_MAX_LOG_ROWS ? log_count : EMV_MAX_LOG_ROWS);
+            for(uint8_t r = 0; r < data->log_rows; r++) {
+                EmvLogRow* row = &data->log[r];
+                char key_date[20], key_amt[20], key_cur[20];
+                snprintf(key_date, sizeof(key_date), "Log %u Date", (unsigned)r);
+                snprintf(key_amt, sizeof(key_amt), "Log %u Amount", (unsigned)r);
+                snprintf(key_cur, sizeof(key_cur), "Log %u Currency", (unsigned)r);
+                if(flipper_format_read_hex(ff, key_date, row->date, 3)) {
+                    row->has_date = true;
+                }
+                if(flipper_format_read_hex(ff, key_amt, row->amount, 6)) {
+                    row->has_amount = true;
+                }
+                uint32_t cur = 0;
+                if(flipper_format_read_uint32(ff, key_cur, &cur, 1)) {
+                    row->currency = (uint16_t)cur;
+                    row->has_currency = true;
+                }
+            }
+        }
+
+        data->ppse_ok = true;
+        ok = true;
+    } while(0);
+
+    furi_string_free(tmp);
+    flipper_format_file_close(ff);
+    flipper_format_free(ff);
+    furi_record_close(RECORD_STORAGE);
+    FURI_LOG_I(TAG, "emv_load %s: %s", ok ? "ok" : "FAILED", path);
+    return ok;
 }

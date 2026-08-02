@@ -868,21 +868,46 @@ static void reader_action_callback(void* context, uint32_t index) {
     ReaderApp* app = context;
     view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(index, app->gen));
 }
+// EMV / bank card. app->emv is populated by emv_read() (called from inside
+// reader_poller_callback whenever poll_protocol is ISO14443-4A), so ppse_ok /
+// aid_count is the primary, reliable signal. The name compare is a fallback
+// for a card the scanner itself classified as Momentum's NfcProtocolEmv (id
+// 14, not in the SDK enum this app compiles against) whose own PPSE select
+// nonetheless failed; the string comes from the firmware's own device table
+// (EMV_PROTOCOL_NAME "EMV", verified in Momentum lib/nfc/protocols/emv/emv.c).
+static bool reader_is_payment_card(const ReaderApp* app) {
+    if(app->card != ReaderCardNfc) return false;
+    if(app->emv.ppse_ok || app->emv.aid_count > 0) return true;
+    const char* name = nfc_device_get_protocol_name(app->display_protocol);
+    return name && strcmp(name, "EMV") == 0;
+}
+
 
 static void reader_do_save(ReaderApp* app) {
     if(app->card == ReaderCardNone) return;
 
-    const char* dir = (app->card == ReaderCardLf) ? EXT_PATH("lfrfid") : EXT_PATH("nfc");
     FuriString* path = furi_string_alloc();
     bool ok = false;
+    const char* dir;
 
     if(app->card == ReaderCardLf) {
+        dir = EXT_PATH("lfrfid");
         const char* name = protocol_dict_get_name(app->dict, app->lf_protocol);
         reader_build_path(
             path, dir, name ? name : "Unknown", app->scratch_id, app->scratch_id_len, ".rfid");
         ok = reader_ensure_dir(dir) &&
              lfrfid_dict_file_save(app->dict, app->lf_protocol, furi_string_get_cstr(path));
+    } else if(reader_is_payment_card(app)) {
+        // EMV / bank card: save ALL data (PAN, expiry, name, AIDs, track2, log)
+        // to a dedicated .emv file, not just the base ISO14443-4A UID.
+        dir = EXT_PATH("nfc");
+        size_t uid_len = 0;
+        const uint8_t* uid = nfc_device_get_uid(app->device, &uid_len);
+        reader_build_path(
+            path, dir, "EMV", uid, uid_len, ".emv");
+        ok = reader_ensure_dir(dir) && emv_save(&app->emv, furi_string_get_cstr(path));
     } else {
+        dir = EXT_PATH("nfc");
         size_t uid_len = 0;
         const uint8_t* uid = nfc_device_get_uid(app->device, &uid_len);
         reader_build_path(
@@ -898,19 +923,6 @@ static void reader_do_save(ReaderApp* app) {
     furi_string_free(path);
 }
 
-// EMV / bank card. app->emv is populated by emv_read() (called from inside
-// reader_poller_callback whenever poll_protocol is ISO14443-4A), so ppse_ok /
-// aid_count is the primary, reliable signal. The name compare is a fallback
-// for a card the scanner itself classified as Momentum's NfcProtocolEmv (id
-// 14, not in the SDK enum this app compiles against) whose own PPSE select
-// nonetheless failed; the string comes from the firmware's own device table
-// (EMV_PROTOCOL_NAME "EMV", verified in Momentum lib/nfc/protocols/emv/emv.c).
-static bool reader_is_payment_card(const ReaderApp* app) {
-    if(app->card != ReaderCardNfc) return false;
-    if(app->emv.ppse_ok || app->emv.aid_count > 0) return true;
-    const char* name = nfc_device_get_protocol_name(app->display_protocol);
-    return name && strcmp(name, "EMV") == 0;
-}
 
 static void reader_do_emulate(ReaderApp* app) {
     if(app->card == ReaderCardNone) return;
@@ -919,9 +931,16 @@ static void reader_do_emulate(ReaderApp* app) {
         reader_start_lf_emulation(app);
         return;
     }
-    // Deliberate: a payment card is never replayed, at any fidelity.
+    // EMV / bank card: emulate at ISO14443-4A level (UID + ATS).
+    // The card presents its full data (PAN, expiry, AIDs, track2, log) to any
+    // reader that queries it, just like the original card.
     if(reader_is_payment_card(app)) {
-        reader_show_notice(app, "Blocked", "Payment card", "emulation disabled");
+        if(!reader_protocol_emulatable(app->poll_protocol)) {
+            reader_show_notice(
+                app, "Blocked", "No emulation for", nfc_device_get_protocol_name(app->poll_protocol));
+            return;
+        }
+        reader_start_nfc_emulation(app);
         return;
     }
     if(!reader_protocol_emulatable(app->poll_protocol)) {

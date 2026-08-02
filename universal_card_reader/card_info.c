@@ -478,6 +478,24 @@ static void card_info_emv(FuriString* out, const NfcDevice* device, const EmvDat
         out_addf(out, "Name: not disclosed\n");
     }
 
+    if(emv->service_code[0]) {
+        out_addf(out, "Service Code: %s\n", emv->service_code);
+    }
+    if(emv->app_pref_name[0]) {
+        out_addf(out, "Pref Name: %s\n", emv->app_pref_name);
+    }
+    if(emv->issuer_country[0]) {
+        out_addf(out, "Country: %s\n", emv->issuer_country);
+    }
+    if(emv->card_seq_num[0]) {
+        out_addf(out, "Seq #: %s\n", emv->card_seq_num);
+    }
+    if(emv->track2_len > 0) {
+        out_addf(out, "Track2: ");
+        out_hex(out, emv->track2, emv->track2_len);
+        out_addf(out, "\n");
+    }
+
     if(emv->log_count) {
         out_addf(out, "Txn log: %u records\n", (unsigned)emv->log_count);
         for(uint8_t r = 0; r < emv->log_rows; r++) {
