@@ -70,7 +70,9 @@ NfcProtocol reader_poll_protocol(NfcProtocol p) {
 
 // Protocols nfc_listener_alloc() can actually emulate. Two things must both
 // hold, checked against Momentum mntm-dev 42630e91 (identical to official
-// 1.4.3): the protocol's own entry in nfc_listeners_api[] must be non-NULL
+// 1.4.3); NfcProtocol enum ids re-confirmed unchanged at commit 8ed809fb
+// (2026-06-02 build) via nfc_protocol.h: the protocol's own entry in
+// nfc_listeners_api[] must be non-NULL
 // (nfc_listener_alloc furi_check()s exactly that), AND every ancestor's entry
 // must be non-NULL too (nfc_listener_list_alloc() walks the whole parent
 // chain and calls each ancestor's ->alloc() with no NULL check at all — an

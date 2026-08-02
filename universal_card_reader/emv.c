@@ -1101,6 +1101,33 @@ bool emv_save(const EmvData* data, const NfcDevice* device, const char* path) {
     return ok;
 }
 
+// flipper_format_read_* (read_string / read_hex / read_uint32) scan forward
+// from the current cursor and, on a miss, leave the stream at EOF without
+// restoring the position - unlike get_value_count / key_exist, which DO
+// save and restore it. So every optional field read here must record the
+// cursor first and seek back on failure; otherwise the first absent field
+// strands the cursor at EOF and silently drops every field after it,
+// including the ISO14443-4A transport block that gates emulation - which is
+// exactly the "no transport data" / Blocked path the user hit. A card that
+// withholds, say, its application label writes no "Label" line; loading that
+// file then lost PAN/Expiry/UID/ATS. (The earlier "verified" card happened to
+// disclose every field before any gap, so no miss stranded the cursor.)
+static void emv_load_str(
+    FlipperFormat* ff,
+    const char* key,
+    FuriString* tmp,
+    char* dst,
+    size_t cap) {
+    size_t pos = flipper_format_tell(ff);
+    if(flipper_format_read_string(ff, key, tmp)) {
+        strncpy(dst, furi_string_get_cstr(tmp), cap);
+        dst[cap] = '\0';
+    } else {
+        flipper_format_seek(ff, (int32_t)pos, FlipperFormatOffsetFromStart);
+    }
+    furi_string_reset(tmp);
+}
+
 bool emv_load(EmvData* data, NfcDevice* device, const char* path) {
     if(!data || !device || !path) return false;
 
@@ -1123,95 +1150,99 @@ bool emv_load(EmvData* data, NfcDevice* device, const char* path) {
         furi_string_free(filetype);
         if(!header_ok) break;
 
-        // AIDs
-        uint32_t aid_count = 0;
-        if(flipper_format_read_uint32(ff, "AID Count", &aid_count, 1)) {
-            data->aid_count = (uint8_t)(aid_count < EMV_MAX_AIDS ? aid_count : EMV_MAX_AIDS);
-            for(uint8_t i = 0; i < data->aid_count; i++) {
-                char key[16];
-                snprintf(key, sizeof(key), "AID %u", (unsigned)i);
-                uint8_t buf[EMV_AID_MAX_LEN];
-                if(flipper_format_read_hex(ff, key, buf, EMV_AID_MAX_LEN)) {
-                    // We need the actual length - read via key_exist + count
-                    uint32_t count = 0;
-                    if(flipper_format_get_value_count(ff, key, &count)) {
-                        data->aid_len[i] = (uint8_t)(count < EMV_AID_MAX_LEN ? count : EMV_AID_MAX_LEN);
-                        memcpy(data->aid[i], buf, data->aid_len[i]);
+        // AIDs. AID Count is mandatory-ish (always written by emv_save); a
+        // missing one still must not strand the cursor for what follows.
+        {
+            size_t pos = flipper_format_tell(ff);
+            uint32_t aid_count = 0;
+            if(flipper_format_read_uint32(ff, "AID Count", &aid_count, 1)) {
+                data->aid_count = (uint8_t)(aid_count < EMV_MAX_AIDS ? aid_count : EMV_MAX_AIDS);
+                for(uint8_t i = 0; i < data->aid_count; i++) {
+                    char key[16];
+                    snprintf(key, sizeof(key), "AID %u", (unsigned)i);
+                    size_t apos = flipper_format_tell(ff);
+                    uint8_t buf[EMV_AID_MAX_LEN];
+                    if(flipper_format_read_hex(ff, key, buf, EMV_AID_MAX_LEN)) {
+                        // get_value_count restores the cursor itself, so it is
+                        // safe to call after a successful read; it re-seeks to
+                        // the key from the start and returns the value count.
+                        uint32_t count = 0;
+                        if(flipper_format_get_value_count(ff, key, &count)) {
+                            data->aid_len[i] =
+                                (uint8_t)(count < EMV_AID_MAX_LEN ? count : EMV_AID_MAX_LEN);
+                            memcpy(data->aid[i], buf, data->aid_len[i]);
+                        }
+                    } else {
+                        flipper_format_seek(ff, (int32_t)apos, FlipperFormatOffsetFromStart);
                     }
                 }
+            } else {
+                flipper_format_seek(ff, (int32_t)pos, FlipperFormatOffsetFromStart);
             }
         }
 
-        // Text fields
-        if(flipper_format_read_string(ff, "Label", tmp)) {
-            strncpy(data->label, furi_string_get_cstr(tmp), EMV_LABEL_MAX_LEN);
-            data->label[EMV_LABEL_MAX_LEN] = '\0';
-        }
-        furi_string_reset(tmp);
-        if(flipper_format_read_string(ff, "PAN", tmp)) {
-            strncpy(data->pan, furi_string_get_cstr(tmp), sizeof(data->pan) - 1);
-            data->pan[sizeof(data->pan) - 1] = '\0';
-        }
-        furi_string_reset(tmp);
-        if(flipper_format_read_string(ff, "Expiry", tmp)) {
-            strncpy(data->expiry, furi_string_get_cstr(tmp), sizeof(data->expiry) - 1);
-            data->expiry[sizeof(data->expiry) - 1] = '\0';
-        }
-        furi_string_reset(tmp);
-        if(flipper_format_read_string(ff, "Cardholder", tmp)) {
-            strncpy(data->name, furi_string_get_cstr(tmp), EMV_NAME_MAX_LEN);
-            data->name[EMV_NAME_MAX_LEN] = '\0';
-        }
-        furi_string_reset(tmp);
-        if(flipper_format_read_string(ff, "Service Code", tmp)) {
-            strncpy(data->service_code, furi_string_get_cstr(tmp), EMV_SERVICE_CODE_LEN);
-            data->service_code[EMV_SERVICE_CODE_LEN] = '\0';
-        }
-        furi_string_reset(tmp);
-        if(flipper_format_read_string(ff, "App Preferred Name", tmp)) {
-            strncpy(data->app_pref_name, furi_string_get_cstr(tmp), EMV_APP_PREF_NAME_LEN);
-            data->app_pref_name[EMV_APP_PREF_NAME_LEN] = '\0';
-        }
-        furi_string_reset(tmp);
-        if(flipper_format_read_string(ff, "Issuer Country", tmp)) {
-            strncpy(data->issuer_country, furi_string_get_cstr(tmp), EMV_ISSUER_COUNTRY_LEN);
-            data->issuer_country[EMV_ISSUER_COUNTRY_LEN] = '\0';
-        }
-        furi_string_reset(tmp);
-        if(flipper_format_read_string(ff, "Card Sequence", tmp)) {
-            strncpy(data->card_seq_num, furi_string_get_cstr(tmp), EMV_CARD_SEQ_NUM_LEN);
-            data->card_seq_num[EMV_CARD_SEQ_NUM_LEN] = '\0';
-        }
+        // Text fields - each restores the cursor on a miss.
+        emv_load_str(ff, "Label", tmp, data->label, EMV_LABEL_MAX_LEN);
+        emv_load_str(ff, "PAN", tmp, data->pan, sizeof(data->pan) - 1);
+        emv_load_str(ff, "Expiry", tmp, data->expiry, sizeof(data->expiry) - 1);
+        emv_load_str(ff, "Cardholder", tmp, data->name, EMV_NAME_MAX_LEN);
+        emv_load_str(ff, "Service Code", tmp, data->service_code, EMV_SERVICE_CODE_LEN);
+        emv_load_str(ff, "App Preferred Name", tmp, data->app_pref_name, EMV_APP_PREF_NAME_LEN);
+        emv_load_str(ff, "Issuer Country", tmp, data->issuer_country, EMV_ISSUER_COUNTRY_LEN);
+        emv_load_str(ff, "Card Sequence", tmp, data->card_seq_num, EMV_CARD_SEQ_NUM_LEN);
 
-        // Track 2
-        uint32_t t2_count = 0;
-        if(flipper_format_get_value_count(ff, "Track2", &t2_count) && t2_count <= EMV_TRACK2_MAX_LEN) {
-            if(flipper_format_read_hex(ff, "Track2", data->track2, (uint16_t)t2_count)) {
-                data->track2_len = (uint8_t)t2_count;
+        // Track 2. get_value_count restores the cursor itself; the read_hex
+        // after it seeks from the start, so a missing Track2 is naturally
+        // safe, but the read_hex failure path still needs a rewind guard.
+        {
+            uint32_t t2_count = 0;
+            if(flipper_format_get_value_count(ff, "Track2", &t2_count) &&
+               t2_count <= EMV_TRACK2_MAX_LEN) {
+                size_t pos = flipper_format_tell(ff);
+                if(flipper_format_read_hex(ff, "Track2", data->track2, (uint16_t)t2_count)) {
+                    data->track2_len = (uint8_t)t2_count;
+                } else {
+                    flipper_format_seek(ff, (int32_t)pos, FlipperFormatOffsetFromStart);
+                }
             }
         }
 
-        // Transaction log
-        uint32_t log_count = 0;
-        if(flipper_format_read_uint32(ff, "Log Count", &log_count, 1)) {
-            data->log_rows = (uint8_t)(log_count < EMV_MAX_LOG_ROWS ? log_count : EMV_MAX_LOG_ROWS);
-            for(uint8_t r = 0; r < data->log_rows; r++) {
-                EmvLogRow* row = &data->log[r];
-                char key_date[20], key_amt[20], key_cur[20];
-                snprintf(key_date, sizeof(key_date), "Log %u Date", (unsigned)r);
-                snprintf(key_amt, sizeof(key_amt), "Log %u Amount", (unsigned)r);
-                snprintf(key_cur, sizeof(key_cur), "Log %u Currency", (unsigned)r);
-                if(flipper_format_read_hex(ff, key_date, row->date, 3)) {
-                    row->has_date = true;
+        // Transaction log. Log Count and each per-row field are all optional.
+        {
+            size_t pos = flipper_format_tell(ff);
+            uint32_t log_count = 0;
+            if(flipper_format_read_uint32(ff, "Log Count", &log_count, 1)) {
+                data->log_rows =
+                    (uint8_t)(log_count < EMV_MAX_LOG_ROWS ? log_count : EMV_MAX_LOG_ROWS);
+                for(uint8_t r = 0; r < data->log_rows; r++) {
+                    EmvLogRow* row = &data->log[r];
+                    char key_date[20], key_amt[20], key_cur[20];
+                    snprintf(key_date, sizeof(key_date), "Log %u Date", (unsigned)r);
+                    snprintf(key_amt, sizeof(key_amt), "Log %u Amount", (unsigned)r);
+                    snprintf(key_cur, sizeof(key_cur), "Log %u Currency", (unsigned)r);
+                    size_t p1 = flipper_format_tell(ff);
+                    if(flipper_format_read_hex(ff, key_date, row->date, 3)) {
+                        row->has_date = true;
+                    } else {
+                        flipper_format_seek(ff, (int32_t)p1, FlipperFormatOffsetFromStart);
+                    }
+                    size_t p2 = flipper_format_tell(ff);
+                    if(flipper_format_read_hex(ff, key_amt, row->amount, 6)) {
+                        row->has_amount = true;
+                    } else {
+                        flipper_format_seek(ff, (int32_t)p2, FlipperFormatOffsetFromStart);
+                    }
+                    size_t p3 = flipper_format_tell(ff);
+                    uint32_t cur = 0;
+                    if(flipper_format_read_uint32(ff, key_cur, &cur, 1)) {
+                        row->currency = (uint16_t)cur;
+                        row->has_currency = true;
+                    } else {
+                        flipper_format_seek(ff, (int32_t)p3, FlipperFormatOffsetFromStart);
+                    }
                 }
-                if(flipper_format_read_hex(ff, key_amt, row->amount, 6)) {
-                    row->has_amount = true;
-                }
-                uint32_t cur = 0;
-                if(flipper_format_read_uint32(ff, key_cur, &cur, 1)) {
-                    row->currency = (uint16_t)cur;
-                    row->has_currency = true;
-                }
+            } else {
+                flipper_format_seek(ff, (int32_t)pos, FlipperFormatOffsetFromStart);
             }
         }
 
@@ -1221,14 +1252,22 @@ bool emv_load(EmvData* data, NfcDevice* device, const char* path) {
         // mirrors a .nfc file's 4A section, so the firmware's own loader
         // parses it; version 3 > NFC_LSB_ATQA_FORMAT_VERSION, so its ATQA
         // un-swap matches the MSB-first order iso14443_3a_save() wrote.
+        // key_exist and get_value_count both restore the cursor; read_hex
+        // does not, so rewind it on failure before handing off to
+        // iso14443_4a_load (which reads ATQA/SAK/T0... sequentially from the
+        // cursor the read_hex left behind).
         if(flipper_format_key_exist(ff, "UID")) {
             Iso14443_4aData* transport = iso14443_4a_alloc();
             do {
                 uint32_t uid_len = 0;
                 if(!flipper_format_get_value_count(ff, "UID", &uid_len)) break;
                 if(uid_len == 0 || uid_len > ISO14443_3A_MAX_UID_SIZE) break;
+                size_t uid_pos = flipper_format_tell(ff);
                 uint8_t uid[ISO14443_3A_MAX_UID_SIZE];
-                if(!flipper_format_read_hex(ff, "UID", uid, (uint16_t)uid_len)) break;
+                if(!flipper_format_read_hex(ff, "UID", uid, (uint16_t)uid_len)) {
+                    flipper_format_seek(ff, (int32_t)uid_pos, FlipperFormatOffsetFromStart);
+                    break;
+                }
                 if(!iso14443_4a_set_uid(transport, uid, uid_len)) break;
                 if(!iso14443_4a_load(transport, ff, version)) break;
                 nfc_device_set_data(

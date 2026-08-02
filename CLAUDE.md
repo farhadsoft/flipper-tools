@@ -438,6 +438,34 @@ known MfClassic hang). Backward compatibility for the v2 load itself
 (financial fields only, notice on Emulate) is unchanged code from the
 already-verified Load session above.
 
+**Second fix 2026-08-02 — Load still reported "Blocked / no transport data"
+for cards that withheld optional fields.** The v3 transport feature above
+was correct on the *save* side, but `emv_load()` re-introduced the same
+symptom through a FlipperFormat cursor bug. Root cause (read from firmware
+source `lib/flipper_format/flipper_format_stream.c`): `flipper_format_read_*`
+(`read_string`/`read_hex`/`read_uint32`) call `seek_to_key`, which scans
+forward from the current cursor and, on a *miss*, leaves the stream at EOF
+without restoring the position — unlike `get_value_count` and `key_exist`,
+which both save/restore the cursor internally. The old `emv_load` read each
+optional field (`Label`, `PAN`, `Expiry`, `Cardholder`, `Service Code`,
+`App Preferred Name`, `Issuer Country`, `Card Sequence`, `Track2`, `Log
+Count`, per-row log fields) with a bare `if(flipper_format_read_*(...))`.
+The first field a card did not disclose was absent from the file, so its
+read scanned to EOF and every subsequent sequential read — including `UID`
+and the whole ISO14443-4A transport block — silently failed. `has_transport`
+stayed false → `reader_do_emulate` showed "Blocked / no transport data". The
+earlier "verified" card happened to disclose every field before any gap, so
+no miss ever stranded the cursor and the bug stayed hidden. Fix:
+`emv_load` now records `flipper_format_tell()` before each optional read and
+`flipper_format_seek(..., FlipperFormatOffsetFromStart)` back on failure,
+exactly mirroring what `get_value_count`/`key_exist` already do; the text
+fields go through a small `emv_load_str` helper. Verified by a host
+simulation that replays the firmware's exact `seek_to_key`/`read_value_line`
+cursor semantics against (a) a full file (all fields present) — old=True,
+new=True, and (b) a sparse file omitting the early optional fields —
+old=False (Blocked), new=True (emulates). Build clean, APPCHK pass
+(Target 7, API 87.1, Momentum mntm-dev, COM4).
+
 ---
 
 # RFID Multi-Reader
