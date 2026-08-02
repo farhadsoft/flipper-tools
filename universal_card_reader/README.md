@@ -122,7 +122,9 @@ and start it from **Apps → Tools** on the device.
    - For EMV cards: **AID**, **App** (label), **PAN**, **Expiry**, **Name** and
      **Txn log** entries — see [EMV bank cards](#emv-bank-cards) — or "No EMV
      app on card" if it has no payment application at all
-4. **OK** rescans, **Back** exits.
+4. **Back** on the result screen goes straight back to scanning for the next
+   card; **Back** on the scanning screen exits the app. If a read fails, the
+   "Read failed" screen offers **OK** to retry and **Back** to exit.
 
 If a card is not picked up right away, keep it in place for a couple of seconds — it may
 need to wait through one full phase cycle before its band's turn comes around. Some

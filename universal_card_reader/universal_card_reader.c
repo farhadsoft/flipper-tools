@@ -100,6 +100,7 @@ typedef struct {
     FuriString* info_text; // backing store for the TextBox; must outlive the text pointer
     FuriTimer* phase_timer;
     FuriTimer* anim_timer;
+    ReaderView current_view; // kept in sync by reader_switch_view()
 
     // NFC side
     Nfc* nfc;
@@ -358,6 +359,20 @@ static void reader_stop_all(ReaderApp* app) {
     reader_stop_lf(app);
 }
 
+// The only place that changes views. Keeps current_view (which the navigation
+// callback reads) and the animation timer in sync: only the scan view animates,
+// so a timer left running on a static screen would post a tick into the
+// dispatcher every ANIM_PERIOD_MS for nothing.
+static void reader_switch_view(ReaderApp* app, ReaderView view) {
+    app->current_view = view;
+    if(view == ReaderViewScan) {
+        furi_timer_start(app->anim_timer, furi_ms_to_ticks(ANIM_PERIOD_MS));
+    } else {
+        furi_timer_stop(app->anim_timer);
+    }
+    view_dispatcher_switch_to_view(app->view_dispatcher, view);
+}
+
 static void reader_set_scanning(ReaderApp* app, bool lf) {
     with_view_model(
         app->view,
@@ -568,7 +583,7 @@ static void reader_start_nfc_phase(ReaderApp* app) {
     app->lf_phase = false;
     reader_set_scanning(app, false);
     // Rescan from the info screen (Back) must land on the scan view again.
-    view_dispatcher_switch_to_view(app->view_dispatcher, ReaderViewScan);
+    reader_switch_view(app, ReaderViewScan);
 
     FURI_LOG_D(TAG, "phase: NFC (gen %lu)", (unsigned long)app->gen);
     app->scanner = nfc_scanner_alloc(app->nfc);
@@ -581,7 +596,7 @@ static void reader_start_lf_phase(ReaderApp* app) {
     app->gen++;
     app->lf_phase = true;
     reader_set_scanning(app, true);
-    view_dispatcher_switch_to_view(app->view_dispatcher, ReaderViewScan);
+    reader_switch_view(app, ReaderViewScan);
 
     FURI_LOG_D(TAG, "phase: LF (gen %lu)", (unsigned long)app->gen);
     lfrfid_worker_start_thread(app->worker);
@@ -593,12 +608,31 @@ static void reader_start_lf_phase(ReaderApp* app) {
 
 /* --------------------------- view callbacks ------------------------- */
 
-// Back from the info screen: rescan immediately. Runs on the GUI thread, so
-// starting the NFC phase here is legal. VIEW_IGNORE because the phase start
-// already switched the view.
-static uint32_t reader_info_previous_callback(void* context) {
-    reader_start_nfc_phase(context);
-    return VIEW_IGNORE;
+// Back that no view consumed. Runs on the GUI thread (input path), so starting
+// a phase here is legal.
+//
+// This has to be the dispatcher's navigation callback rather than the info
+// view's previous_callback: view_previous() passes view->context, and
+// text_box_alloc() sets that to the TextBox itself, so a previous_callback
+// would receive a TextBox* to use as a ReaderApp*. Measured on the device:
+// prev_ctx == text_box (0x2000A578), app was 0x2000A5C0 — dereferencing it
+// crashed the firmware. The dispatcher passes event_context, i.e. the app.
+static bool reader_navigation_callback(void* context) {
+    ReaderApp* app = context;
+
+    // The info TextBox never consumes Back; the scan view consumes only short
+    // and repeat presses, so a long Back from there lands here too.
+    if(app->current_view == ReaderViewInfo) {
+        reader_start_nfc_phase(app);
+        return true;
+    }
+
+    // Leaving: release the radio now and retire every event still queued from
+    // the phase we are killing, then let the dispatcher stop. run() returns and
+    // reader_app_free() does the rest.
+    reader_stop_all(app);
+    app->gen++;
+    return false;
 }
 
 static bool reader_custom_event_callback(void* context, uint32_t event) {
@@ -669,7 +703,7 @@ static bool reader_custom_event_callback(void* context, uint32_t event) {
         text_box_set_font(app->text_box, TextBoxFontText);
         text_box_set_focus(app->text_box, TextBoxFocusStart);
         text_box_set_text(app->text_box, furi_string_get_cstr(app->info_text));
-        view_dispatcher_switch_to_view(app->view_dispatcher, ReaderViewInfo);
+        reader_switch_view(app, ReaderViewInfo);
         return true;
 
     case ReaderEventLfRead: {
@@ -698,13 +732,14 @@ static bool reader_custom_event_callback(void* context, uint32_t event) {
         text_box_set_font(app->text_box, TextBoxFontText);
         text_box_set_focus(app->text_box, TextBoxFocusStart);
         text_box_set_text(app->text_box, furi_string_get_cstr(app->info_text));
-        view_dispatcher_switch_to_view(app->view_dispatcher, ReaderViewInfo);
+        reader_switch_view(app, ReaderViewInfo);
         return true;
     }
 
     case ReaderEventError:
         reader_stop_all(app);
         app->gen++;
+        furi_timer_stop(app->anim_timer); // the error screen is static
         with_view_model(app->view, ReaderModel * m, { m->state = ReaderStateError; }, true);
         return true;
 
@@ -725,12 +760,8 @@ static bool reader_input_callback(InputEvent* event, void* context) {
         return true;
     }
 
-    if(event->key == InputKeyBack) {
-        reader_stop_all(app);
-        app->gen++;
-        view_dispatcher_stop(app->view_dispatcher);
-        return true;
-    }
+    // Back is deliberately left unconsumed: it falls through to the
+    // dispatcher's navigation callback, which owns both rescan and exit.
 
     return false;
 }
@@ -752,26 +783,25 @@ static ReaderApp* reader_app_alloc(void) {
 
     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
     view_dispatcher_set_custom_event_callback(app->view_dispatcher, reader_custom_event_callback);
+    view_dispatcher_set_navigation_event_callback(
+        app->view_dispatcher, reader_navigation_callback);
     view_dispatcher_add_view(app->view_dispatcher, ReaderViewScan, app->view);
 
     app->text_box = text_box_alloc();
     view_dispatcher_add_view(
         app->view_dispatcher, ReaderViewInfo, text_box_get_view(app->text_box));
-    view_set_previous_callback(
-        text_box_get_view(app->text_box), reader_info_previous_callback);
     // text_box_set_text() stores the raw pointer, so this string must stay
     // alive and unmodified while the info view is shown.
     app->info_text = furi_string_alloc();
     furi_string_reserve(app->info_text, 8192);
 
-    view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
-    view_dispatcher_switch_to_view(app->view_dispatcher, ReaderViewScan);
-
     app->phase_timer =
         furi_timer_alloc(reader_phase_timer_callback, FuriTimerTypeOnce, app);
     app->anim_timer =
         furi_timer_alloc(reader_anim_timer_callback, FuriTimerTypePeriodic, app);
-    furi_timer_start(app->anim_timer, furi_ms_to_ticks(ANIM_PERIOD_MS));
+
+    view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
+    reader_switch_view(app, ReaderViewScan); // also starts the animation timer
 
     app->nfc = nfc_alloc();
     app->device = nfc_device_alloc();

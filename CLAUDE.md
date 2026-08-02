@@ -65,8 +65,9 @@ The repo directory is named after an earlier NFC-only app that lived at the root
 and was deleted once this one superseded it — that is the only reason the folder
 and the app have different names. Nothing should be added back at the root.
 
-**Not a git repository** — there is no undo for deletions here. Copy anything
-you are about to remove somewhere safe first.
+**Git repository, branch `main`.** Commits here carry a real body: what changed,
+why, and an on-device **Verified** block. Build output (`dist/`,
+`.vscode/compile_commands.json`) and serial captures (`cap_*.log`) are ignored.
 
 ## Architecture
 
@@ -85,7 +86,7 @@ that touch a radio; both begin with `reader_stop_all()` and switch back to
 (`reader_poll_protocol()`, e.g. MfClassic / MfUltralight / ISO14443-4A with the
 EMV chain) for the full card data → render in the TextBox info screen.
 
-**Three invariants that are load-bearing — breaking any of them wedges the device:**
+**Four invariants that are load-bearing — breaking any of them wedges the device:**
 
 1. **No fork-sensitive enum values.** `reader_poll_protocol()` picks the
    most-derived pollable protocol from a compile-time whitelist (ids 0..11),
@@ -101,6 +102,15 @@ EMV chain) for the full card data → render in the TextBox info screen.
    in `reader_start_lf_phase()`, not in `reader_app_alloc()`, and
    `reader_stop_lf()` calls `lfrfid_worker_stop_thread()` to *join* before NFC may
    start. `lfrfid_worker_stop()` alone does not wait.
+4. **Back is owned by the ViewDispatcher's navigation callback**, never by a
+   module view's `previous_callback`. `view_previous()` passes `view->context`,
+   and `text_box_alloc()` sets that context to the `TextBox` itself — a
+   `view_set_previous_callback()` on the info view is handed a `TextBox*` to use
+   as a `ReaderApp*`. That was a real crash (see below); the dispatcher's
+   navigation callback gets `event_context`, which *is* the app.
+   `reader_switch_view()` is the only place that changes views: it records
+   `app->current_view` (the navigation callback reads it to tell "rescan" from
+   "exit") and starts/stops the animation timer, which only the scan view needs.
 
 `protocol_dict_alloc(lfrfid_protocols, LFRFIDProtocolMax)` passes our
 compile-time count against the firmware's array. Safe when the fork has more
@@ -117,8 +127,16 @@ commands and a small `--cmd-delay` so `log` attaches immediately after.
   **the LF path is only exercised with the card removed.** Confirm alternation by
   capturing ~25 s at `log debug` and checking `phase: LF (gen N)` /
   `phase: NFC (gen N+1)` alternate, then that `top` still answers.
-- `input send ok short` triggers an in-app rescan — the only way to catch the
-  read logs, which otherwise all happen before a log session can attach.
+- `input send back short` on the result screen triggers an in-app rescan (and a
+  fresh read within ~300 ms). It is the only way to catch the read logs, which
+  otherwise all happen before a log session can attach. **A `log` session
+  accepts no further commands**, so the order is: inject the input first, then
+  `log debug` — the rescan's `NFC detected` / `NFC read` lines land inside the
+  capture window.
+- A crash is visible from the host as the USB VCP dropping mid-command
+  (`ClearCommError failed`) plus a reset `uptime`; `furi_crash` output never
+  reaches USB, only the screen and the UART console. `uptime` also refuses to
+  answer while an app is open, which makes it a free liveness probe.
 - `top` should show `LfrfidWorker` **only** during the LF phase and
   `NfcScanWorker`/`NfcWorker` only during the NFC phase. Overlap means invariant 3
   is broken.
@@ -130,6 +148,15 @@ debugging phase logic.
 **Known:** the test card is an ISO14443-4A with a random UID (first byte `0x08`),
 so its UID legitimately differs on every read. A real 125 kHz LF read has not yet
 been verified — no LF card available.
+
+**Fixed 2026-08-02 — Back on the result screen rebooted the device.**
+`view_set_previous_callback(text_box_get_view(...), cb)` had the callback cast
+`view->context` to `ReaderApp*`, but that context is the `TextBox` (8-byte
+struct), so `app->phase_timer` / `app->poller` were read out of a neighbouring
+heap block and passed to `furi_timer_stop()` / `nfc_poller_stop()`. Proven on
+device by logging both pointers from a non-dereferencing callback:
+`prev_ctx=2000A578 app=2000A5C0 text_box=2000A578`. Replaced by
+`view_dispatcher_set_navigation_event_callback()` — see invariant 4.
 
 ---
 
