@@ -4,13 +4,15 @@ App(
     apptype=FlipperAppType.EXTERNAL,
     entry_point="universal_card_reader_app",
     requires=["gui"],
-    # 8 KB: the GUI thread runs the animated draw callback plus every
-    # nfc_*/lfrfid_worker_* start/stop call, which is deep enough that 4 KB
-    # risks a stack overflow.
-    stack_size=8 * 1024,
+    # 12 KB: the GUI thread runs the animated draw callback, every
+    # nfc_*/lfrfid_worker_* start/stop call, and — for Save — the
+    # FlipperFormat writer inside nfc_device_save()/lfrfid_dict_file_save().
+    # 8 KB was enough before Save/Emulate; keep headroom now it isn't just
+    # animation + radio depth.
+    stack_size=12 * 1024,
     fap_category="Tools",
     fap_description="Reads any NFC (13.56MHz) or LF RFID (125kHz) card.",
     fap_author="farhadsoft",
-    fap_version="1.2",
+    fap_version="1.3",
     fap_icon="icon.png",
 )

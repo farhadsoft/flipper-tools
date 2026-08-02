@@ -9,6 +9,11 @@ Reads **both** card families with one app:
 - **LF RFID** — 125 kHz: EM4100, HID Prox, Indala, and the rest of the firmware's
   LF protocol set
 
+Read cards can be **saved** to the SD card in the same format the stock NFC/125 kHz
+apps use, and **emulated** back over the matching radio — see
+[Save & Emulate](#save--emulate) below. Payment cards are the one exception: save-only
+(UID/ATS, never the EMV data) and never emulated.
+
 ## How it works
 
 The Flipper cannot drive both radios at once, so the app alternates timed phases and
@@ -61,6 +66,32 @@ clear the app asked and the card declined.
 the card's private keys never leave its secure element. A contactless read is
 also a subset of what a contact (chip-and-PIN) terminal sees — a card may
 legitimately expose only its AID over NFC.
+
+## Save & Emulate
+
+From the result screen, **Back** opens an actions menu — **Save**, **Emulate**,
+**Rescan**, **Exit** — the same relationship the stock NFC/125 kHz apps use between
+their result screen and card menu.
+
+- **Save** writes the card to `/ext/nfc/<Type>_<UID>.nfc` (NFC) or
+  `/ext/lfrfid/<Type>_<ID>.rfid` (LF RFID) — the same file formats the stock apps
+  use, so they show up under **NFC → Saved** / **125 kHz RFID → Saved**. The name
+  is deterministic (type + UID/ID), so saving the same card again overwrites its
+  own file rather than piling up duplicates.
+- **Emulate** replays the card over the matching radio until **Back** stops it.
+  NFC emulation is restricted to protocols the firmware can actually emulate
+  (ISO14443-3A, ISO14443-4A, ISO15693-3, FeliCa, Mifare Ultralight, Mifare
+  Classic) — ISO14443-3B and ST25TB have no emulation support in the firmware at
+  all, so those are refused with an on-screen "No emulation for …" message
+  instead of being attempted. LF RFID emulates whatever protocol was read, the
+  same scope the stock 125 kHz app covers.
+
+**Payment (EMV) cards are never emulated, at any fidelity**, and are only ever
+saved as their bare transport identifier. A card the app read as an EMV
+application (flagged with a `[Policy]` note on the result screen) saves as a
+plain ISO14443-4A file — UID/ATQA/SAK/ATS only. The PAN, cardholder name,
+expiry and transaction log shown on screen are never written to a file or
+replayed; they exist only for you to read off the device.
 
 ## Requirements
 
@@ -122,9 +153,10 @@ and start it from **Apps → Tools** on the device.
    - For EMV cards: **AID**, **App** (label), **PAN**, **Expiry**, **Name** and
      **Txn log** entries — see [EMV bank cards](#emv-bank-cards) — or "No EMV
      app on card" if it has no payment application at all
-4. **Back** on the result screen goes straight back to scanning for the next
-   card; **Back** on the scanning screen exits the app. If a read fails, the
-   "Read failed" screen offers **OK** to retry and **Back** to exit.
+4. **Back** on the result screen opens the **actions menu** — **Save**, **Emulate**,
+   **Rescan**, **Exit** (see [Save & Emulate](#save--emulate)); **Back** in that menu
+   returns to the result screen. **Back** on the scanning screen exits the app. If a
+   read fails, the "Read failed" screen offers **OK** to retry and **Back** to exit.
 
 If a card is not picked up right away, keep it in place for a couple of seconds — it may
 need to wait through one full phase cycle before its band's turn comes around. Some
@@ -133,10 +165,12 @@ cards also read more reliably at a slightly different position on the back panel
 ## Legal / responsible use
 
 This tool is for cards and tags that **you own, or that you have explicit permission to
-test**. Reading access-control credentials — or payment card data — belonging to other
-people or to an organisation without written authorisation is illegal in most
-jurisdictions. Use it for your own tags and cards, for authorised security assessments,
-and for learning — nothing else.
+test**. Reading, saving, or emulating access-control credentials — or payment card
+data — belonging to other people or to an organisation without written authorisation is
+illegal in most jurisdictions. Emulating a credential is functionally equivalent to
+possessing a copy of it, so treat Save and Emulate with the same care as the physical
+card. Use it for your own tags and cards, for authorised security assessments, and for
+learning — nothing else.
 
 ## History
 
