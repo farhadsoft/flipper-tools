@@ -1,202 +1,205 @@
 # Universal Card Reader
 
-Flipper Zero FAP-i — `application.fam` təsviri: **Reads any NFC (13.56MHz) or LF RFID (125kHz) card.**
+Flipper Zero FAP — `application.fam` description: **Reads any NFC (13.56MHz) or LF RFID (125kHz) card.**
 
-- **Versiya:** 1.4 (`application.fam`də `fap_version`)
-- **Kateqoriya:** Tools
-- **Yığma stack:** 12 KB
-- **Müəllif:** farhadsoft
+- **Version:** 1.4 (`fap_version` in `application.fam`)
+- **Category:** Tools
+- **Stack size:** 12 KB
+- **Author:** farhadsoft
 
-## Nə edir
+## What it does
 
-Bir tətbiqdə iki diapazonu növbəli skan edir:
+Scans both bands, alternating, in a single app:
 
 - **NFC — 13.56 MHz:** ISO14443-3A/3B/4A, ISO15693-3, FeliCa, St25tb,
   Mifare Ultralight/NTAG, Mifare Classic.
-- **LF RFID — 125 kHz:** firmware-in LF RFID işçi axını ilə avto-aşkarlanan
-  protokollar (məs. EM4100, HID Prox, Indala və s.).
+- **LF RFID — 125 kHz:** protocols auto-detected via the firmware's LF RFID
+  worker thread (e.g. EM4100, HID Prox, Indala, etc.).
 
-Flipper eyni vaxtda hər iki radiodu işlədə bilmədiyi üçün app
-növbəli fazalarla işləyir: NFC fazası (~1200 ms) → LF fazası (~1600 ms) →
-dövr. Kart tapılanda aktiv faza dayanır və oxuma aparılır.
+Since Flipper cannot run both radios at the same time, the app works in
+alternating phases: NFC phase (~1200 ms) → LF phase (~1600 ms) → repeat.
+When a card is found, the active phase stops and the read proceeds.
 
-Bütün radio start/stop çağırışları GUI axınında edir; işçi axınları və
-faza taymeri yalnız `view_dispatcher_send_custom_event()` göndərir.
+All radio start/stop calls happen on the GUI thread; worker threads and
+the phase timer only ever post via `view_dispatcher_send_custom_event()`.
 
-## Göstərilən məlumat
+## Displayed information
 
-NFC kart üçün nəticə ekranında (mövcud olduqca):
+For an NFC card, on the result screen (when available):
 
 - Band (13.56 MHz)
-- Tip (skanerin qaytardığı ən dəqiq protokol adı)
-- Protokol zənciri (məs. `ISO14443-3A > ISO14443-4A > EMV`)
+- Type (the most specific protocol name returned by the scanner)
+- Protocol chain (e.g. `ISO14443-3A > ISO14443-4A > EMV`)
 - UID
 - ISO14443-3A: ATQA, SAK
-- ISO14443-4A: ATS (TL/T0/TA1/TB1/TC1) və tarixi baytlar
-- ISO15693-3: istehsalçı kodu, DSFID, AFI, IC ref, blok sayı və blok
-  məzmunu (oxunanlar)
-- FeliCa: IDm, PMm, oxunan/blok sayı
-- Mifare Ultralight/NTAG: tip, oxunan/səhifə sayı, səhifə hex dökümü,
-  NDEF URI/Text qeydləri
-- Mifare Classic: tip (Mini/1K/4K), oxunan sektor sayı, sektor xəritəsi,
-  oxunan blokların hex dökümü
-- EMV / bank kartı: AID(s), tətbiq etiketi, PAN, son istifadə tarixi,
-  kart sahibinin adı, service code, issuer country, card sequence,
-  Track2 məlumatı, əməliyyat jurnalı (kart verərsə)
+- ISO14443-4A: ATS (TL/T0/TA1/TB1/TC1) and historical bytes
+- ISO15693-3: manufacturer code, DSFID, AFI, IC ref, block count, and
+  block contents (the ones read)
+- FeliCa: IDm, PMm, blocks read/total
+- Mifare Ultralight/NTAG: type, pages read/total, page hex dump,
+  NDEF URI/Text records
+- Mifare Classic: type (Mini/1K/4K), sectors read, sector map,
+  hex dump of the read blocks
+- EMV / bank card: AID(s), application label, PAN, expiry date,
+  cardholder name, service code, issuer country, card sequence,
+  Track2 data, transaction log (if the card provides it)
 
-LF RFID üçün:
+For LF RFID:
 
 - Band (125 kHz)
-- Tip
+- Type
 - ID (hex)
 
-EMV məlumatları kartın özü verdiyi qədərdir; kart vermədiyi sahə
-`not disclosed` / `not available over contactless` olaraq göstərilir.
+EMV data is shown to whatever extent the card itself provides; a field
+the card does not disclose is shown as `not disclosed` /
+`not available over contactless`.
 
-## Ödəniş kartı (EMV) davranışı
+## Payment card (EMV) behaviour
 
-Kontaktsız bank kartları (Visa, Mastercard, AmEx, Discover, JCB, UnionPay
-və s.) üçün app ISO14443-4A səviyyəsində aşağıdakı **yalnız oxuma**
-əmrlərini işlədir:
+For contactless bank cards (Visa, Mastercard, AmEx, Discover, JCB,
+UnionPay, etc.) the app runs the following **read-only** commands at the
+ISO14443-4A level:
 
 1. SELECT PPSE (`2PAY.SYS.DDF01`)
-2. SELECT AID (PPSE uğursuz olarsa tanınmış AID-lərlə fallback)
-3. GET PROCESSING OPTIONS (PDOL-dan qurulmuş standart terminal dəyərləri ilə)
-4. READ RECORD (AFL üzrə)
-5. Əməliyyat jurnalı üçün GET DATA `9F4F` və READ RECORD
+2. SELECT AID (falls back to well-known AIDs if PPSE fails)
+3. GET PROCESSING OPTIONS (with standard terminal defaults built from the PDOL)
+4. READ RECORD (per the AFL)
+5. GET DATA `9F4F` and READ RECORD for the transaction log
 
-Yazma, yeniləmə və ya PIN/cripto əməliyyatları aparılmır. CVV/CVC2, PIN
-və kartın özəl açarları secure elementdən çıxarılmır.
+No write, update, or PIN/crypto operations are performed. CVV/CVC2, the
+PIN, and the card's private keys are never extracted from the secure
+element.
 
-**Yadda saxlama:** EMV kartları app-ın öz data qovluğuna
-(`/ext/apps_data/universal_card_reader/EMV_<UID>.emv`) yazılır və PAN,
-son istifadə tarixi, kart sahibi, AID-lər, Track2 və jurnal kimi oxunan
-bütün maliyyə sahələrini, üstəlik ISO14443-4A nəqliyyat məlumatını
-(UID/ATQA/SAK/ATS) saxlayır — beləcə yüklənmiş fayl da canlı oxunmuş kart
-kimi emulyasiya edilə bilir.
+**Storage:** EMV cards are written to the app's own data folder
+(`/ext/apps_data/universal_card_reader/EMV_<UID>.emv`) and store the PAN,
+expiry date, cardholder, AIDs, Track2, and log — every financial field
+that was read — plus the ISO14443-4A transport data (UID/ATQA/SAK/ATS),
+so a loaded file can also be emulated just like a freshly read card.
 
-**Emulyasiya:** EMV kartı üçün Emulate seçiləndə app ISO14443-4A
-nəqliyyat səviyyəsində emulyasiya başladır (yaxalanmış UID/ATS ilə, canlı
-oxunmuşdan və ya `.emv` faylından yüklənmişdən asılı olmayaraq). Tətbiq
-səviyyəsində EMV terminal emulyasiyası **yoxdur**; yəni PAN və jurnal
-başqa bir oxuyucuya ötürülmür.
+**Emulation:** when Emulate is chosen for an EMV card, the app starts
+ISO14443-4A transport-level emulation (with the captured UID/ATS,
+regardless of whether the card was read live or loaded from an `.emv`
+file). There is **no** application-level EMV terminal emulation; the PAN
+and log are never relayed to another reader.
 
-> **Qeyd:** Nəticə ekranının sonunda `[Policy] Bank card: emulation disabled;
-> save stores UID/ATS only.` sətri görünə bilər. Bu bildiriş köhnəlib:
-> hazırkı kodda EMV məlumatları `.emv` faylında saxlanılır və Emulate
-> ISO14443-4A səviyyəsində işləyir.
+> **Note:** the bottom of the result screen may still show the line
+> `[Policy] Bank card: emulation disabled; save stores UID/ATS only.`
+> This notice is stale: in the current code, EMV data is stored in the
+> `.emv` file and Emulate works at the ISO14443-4A level.
 
-## Kartları yadda saxlamaq və yükləmək (Save / Load)
+## Saving and loading cards (Save / Load)
 
-Bütün yadda saxlanan kartlar (`.nfc`, `.emv`, `.rfid`) tək bir qovluqda —
-`/ext/apps_data/universal_card_reader/` altında — app-ın öz data
-qovluğunda saxlanılır, bayaqkı paylaşılan `/ext/nfc` və `/ext/lfrfid`
-qovluqlarından ayrı. Həmin köhnə qovluqlardakı fayllar toxunulmaz qalır —
-köçürülmür, silinmir.
+All saved cards (`.nfc`, `.emv`, `.rfid`) are stored in a single folder —
+under `/ext/apps_data/universal_card_reader/` — the app's own data
+folder, separate from the previously shared `/ext/nfc` and `/ext/lfrfid`
+folders. Files in those old folders are left untouched — neither moved
+nor deleted.
 
-**Load** əməliyyatlar menyusunda (Save/Emulate/Rescan-dan sonra) və ya
-skan ekranında birbaşa **OK** düyməsi ilə açılır: firmware-in öz fayl
-seçici dialoqu yalnız bu qovluğu göstərir. Seçilən fayl nəticə ekranında
-elə canlı oxunmuş kart kimi göstərilir; nəqliyyat məlumatı olan fayllar
-(`.nfc`/`.rfid`/transport-lu `.emv`) **Emulate** ilə işə salına bilər.
-Köhnə `.emv` faylları (bu dəyişiklikdən əvvəl saxlanmış, yalnız EMV
-sahələri olan) arxasında nəqliyyat məlumatı olmadığı üçün emulyasiya
-üçün bloklanır — nəticə ekranında bu aydın göstərilir.
+**Load** opens from the actions menu (after Save/Emulate/Rescan) or
+directly from the scan screen with the **OK** button: the firmware's own
+file-picker dialog shows only this folder. The selected file is shown on
+the result screen exactly like a freshly read card; files that carry
+transport data (`.nfc`/`.rfid`/`.emv` with transport) can be launched
+with **Emulate**. Older `.emv` files (saved before this change, containing
+only EMV fields) have no transport data behind them, so they are blocked
+from emulation — the result screen makes this clear.
 
-## Məhdudiyyətlər
+## Limitations
 
-- Mifare Classic sektorları yalnız nəqliyyat açarı `FF FF FF FF FF FF`
-  ilə oxunur; digər açar tələb edən sektorlar oxunmayacaq.
-- ISO14443-4B və SLIX emulyasiyası dəstəklənmir; bu kartlar nəqliyyat
-  protokoluna qayıdaraq oxunur.
-- UHF / 2.45 GHz Flipper-in daxili avadanlığı ilə dəstəklənmir.
-- EMV emulyasiyası yalnız ISO14443-4A nəqliyyat səviyyəsindədir.
-- **Yüklənmiş (fayldan açılmış) Mifare Classic kartını Emulate etmək bəzən
-  app-i asıla bilər** — bu, firmware səviyyəsində tanınan, uzun müddətdir
-  davam edən bir problemdir (bax: rəsmi firmware issue #2577, Unleashed
-  issue #257), bu app-in kodundan qaynaqlanmır. Asılma zamanı `loader
-  close` işləmir; bərpa üçün cihazı yenidən başlatmaq (`power reboot` CLI
-  əmri və ya fiziki reset) lazımdır. Canlı oxunmuş kartı birbaşa
-  emulyasiya etmək bu problemi göstərməyib.
-- **Yüklənmiş (fayldan açılmış) EMV/ISO14443-4A kartını Emulate etmək də
-  eyni sinif firmware problemi ilə üzləşə bilər** — yuxarıdakı Mifare
-  Classic qeydinin ISO14443-4A üçün təsdiqlənmiş forması: canlı oxunmuş
-  kartın birbaşa emulyasiyası dəfələrlə problemsiz işləyib, lakin `.emv`
-  faylından yüklənib emulyasiya edilən eyni kart bir dəfə cihazı
-  reboot edən bir crash-a səbəb olub (uzun USB kəsilməsi ilə). Bərpa üçün
-  `power reboot` və ya cihazın enumerasiyasını gözləmək kifayətdir;
-  app-in özündə bu firmware zəngini kəsmək üçün heç bir hook yoxdur.
+- Mifare Classic sectors are only read with the transport key
+  `FF FF FF FF FF FF`; sectors requiring another key will not be read.
+- ISO14443-4B and SLIX emulation are not supported; these cards fall
+  back to being read via the transport protocol.
+- UHF / 2.45 GHz is not supported by Flipper's built-in hardware.
+- EMV emulation is at the ISO14443-4A transport level only.
+- **Emulating a loaded (opened-from-file) Mifare Classic card can
+  sometimes hang the app** — this is a known, long-standing
+  firmware-level issue (see: official firmware issue #2577, Unleashed
+  issue #257), not something caused by this app's code. During the
+  hang, `loader close` does not work; recovery requires restarting the
+  device (`power reboot` CLI command or a physical reset). Emulating a
+  freshly (live-)read card directly has not exhibited this issue.
+- **Emulating a loaded (opened-from-file) EMV/ISO14443-4A card can also
+  run into the same class of firmware issue** — the ISO14443-4A-confirmed
+  form of the Mifare Classic note above: direct emulation of a
+  freshly-read card has worked without issue many times, but the same
+  card loaded from an `.emv` file and then emulated once caused a crash
+  that rebooted the device (with a long USB disconnect). Recovery only
+  requires `power reboot` or waiting for the device to re-enumerate; the
+  app itself has no hook to intercept this firmware call.
 
-## Qurma
+## Building
 
-App qovluğundan:
+From the app directory:
 
 ```sh
 cd universal_card_reader
 ufbt
 ```
 
-Nəticə: `dist/universal_card_reader.fap`.
+Output: `dist/universal_card_reader.fap`.
 
-Bağlı cihaza yükləmək və işə salmaq:
+To upload and run on a connected device:
 
 ```sh
 ufbt launch
 ```
 
-> `ufbt launch` USB portu tutur. Əgər qFlipper açıqdırsa, əvvəlcə onu
-> bağlayın.
+> `ufbt launch` holds the USB port. If qFlipper is open, close it first.
 
-Alternativ olaraq `dist/universal_card_reader.fap` faylını SD kartın
-`apps/Tools/` altına qoyub cihazda **Apps → Tools → Universal Card
-Reader** seçin.
+Alternatively, copy `dist/universal_card_reader.fap` onto the SD card
+under `apps/Tools/` and select **Apps → Tools → Universal Card Reader**
+on the device.
 
-Menyu ikonu `icon.png` faylıdır; lazım gələrsə `make_icon.py` ilə
-10×10 1-bit PNG yenidən yaradıla bilər.
+The menu icon is the `icon.png` file; if needed, it can be regenerated
+as a 10×10 1-bit PNG with `make_icon.py`.
 
-## İstifadə
+## Usage
 
-1. App-i işə salın. Ekran dərhal skan etməyə başlayır və aktiv bandı
-   göstərir.
-2. Kartı Flipper-in arxasına tutun (həm NFC, həm LF antenası oradadır).
-3. Kart oxunanda nəticə ekranı açılır; məzmun çoxdursa **Yuxarı** /
-   **Aşağı** ilə sürüşdürün.
-4. Nəticə ekranında **Geri** düyməsi əməliyyatlar menyusunu açır:
+1. Launch the app. The screen immediately starts scanning and shows the
+   active band.
+2. Hold the card against the back of the Flipper (both the NFC and LF
+   antennas are there).
+3. When the card is read, the result screen opens; if the content
+   overflows, scroll with **Up** / **Down**.
+4. On the result screen, the **Back** button opens the actions menu:
    **Save**, **Emulate**, **Rescan**, **Load**, **Exit**.
-5. Əvvəllər yadda saxlanmış kartı açmaq üçün **Load** seçin (və ya skan
-   ekranından birbaşa **OK** basın) və siyahıdan faylı seçin.
-6. Skan ekranında **Geri** app-dən çıxar.
+5. To open a previously saved card, select **Load** (or press **OK**
+   directly from the scan screen) and pick the file from the list.
+6. On the scan screen, **Back** exits the app.
 
-## Fayl strukturu
+## File structure
 
-| Fayl | Təyinat |
+| File | Purpose |
 |---|---|
-| `universal_card_reader.c` | App-in əsas həyat dövrü, save/emulate, fazalar |
-| `reader_app.h` | Strukturlar, enumlar, sabitlər |
-| `reader_nfc.c/h` | NFC skaner/poller, protokol həll etmə, emulyasiya |
-| `reader_lf.c/h` | LF RFID işçi axını, emulyasiya |
-| `card_info.c/h` | NFC/LF nəticələrinin ekran üçün formatlanması |
-| `emv.c/h` | Yalnız oxuma EMV APDU zənciri, `.emv` save/load |
-| `reader_ui.c/h` | Cihaz UI-si (scan/reading/emulating ekranları) |
-| `application.fam` | FAP manifesti |
-| `icon.png` / `make_icon.py` | Menyu ikonu |
+| `universal_card_reader.c` | App's main lifecycle, save/emulate, phases |
+| `reader_app.h` | Structs, enums, constants |
+| `reader_nfc.c/h` | NFC scanner/poller, protocol resolution, emulation |
+| `reader_lf.c/h` | LF RFID worker thread, emulation |
+| `card_info.c/h` | Formatting of NFC/LF results for the screen |
+| `emv.c/h` | Read-only EMV APDU chain, `.emv` save/load |
+| `reader_ui.c/h` | Device UI (scan/reading/emulating screens) |
+| `application.fam` | FAP manifest |
+| `icon.png` / `make_icon.py` | Menu icon |
 
-## Təhlükəsizlik və etik
+## Security and ethics
 
-Yalnız öz kartlarınızı və ya sınamaq üçün açıq icazəniz olan kartları
-oxuyun, saxlayın və emulyasiya edin. İcazəsiz ödəniş kartı məlumatlarının
-oxunması/qeyd edilməsi çox yurisdiksiyada cinayət sayılır. Emulyasiya
-fiziki kartın surətinə sahib olmaq kimi qiymətləndirilir; ona uyğun
-qayğı ilə yanaşın.
+Only read, save, and emulate your own cards, or cards you have explicit
+permission to test. Reading/recording payment card data without
+authorization is a crime in most jurisdictions. Emulation is equivalent
+to possessing a copy of the physical card; handle it with matching care.
 
-## Firmware fork uyğunluğu
+## Firmware fork compatibility
 
-App `NfcProtocolNum` / `NfcProtocolInvalid` kimi fork-arası stabilliyi
-olmayan sentinel dəyərlərdən istifadə etmir. Protokol münasibətləri
-`nfc_protocol_has_parent()` ilə firmware tərəfindən qiymətləndirilir.
-Rəsmi firmware 1.x və Momentum `mntm-dev` (API 87.1) üzərində yoxlanıb.
+The app does not use sentinel values such as `NfcProtocolNum` /
+`NfcProtocolInvalid` that are not stable across forks. Protocol
+relationships are evaluated by the firmware itself via
+`nfc_protocol_has_parent()`. Verified against official firmware 1.x and
+Momentum `mntm-dev` (API 87.1).
 
-APPCHK yalnız API major/minor müqayisə edir; fork-lar eyni API versiyasını
-saxlayıb enum dəyərlərini dəyişə bilər. App bunun qarşısını almaq üçün
-yalnız rəsmi və Momentum-da eyni qalan protokol ID-lərini (0–11) poll və
-emulyasiya üçün istifadə edir.
+APPCHK only compares API major/minor; forks can keep the same API
+version while shifting enum values. To guard against this, the app only
+uses protocol IDs (0–11) that remain identical between official and
+Momentum firmware for polling and emulation.
+</content>
+<parameter name="i">Translate universal_card_reader README to English
