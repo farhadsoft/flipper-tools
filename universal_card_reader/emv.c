@@ -25,8 +25,22 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stddef.h>
 
 #define TAG "UniEmv"
+
+#define EMV_SW_OK 0x9000 // APDU status word: success
+
+#define EMV_TAG_PAN              0x5A
+#define EMV_TAG_TRACK2_EQUIV     0x57
+#define EMV_TAG_APP_LABEL        0x50
+#define EMV_TAG_EXPIRY           0x5F24
+#define EMV_TAG_CARDHOLDER_NAME  0x5F20
+#define EMV_TAG_SERVICE_CODE     0x5F30
+#define EMV_TAG_ISSUER_COUNTRY   0x5F28
+#define EMV_TAG_CARD_SEQ_NUM     0x5F34
+#define EMV_TAG_APP_PREF_NAME    0x9F12
+#define EMV_TAG_TRACK2_MAGSTRIPE 0x9F6B
 
 /* ------------------------------ BER-TLV ------------------------------ */
 
@@ -319,6 +333,47 @@ static void emv_harvest_track2(const uint8_t* v, size_t len, EmvData* out) {
     }
 }
 
+static void emv_take_expiry(const uint8_t* val, size_t val_len, EmvData* out) {
+    if(out->expiry[0] != '\0' || val_len < 2) return;
+    snprintf(out->expiry, sizeof(out->expiry), "%02X/%02X", (unsigned)val[1], (unsigned)val[0]);
+}
+
+// Service code, 3 digits BCD
+static void emv_take_service_code(const uint8_t* val, size_t val_len, EmvData* out) {
+    if(out->service_code[0] != '\0' || val_len < 2) return;
+    snprintf(
+        out->service_code,
+        sizeof(out->service_code),
+        "%02X%01X",
+        (unsigned)val[0],
+        (unsigned)(val[1] >> 4));
+}
+
+static void emv_take_app_pref_name(const uint8_t* val, size_t val_len, EmvData* out) {
+    if(out->app_pref_name[0] != '\0') return;
+    size_t n = val_len < EMV_APP_PREF_NAME_LEN ? val_len : EMV_APP_PREF_NAME_LEN;
+    memcpy(out->app_pref_name, val, n);
+    out->app_pref_name[n] = '\0';
+}
+
+// Issuer country code, ISO 3166, BCD 2 bytes
+static void emv_take_issuer_country(const uint8_t* val, size_t val_len, EmvData* out) {
+    if(out->issuer_country[0] != '\0' || val_len < 2) return;
+    unsigned cc = (unsigned)(val[0] << 8) | val[1];
+    if(cc > 999) cc = 999;
+    snprintf(out->issuer_country, sizeof(out->issuer_country), "%03u", cc);
+}
+
+// Card sequence number
+static void emv_take_card_seq(const uint8_t* val, size_t val_len, EmvData* out) {
+    if(out->card_seq_num[0] != '\0' || val_len < 1) return;
+    size_t n = val_len < EMV_CARD_SEQ_NUM_LEN ? val_len : EMV_CARD_SEQ_NUM_LEN;
+    for(size_t k = 0; k < n; k++) {
+        out->card_seq_num[k] = (char)('0' + ((val[k] >> 4) & 0x0F));
+    }
+    out->card_seq_num[n] = '\0';
+}
+
 #define EMV_HARVEST_MAX_DEPTH 6
 
 // Runs over any record or template, depth-first, filling every field that is
@@ -336,68 +391,33 @@ static void emv_harvest_level(const uint8_t* data, size_t len, EmvData* out, uin
         if(!tlv_next(&p, end, &tag, &constructed, &val, &val_len)) break;
 
         switch(tag) {
-        case 0x5A:
+        case EMV_TAG_PAN:
             if(out->pan[0] == '\0') emv_harvest_pan_bcd(val, val_len, out->pan, sizeof(out->pan));
             break;
-        case 0x5F24:
-            if(out->expiry[0] == '\0' && val_len >= 2) {
-                snprintf(
-                    out->expiry,
-                    sizeof(out->expiry),
-                    "%02X/%02X",
-                    (unsigned)val[1],
-                    (unsigned)val[0]);
-            }
+        case EMV_TAG_EXPIRY:
+            emv_take_expiry(val, val_len, out);
             break;
-        case 0x5F20:
+        case EMV_TAG_CARDHOLDER_NAME:
             if(out->name[0] == '\0') emv_copy_name(val, val_len, out->name, sizeof(out->name));
             break;
-        case 0x57:
-        case 0x9F6B:
+        case EMV_TAG_TRACK2_EQUIV:
+        case EMV_TAG_TRACK2_MAGSTRIPE:
             emv_harvest_track2(val, val_len, out);
             break;
-        case 0x50:
+        case EMV_TAG_APP_LABEL:
             if(out->label[0] == '\0') emv_set_label(out->label, sizeof(out->label), val, val_len);
             break;
-        case 0x5F30:
-            // Service code, 3 digits BCD
-            if(out->service_code[0] == '\0' && val_len >= 2) {
-                snprintf(
-                    out->service_code,
-                    sizeof(out->service_code),
-                    "%02X%01X",
-                    (unsigned)val[0],
-                    (unsigned)(val[1] >> 4));
-            }
+        case EMV_TAG_SERVICE_CODE:
+            emv_take_service_code(val, val_len, out);
             break;
-        case 0x9F12:
-            if(out->app_pref_name[0] == '\0') {
-                size_t n = val_len < EMV_APP_PREF_NAME_LEN ? val_len : EMV_APP_PREF_NAME_LEN;
-                memcpy(out->app_pref_name, val, n);
-                out->app_pref_name[n] = '\0';
-            }
+        case EMV_TAG_APP_PREF_NAME:
+            emv_take_app_pref_name(val, val_len, out);
             break;
-        case 0x5F28:
-            // Issuer country code, ISO 3166, BCD 2 bytes
-            if(out->issuer_country[0] == '\0' && val_len >= 2) {
-                unsigned cc = (unsigned)(val[0] << 8) | val[1];
-                if(cc > 999) cc = 999;
-                snprintf(
-                    out->issuer_country,
-                    sizeof(out->issuer_country),
-                    "%03u",
-                    cc);
-            }
+        case EMV_TAG_ISSUER_COUNTRY:
+            emv_take_issuer_country(val, val_len, out);
             break;
-        case 0x5F34:
-            // Card sequence number
-            if(out->card_seq_num[0] == '\0' && val_len >= 1) {
-                size_t n = val_len < EMV_CARD_SEQ_NUM_LEN ? val_len : EMV_CARD_SEQ_NUM_LEN;
-                for(size_t k = 0; k < n; k++) {
-                    out->card_seq_num[k] = (char)('0' + ((val[k] >> 4) & 0x0F));
-                }
-                out->card_seq_num[n] = '\0';
-            }
+        case EMV_TAG_CARD_SEQ_NUM:
+            emv_take_card_seq(val, val_len, out);
             break;
         default:
             break;
@@ -608,7 +628,7 @@ static bool
     uint16_t sw = 0;
     bool ok = emv_apdu(poller, tx, rx, k_ppse_apdu, sizeof(k_ppse_apdu), &body, &body_len, &sw);
 
-    if(ok && sw == 0x9000) {
+    if(ok && sw == EMV_SW_OK) {
         ppse_collect_templates(body, body_len, out, 0);
         if(out->aid_count == 0) {
             const uint8_t* aid_val;
@@ -619,7 +639,7 @@ static bool
         }
     }
     FURI_LOG_I(TAG, "PPSE sw=%04X aids=%u", (unsigned)sw, (unsigned)out->aid_count);
-    if(!ok || sw != 0x9000 || out->aid_count == 0) return false;
+    if(!ok || sw != EMV_SW_OK || out->aid_count == 0) return false;
 
     out->ppse_ok = true;
     return true;
@@ -657,7 +677,7 @@ static bool emv_select_aid(
         hex_str(out->aid[i], alen, aid_hex, sizeof(aid_hex));
         FURI_LOG_I(TAG, "SELECT AID %s sw=%04X", aid_hex, (unsigned)sw);
 
-        if(!ok || sw != 0x9000) continue;
+        if(!ok || sw != EMV_SW_OK) continue;
 
         out->aid_selected = true;
         out->aid_selected_idx = i;
@@ -732,7 +752,7 @@ static void emv_gpo(
         free(apdu);
     }
 
-    if(ok && sw == 0x9000 && body_len > 0) {
+    if(ok && sw == EMV_SW_OK && body_len > 0) {
         uint32_t tag;
         bool constructed;
         const uint8_t* val;
@@ -797,7 +817,7 @@ static void emv_read_records(
                 (unsigned)sw,
                 (unsigned)body_len);
 
-            if(ok && sw == 0x9000) emv_harvest(body, body_len, out);
+            if(ok && sw == EMV_SW_OK) emv_harvest(body, body_len, out);
         }
     }
 }
@@ -823,7 +843,7 @@ static void
            &body,
            &body_len,
            &sw) ||
-       sw != 0x9000) {
+       sw != EMV_SW_OK) {
         return;
     }
 
@@ -851,7 +871,7 @@ static void
             (unsigned)rsw,
             (unsigned)rbody_len);
 
-        if(!ok || rsw != 0x9000) continue;
+        if(!ok || rsw != EMV_SW_OK) continue;
         emv_parse_log_record(dol, dol_len, rbody, rbody_len, &out->log[out->log_rows]);
         out->log_rows++;
     }
@@ -919,7 +939,7 @@ static bool
         hex_str(ka->aid, ka->len, aid_hex, sizeof(aid_hex));
         FURI_LOG_I(TAG, "fallback SELECT AID %s sw=%04X", aid_hex, (unsigned)sw);
 
-        if(ok && sw == 0x9000) {
+        if(ok && sw == EMV_SW_OK) {
             ppse_add_aid(out, ka->aid, ka->len);
             // Also harvest label/PDOL/log from this AID's FCI directly, since
             // emv_select_aid() will skip it (already selected, re-selecting may
@@ -1001,6 +1021,89 @@ bool emv_read(Iso14443_4aPoller* poller, EmvData* out) {
 #define EMV_FILE_VERSION     3 // v3 adds the ISO14443-4A transport block (UID/ATQA/SAK/ATS)
 #define EMV_FILE_MIN_VERSION 2 // v2 (financial fields only) still loads, just cannot emulate
 
+static const struct {
+    const char* key;
+    size_t offset;
+} k_emv_text_fields[] = {
+    {"Label", offsetof(EmvData, label)},
+    {"PAN", offsetof(EmvData, pan)},
+    {"Expiry", offsetof(EmvData, expiry)},
+    {"Cardholder", offsetof(EmvData, name)},
+    {"Service Code", offsetof(EmvData, service_code)},
+    {"App Preferred Name", offsetof(EmvData, app_pref_name)},
+    {"Issuer Country", offsetof(EmvData, issuer_country)},
+    {"Card Sequence", offsetof(EmvData, card_seq_num)},
+};
+
+// AIDs
+static bool emv_save_aids(FlipperFormat* ff, const EmvData* data) {
+    uint32_t aid_count = data->aid_count;
+    if(!flipper_format_write_uint32(ff, "AID Count", &aid_count, 1)) return false;
+    for(uint8_t i = 0; i < data->aid_count; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "AID %u", (unsigned)i);
+        if(!flipper_format_write_hex(ff, key, data->aid[i], data->aid_len[i])) return false;
+    }
+    return true;
+}
+
+// Text fields
+static bool emv_save_text(FlipperFormat* ff, const EmvData* data) {
+    for(size_t i = 0; i < COUNT_OF(k_emv_text_fields); i++) {
+        const char* value = (const char*)data + k_emv_text_fields[i].offset;
+        if(value[0] && !flipper_format_write_string_cstr(ff, k_emv_text_fields[i].key, value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Track 2 raw data
+static bool emv_save_track2(FlipperFormat* ff, const EmvData* data) {
+    if(data->track2_len == 0) return true;
+    return flipper_format_write_hex(ff, "Track2", data->track2, data->track2_len);
+}
+
+// Transaction log
+static bool emv_save_log(FlipperFormat* ff, const EmvData* data) {
+    uint32_t log_count = data->log_rows;
+    if(log_count == 0) return true;
+    if(!flipper_format_write_uint32(ff, "Log Count", &log_count, 1)) return false;
+    for(uint8_t r = 0; r < data->log_rows; r++) {
+        const EmvLogRow* row = &data->log[r];
+        char key_date[20], key_amt[20], key_cur[20];
+        snprintf(key_date, sizeof(key_date), "Log %u Date", (unsigned)r);
+        snprintf(key_amt, sizeof(key_amt), "Log %u Amount", (unsigned)r);
+        snprintf(key_cur, sizeof(key_cur), "Log %u Currency", (unsigned)r);
+        if(row->has_date && !flipper_format_write_hex(ff, key_date, row->date, 3)) return false;
+        if(row->has_amount && !flipper_format_write_hex(ff, key_amt, row->amount, 6)) return false;
+        if(row->has_currency) {
+            uint32_t cur = row->currency;
+            if(!flipper_format_write_uint32(ff, key_cur, &cur, 1)) return false;
+        }
+    }
+    return true;
+}
+
+// ISO14443-4A transport, so a loaded file can emulate at transport level.
+// Written with the firmware's own protocol saver - the same key layout a
+// .nfc file uses - except UID, which is device-level there and so is written
+// explicitly. Skipped when the device somehow holds no 4A data; such a file
+// still loads, it just cannot emulate.
+static bool emv_save_transport(FlipperFormat* ff, const NfcDevice* device) {
+    NfcProtocol stored = nfc_device_get_protocol(device);
+    if(stored != NfcProtocolIso14443_4a &&
+       !nfc_protocol_has_parent(stored, NfcProtocolIso14443_4a)) {
+        return true;
+    }
+    const Iso14443_4aData* transport =
+        (const Iso14443_4aData*)nfc_device_get_data(device, NfcProtocolIso14443_4a);
+    size_t uid_len = 0;
+    const uint8_t* uid = iso14443_4a_get_uid(transport, &uid_len);
+    if(!flipper_format_write_hex(ff, "UID", uid, uid_len)) return false;
+    return iso14443_4a_save(transport, ff);
+}
+
 bool emv_save(const EmvData* data, const NfcDevice* device, const char* path) {
     if(!data || !device || !path) return false;
 
@@ -1012,84 +1115,11 @@ bool emv_save(const EmvData* data, const NfcDevice* device, const char* path) {
         if(!flipper_format_file_open_always(ff, path)) break;
         if(!flipper_format_write_header_cstr(ff, EMV_FILE_TYPE, EMV_FILE_VERSION)) break;
 
-        // AIDs
-        uint32_t aid_count = data->aid_count;
-        if(!flipper_format_write_uint32(ff, "AID Count", &aid_count, 1)) break;
-        for(uint8_t i = 0; i < data->aid_count; i++) {
-            char key[16];
-            snprintf(key, sizeof(key), "AID %u", (unsigned)i);
-            if(!flipper_format_write_hex(ff, key, data->aid[i], data->aid_len[i])) break;
-        }
-
-        // Text fields
-        if(data->label[0]) {
-            if(!flipper_format_write_string_cstr(ff, "Label", data->label)) break;
-        }
-        if(data->pan[0]) {
-            if(!flipper_format_write_string_cstr(ff, "PAN", data->pan)) break;
-        }
-        if(data->expiry[0]) {
-            if(!flipper_format_write_string_cstr(ff, "Expiry", data->expiry)) break;
-        }
-        if(data->name[0]) {
-            if(!flipper_format_write_string_cstr(ff, "Cardholder", data->name)) break;
-        }
-        if(data->service_code[0]) {
-            if(!flipper_format_write_string_cstr(ff, "Service Code", data->service_code)) break;
-        }
-        if(data->app_pref_name[0]) {
-            if(!flipper_format_write_string_cstr(ff, "App Preferred Name", data->app_pref_name)) break;
-        }
-        if(data->issuer_country[0]) {
-            if(!flipper_format_write_string_cstr(ff, "Issuer Country", data->issuer_country)) break;
-        }
-        if(data->card_seq_num[0]) {
-            if(!flipper_format_write_string_cstr(ff, "Card Sequence", data->card_seq_num)) break;
-        }
-
-        // Track 2 raw data
-        if(data->track2_len > 0) {
-            if(!flipper_format_write_hex(ff, "Track2", data->track2, data->track2_len)) break;
-        }
-
-        // Transaction log
-        uint32_t log_count = data->log_rows;
-        if(log_count > 0) {
-            if(!flipper_format_write_uint32(ff, "Log Count", &log_count, 1)) break;
-            for(uint8_t r = 0; r < data->log_rows; r++) {
-                const EmvLogRow* row = &data->log[r];
-                char key_date[20], key_amt[20], key_cur[20];
-                snprintf(key_date, sizeof(key_date), "Log %u Date", (unsigned)r);
-                snprintf(key_amt, sizeof(key_amt), "Log %u Amount", (unsigned)r);
-                snprintf(key_cur, sizeof(key_cur), "Log %u Currency", (unsigned)r);
-                if(row->has_date) {
-                    if(!flipper_format_write_hex(ff, key_date, row->date, 3)) break;
-                }
-                if(row->has_amount) {
-                    if(!flipper_format_write_hex(ff, key_amt, row->amount, 6)) break;
-                }
-                if(row->has_currency) {
-                    uint32_t cur = row->currency;
-                    if(!flipper_format_write_uint32(ff, key_cur, &cur, 1)) break;
-                }
-            }
-        }
-
-        // ISO14443-4A transport, so a loaded file can emulate at transport
-        // level. Written with the firmware's own protocol saver - the same key
-        // layout a .nfc file uses - except UID, which is device-level there
-        // and so is written explicitly. Skipped when the device somehow holds
-        // no 4A data; such a file still loads, it just cannot emulate.
-        NfcProtocol stored = nfc_device_get_protocol(device);
-        if(stored == NfcProtocolIso14443_4a ||
-           nfc_protocol_has_parent(stored, NfcProtocolIso14443_4a)) {
-            const Iso14443_4aData* transport =
-                (const Iso14443_4aData*)nfc_device_get_data(device, NfcProtocolIso14443_4a);
-            size_t uid_len = 0;
-            const uint8_t* uid = iso14443_4a_get_uid(transport, &uid_len);
-            if(!flipper_format_write_hex(ff, "UID", uid, uid_len)) break;
-            if(!iso14443_4a_save(transport, ff)) break;
-        }
+        if(!emv_save_aids(ff, data)) break;
+        if(!emv_save_text(ff, data)) break;
+        if(!emv_save_track2(ff, data)) break;
+        if(!emv_save_log(ff, data)) break;
+        if(!emv_save_transport(ff, device)) break;
 
         ok = true;
     } while(0);
@@ -1128,6 +1158,109 @@ static void emv_load_str(
     furi_string_reset(tmp);
 }
 
+static bool emv_load_hex(FlipperFormat* ff, const char* key, uint8_t* dst, uint16_t len) {
+    size_t pos = flipper_format_tell(ff);
+    if(flipper_format_read_hex(ff, key, dst, len)) return true;
+    flipper_format_seek(ff, (int32_t)pos, FlipperFormatOffsetFromStart);
+    return false;
+}
+
+static bool emv_load_u32(FlipperFormat* ff, const char* key, uint32_t* out) {
+    size_t pos = flipper_format_tell(ff);
+    if(flipper_format_read_uint32(ff, key, out, 1)) return true;
+    flipper_format_seek(ff, (int32_t)pos, FlipperFormatOffsetFromStart);
+    return false;
+}
+
+// AIDs. AID Count is mandatory-ish (always written by emv_save); a missing
+// one still must not strand the cursor for what follows.
+static void emv_load_aids(FlipperFormat* ff, EmvData* data) {
+    uint32_t aid_count = 0;
+    if(!emv_load_u32(ff, "AID Count", &aid_count)) return;
+    data->aid_count = (uint8_t)(aid_count < EMV_MAX_AIDS ? aid_count : EMV_MAX_AIDS);
+    for(uint8_t i = 0; i < data->aid_count; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "AID %u", (unsigned)i);
+        uint8_t buf[EMV_AID_MAX_LEN];
+        if(!emv_load_hex(ff, key, buf, EMV_AID_MAX_LEN)) continue;
+        // get_value_count restores the cursor itself, so it is safe to call
+        // after a successful read; it re-seeks to the key from the start and
+        // returns the value count.
+        uint32_t count = 0;
+        if(flipper_format_get_value_count(ff, key, &count)) {
+            data->aid_len[i] = (uint8_t)(count < EMV_AID_MAX_LEN ? count : EMV_AID_MAX_LEN);
+            memcpy(data->aid[i], buf, data->aid_len[i]);
+        }
+    }
+}
+
+// Track 2. get_value_count restores the cursor itself; the read_hex after it
+// seeks from the start, so a missing Track2 is naturally safe, but the
+// read_hex failure path still needs a rewind guard.
+static void emv_load_track2(FlipperFormat* ff, EmvData* data) {
+    uint32_t t2_count = 0;
+    if(!flipper_format_get_value_count(ff, "Track2", &t2_count)) return;
+    if(t2_count > EMV_TRACK2_MAX_LEN) return;
+    if(emv_load_hex(ff, "Track2", data->track2, (uint16_t)t2_count)) {
+        data->track2_len = (uint8_t)t2_count;
+    }
+}
+
+// Transaction log. Log Count and each per-row field are all optional.
+static void emv_load_log(FlipperFormat* ff, EmvData* data) {
+    uint32_t log_count = 0;
+    if(!emv_load_u32(ff, "Log Count", &log_count)) return;
+    data->log_rows = (uint8_t)(log_count < EMV_MAX_LOG_ROWS ? log_count : EMV_MAX_LOG_ROWS);
+    for(uint8_t r = 0; r < data->log_rows; r++) {
+        EmvLogRow* row = &data->log[r];
+        char key_date[20], key_amt[20], key_cur[20];
+        snprintf(key_date, sizeof(key_date), "Log %u Date", (unsigned)r);
+        snprintf(key_amt, sizeof(key_amt), "Log %u Amount", (unsigned)r);
+        snprintf(key_cur, sizeof(key_cur), "Log %u Currency", (unsigned)r);
+        if(emv_load_hex(ff, key_date, row->date, 3)) row->has_date = true;
+        if(emv_load_hex(ff, key_amt, row->amount, 6)) row->has_amount = true;
+        uint32_t cur = 0;
+        if(emv_load_u32(ff, key_cur, &cur)) {
+            row->currency = (uint16_t)cur;
+            row->has_currency = true;
+        }
+    }
+}
+
+// ISO14443-4A transport block (v3 files). Optional and non-fatal: v2 files
+// predate it, and a malformed block must not cost the financial fields, so
+// any failure just leaves has_transport clear. The block mirrors a .nfc
+// file's 4A section, so the firmware's own loader parses it; version 3 >
+// NFC_LSB_ATQA_FORMAT_VERSION, so its ATQA un-swap matches the MSB-first
+// order iso14443_3a_save() wrote. key_exist and get_value_count both restore
+// the cursor; read_hex does not, so rewind it on failure before handing off
+// to iso14443_4a_load (which reads ATQA/SAK/T0... sequentially from the
+// cursor the read_hex left behind).
+static void emv_load_transport(
+    FlipperFormat* ff,
+    EmvData* data,
+    NfcDevice* device,
+    uint32_t version) {
+    if(!flipper_format_key_exist(ff, "UID")) return;
+    Iso14443_4aData* transport = iso14443_4a_alloc();
+    do {
+        uint32_t uid_len = 0;
+        if(!flipper_format_get_value_count(ff, "UID", &uid_len)) break;
+        if(uid_len == 0 || uid_len > ISO14443_3A_MAX_UID_SIZE) break;
+        size_t uid_pos = flipper_format_tell(ff);
+        uint8_t uid[ISO14443_3A_MAX_UID_SIZE];
+        if(!flipper_format_read_hex(ff, "UID", uid, (uint16_t)uid_len)) {
+            flipper_format_seek(ff, (int32_t)uid_pos, FlipperFormatOffsetFromStart);
+            break;
+        }
+        if(!iso14443_4a_set_uid(transport, uid, uid_len)) break;
+        if(!iso14443_4a_load(transport, ff, version)) break;
+        nfc_device_set_data(device, NfcProtocolIso14443_4a, (const NfcDeviceData*)transport);
+        data->has_transport = true;
+    } while(false);
+    iso14443_4a_free(transport);
+}
+
 bool emv_load(EmvData* data, NfcDevice* device, const char* path) {
     if(!data || !device || !path) return false;
 
@@ -1150,36 +1283,7 @@ bool emv_load(EmvData* data, NfcDevice* device, const char* path) {
         furi_string_free(filetype);
         if(!header_ok) break;
 
-        // AIDs. AID Count is mandatory-ish (always written by emv_save); a
-        // missing one still must not strand the cursor for what follows.
-        {
-            size_t pos = flipper_format_tell(ff);
-            uint32_t aid_count = 0;
-            if(flipper_format_read_uint32(ff, "AID Count", &aid_count, 1)) {
-                data->aid_count = (uint8_t)(aid_count < EMV_MAX_AIDS ? aid_count : EMV_MAX_AIDS);
-                for(uint8_t i = 0; i < data->aid_count; i++) {
-                    char key[16];
-                    snprintf(key, sizeof(key), "AID %u", (unsigned)i);
-                    size_t apos = flipper_format_tell(ff);
-                    uint8_t buf[EMV_AID_MAX_LEN];
-                    if(flipper_format_read_hex(ff, key, buf, EMV_AID_MAX_LEN)) {
-                        // get_value_count restores the cursor itself, so it is
-                        // safe to call after a successful read; it re-seeks to
-                        // the key from the start and returns the value count.
-                        uint32_t count = 0;
-                        if(flipper_format_get_value_count(ff, key, &count)) {
-                            data->aid_len[i] =
-                                (uint8_t)(count < EMV_AID_MAX_LEN ? count : EMV_AID_MAX_LEN);
-                            memcpy(data->aid[i], buf, data->aid_len[i]);
-                        }
-                    } else {
-                        flipper_format_seek(ff, (int32_t)apos, FlipperFormatOffsetFromStart);
-                    }
-                }
-            } else {
-                flipper_format_seek(ff, (int32_t)pos, FlipperFormatOffsetFromStart);
-            }
-        }
+        emv_load_aids(ff, data);
 
         // Text fields - each restores the cursor on a miss.
         emv_load_str(ff, "Label", tmp, data->label, EMV_LABEL_MAX_LEN);
@@ -1191,91 +1295,9 @@ bool emv_load(EmvData* data, NfcDevice* device, const char* path) {
         emv_load_str(ff, "Issuer Country", tmp, data->issuer_country, EMV_ISSUER_COUNTRY_LEN);
         emv_load_str(ff, "Card Sequence", tmp, data->card_seq_num, EMV_CARD_SEQ_NUM_LEN);
 
-        // Track 2. get_value_count restores the cursor itself; the read_hex
-        // after it seeks from the start, so a missing Track2 is naturally
-        // safe, but the read_hex failure path still needs a rewind guard.
-        {
-            uint32_t t2_count = 0;
-            if(flipper_format_get_value_count(ff, "Track2", &t2_count) &&
-               t2_count <= EMV_TRACK2_MAX_LEN) {
-                size_t pos = flipper_format_tell(ff);
-                if(flipper_format_read_hex(ff, "Track2", data->track2, (uint16_t)t2_count)) {
-                    data->track2_len = (uint8_t)t2_count;
-                } else {
-                    flipper_format_seek(ff, (int32_t)pos, FlipperFormatOffsetFromStart);
-                }
-            }
-        }
-
-        // Transaction log. Log Count and each per-row field are all optional.
-        {
-            size_t pos = flipper_format_tell(ff);
-            uint32_t log_count = 0;
-            if(flipper_format_read_uint32(ff, "Log Count", &log_count, 1)) {
-                data->log_rows =
-                    (uint8_t)(log_count < EMV_MAX_LOG_ROWS ? log_count : EMV_MAX_LOG_ROWS);
-                for(uint8_t r = 0; r < data->log_rows; r++) {
-                    EmvLogRow* row = &data->log[r];
-                    char key_date[20], key_amt[20], key_cur[20];
-                    snprintf(key_date, sizeof(key_date), "Log %u Date", (unsigned)r);
-                    snprintf(key_amt, sizeof(key_amt), "Log %u Amount", (unsigned)r);
-                    snprintf(key_cur, sizeof(key_cur), "Log %u Currency", (unsigned)r);
-                    size_t p1 = flipper_format_tell(ff);
-                    if(flipper_format_read_hex(ff, key_date, row->date, 3)) {
-                        row->has_date = true;
-                    } else {
-                        flipper_format_seek(ff, (int32_t)p1, FlipperFormatOffsetFromStart);
-                    }
-                    size_t p2 = flipper_format_tell(ff);
-                    if(flipper_format_read_hex(ff, key_amt, row->amount, 6)) {
-                        row->has_amount = true;
-                    } else {
-                        flipper_format_seek(ff, (int32_t)p2, FlipperFormatOffsetFromStart);
-                    }
-                    size_t p3 = flipper_format_tell(ff);
-                    uint32_t cur = 0;
-                    if(flipper_format_read_uint32(ff, key_cur, &cur, 1)) {
-                        row->currency = (uint16_t)cur;
-                        row->has_currency = true;
-                    } else {
-                        flipper_format_seek(ff, (int32_t)p3, FlipperFormatOffsetFromStart);
-                    }
-                }
-            } else {
-                flipper_format_seek(ff, (int32_t)pos, FlipperFormatOffsetFromStart);
-            }
-        }
-
-        // ISO14443-4A transport block (v3 files). Optional and non-fatal: v2
-        // files predate it, and a malformed block must not cost the financial
-        // fields, so any failure just leaves has_transport clear. The block
-        // mirrors a .nfc file's 4A section, so the firmware's own loader
-        // parses it; version 3 > NFC_LSB_ATQA_FORMAT_VERSION, so its ATQA
-        // un-swap matches the MSB-first order iso14443_3a_save() wrote.
-        // key_exist and get_value_count both restore the cursor; read_hex
-        // does not, so rewind it on failure before handing off to
-        // iso14443_4a_load (which reads ATQA/SAK/T0... sequentially from the
-        // cursor the read_hex left behind).
-        if(flipper_format_key_exist(ff, "UID")) {
-            Iso14443_4aData* transport = iso14443_4a_alloc();
-            do {
-                uint32_t uid_len = 0;
-                if(!flipper_format_get_value_count(ff, "UID", &uid_len)) break;
-                if(uid_len == 0 || uid_len > ISO14443_3A_MAX_UID_SIZE) break;
-                size_t uid_pos = flipper_format_tell(ff);
-                uint8_t uid[ISO14443_3A_MAX_UID_SIZE];
-                if(!flipper_format_read_hex(ff, "UID", uid, (uint16_t)uid_len)) {
-                    flipper_format_seek(ff, (int32_t)uid_pos, FlipperFormatOffsetFromStart);
-                    break;
-                }
-                if(!iso14443_4a_set_uid(transport, uid, uid_len)) break;
-                if(!iso14443_4a_load(transport, ff, version)) break;
-                nfc_device_set_data(
-                    device, NfcProtocolIso14443_4a, (const NfcDeviceData*)transport);
-                data->has_transport = true;
-            } while(false);
-            iso14443_4a_free(transport);
-        }
+        emv_load_track2(ff, data);
+        emv_load_log(ff, data);
+        emv_load_transport(ff, data, device, version);
 
         data->ppse_ok = true;
         ok = true;

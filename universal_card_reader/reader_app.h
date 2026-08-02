@@ -57,8 +57,6 @@
 typedef enum {
     ReaderStateScanning,
     ReaderStateReading,
-    // Unreachable today — see the TODO on ReaderEventError in reader_app.h.
-    ReaderStateError,
     ReaderStateNotice, // save result / blocked-action message, auto-returns
     ReaderStateEmulating,
 } ReaderState;
@@ -70,11 +68,6 @@ typedef enum {
     ReaderEventNfcScanned,
     ReaderEventNfcRead,
     ReaderEventLfRead,
-    // TODO(unreachable): nothing posts this — grep for EVENT_MAKE(ReaderEventError.
-    // The whole path (ReaderStateError, its draw case, draw_cross(),
-    // reader_handle_error() and the OK-to-rescan branch in reader_input_callback())
-    // is kept for a future error source; wire it up or delete it as a whole, never half.
-    ReaderEventError,
     ReaderEventActionSave,
     ReaderEventActionEmulate,
     ReaderEventActionRescan,

@@ -223,6 +223,63 @@ static void reader_do_save(ReaderApp* app) {
     furi_string_free(path);
 }
 
+static bool reader_load_nfc_file(ReaderApp* app, const char* full) {
+    bool ok = nfc_device_load(app->device, full);
+    if(ok) {
+        memset(&app->emv, 0, sizeof(app->emv)); // no stale bank data from a previous card
+        // display_protocol comes from the firmware's own device table, so it may be
+        // a fork-only protocol (Momentum NfcProtocolEmv/Ntag4xx/Type4Tag) for a file
+        // dropped in over USB - safe here since it is only used for the name/chain
+        // (card_info's dev_has()) and as input to reader_poll_protocol(), which
+        // resolves it via nfc_protocol_has_parent() (firmware-evaluated) to the same
+        // compile-time-whitelisted id a live scan would have produced. Never compare
+        // display_protocol itself against a sentinel.
+        app->display_protocol = nfc_device_get_protocol(app->device);
+        app->poll_protocol = reader_poll_protocol(app->display_protocol);
+        app->card = ReaderCardNfc;
+        reader_report_begin(app);
+        card_info_format_nfc(app->info_text, app->device, app->display_protocol, &app->emv);
+        reader_report_show(app, nfc_device_get_protocol_name(app->display_protocol));
+    }
+    return ok;
+}
+
+static bool reader_load_emv_file(ReaderApp* app, const char* full) {
+    bool ok = emv_load(&app->emv, app->device, full);
+    if(ok) {
+        app->card = ReaderCardEmvFile;
+        if(app->emv.has_transport) {
+            // v3 file: the 4A transport was restored into the device, so
+            // Emulate can run exactly like a live ISO14443-4A read.
+            app->display_protocol = NfcProtocolIso14443_4a;
+            app->poll_protocol = NfcProtocolIso14443_4a;
+        }
+        reader_report_begin(app);
+        card_info_format_emv(app->info_text, &app->emv);
+        reader_report_show(app, "EMV file");
+    }
+    return ok;
+}
+
+static bool reader_load_rfid_file(ReaderApp* app, const char* full) {
+    ProtocolId id = lfrfid_dict_file_load(app->dict, full);
+    bool ok = (id != PROTOCOL_NO);
+    if(ok) {
+        app->lf_protocol = id;
+        size_t size = protocol_dict_get_data_size(app->dict, id);
+        if(size > ID_MAX_LEN) size = ID_MAX_LEN;
+        protocol_dict_get_data(app->dict, id, app->scratch_id, size);
+        app->scratch_id_len = size;
+        app->card = ReaderCardLf;
+        const char* name = protocol_dict_get_name(app->dict, id);
+        reader_report_begin(app);
+        card_info_format_lf(
+            app->info_text, name ? name : "Unknown", app->scratch_id, app->scratch_id_len);
+        reader_report_show(app, name ? name : "Unknown");
+    }
+    return ok;
+}
+
 // GUI thread only. dialog_file_browser_show() blocks this thread until the
 // user picks or cancels, so every radio must be down and — critically — the
 // animation timer must be stopped first: view_dispatcher_send_custom_event()
@@ -261,53 +318,11 @@ static void reader_do_load(ReaderApp* app) {
     bool ok = false;
 
     if(furi_string_end_with_str(path, ".nfc")) {
-        ok = nfc_device_load(app->device, full);
-        if(ok) {
-            memset(&app->emv, 0, sizeof(app->emv)); // no stale bank data from a previous card
-            // display_protocol comes from the firmware's own device table, so it may be
-            // a fork-only protocol (Momentum NfcProtocolEmv/Ntag4xx/Type4Tag) for a file
-            // dropped in over USB - safe here since it is only used for the name/chain
-            // (card_info's dev_has()) and as input to reader_poll_protocol(), which
-            // resolves it via nfc_protocol_has_parent() (firmware-evaluated) to the same
-            // compile-time-whitelisted id a live scan would have produced. Never compare
-            // display_protocol itself against a sentinel.
-            app->display_protocol = nfc_device_get_protocol(app->device);
-            app->poll_protocol = reader_poll_protocol(app->display_protocol);
-            app->card = ReaderCardNfc;
-            reader_report_begin(app);
-            card_info_format_nfc(app->info_text, app->device, app->display_protocol, &app->emv);
-            reader_report_show(app, nfc_device_get_protocol_name(app->display_protocol));
-        }
+        ok = reader_load_nfc_file(app, full);
     } else if(furi_string_end_with_str(path, ".emv")) {
-        ok = emv_load(&app->emv, app->device, full);
-        if(ok) {
-            app->card = ReaderCardEmvFile;
-            if(app->emv.has_transport) {
-                // v3 file: the 4A transport was restored into the device, so
-                // Emulate can run exactly like a live ISO14443-4A read.
-                app->display_protocol = NfcProtocolIso14443_4a;
-                app->poll_protocol = NfcProtocolIso14443_4a;
-            }
-            reader_report_begin(app);
-            card_info_format_emv(app->info_text, &app->emv);
-            reader_report_show(app, "EMV file");
-        }
+        ok = reader_load_emv_file(app, full);
     } else if(furi_string_end_with_str(path, ".rfid")) {
-        ProtocolId id = lfrfid_dict_file_load(app->dict, full);
-        ok = (id != PROTOCOL_NO);
-        if(ok) {
-            app->lf_protocol = id;
-            size_t size = protocol_dict_get_data_size(app->dict, id);
-            if(size > ID_MAX_LEN) size = ID_MAX_LEN;
-            protocol_dict_get_data(app->dict, id, app->scratch_id, size);
-            app->scratch_id_len = size;
-            app->card = ReaderCardLf;
-            const char* name = protocol_dict_get_name(app->dict, id);
-            reader_report_begin(app);
-            card_info_format_lf(
-                app->info_text, name ? name : "Unknown", app->scratch_id, app->scratch_id_len);
-            reader_report_show(app, name ? name : "Unknown");
-        }
+        ok = reader_load_rfid_file(app, full);
     }
 
     FURI_LOG_I(TAG, "load %s: %s", ok ? "ok" : "FAILED", full);
@@ -331,16 +346,6 @@ static void reader_do_emulate(ReaderApp* app) {
             reader_show_notice(app, "Blocked", "no transport data", "in .emv file");
             return;
         }
-        // v3 file: emulate the restored ISO14443-4A transport, same as the
-        // live payment-card path below.
-        if(!reader_protocol_emulatable(app->poll_protocol)) {
-            reader_show_notice(
-                app,
-                "Blocked",
-                "No emulation for",
-                nfc_device_get_protocol_name(app->poll_protocol));
-            return;
-        }
         reader_start_nfc_emulation(app);
         return;
     }
@@ -353,11 +358,6 @@ static void reader_do_emulate(ReaderApp* app) {
     // The card presents its full data (PAN, expiry, AIDs, track2, log) to any
     // reader that queries it, just like the original card.
     if(reader_is_payment_card(app)) {
-        if(!reader_protocol_emulatable(app->poll_protocol)) {
-            reader_show_notice(
-                app, "Blocked", "No emulation for", nfc_device_get_protocol_name(app->poll_protocol));
-            return;
-        }
         reader_start_nfc_emulation(app);
         return;
     }
@@ -377,14 +377,6 @@ static void reader_handle_phase_timeout(ReaderApp* app) {
     } else {
         reader_start_lf_phase(app);
     }
-}
-
-// Unreachable today — see the TODO on ReaderEventError in reader_app.h.
-static void reader_handle_error(ReaderApp* app) {
-    reader_stop_all(app);
-    app->gen++;
-    furi_timer_stop(app->anim_timer); // the error screen is static
-    reader_set_state(app, ReaderStateError);
 }
 
 static void reader_handle_exit(ReaderApp* app) {
@@ -417,7 +409,6 @@ static bool reader_custom_event_callback(void* context, uint32_t event) {
     case ReaderEventNfcScanned:    reader_nfc_handle_scanned(app);          return true;
     case ReaderEventNfcRead:       reader_nfc_handle_read(app);             return true;
     case ReaderEventLfRead:        reader_lf_handle_read(app);              return true;
-    case ReaderEventError:         reader_handle_error(app);                return true;
     case ReaderEventActionSave:    reader_do_save(app);                     return true;
     case ReaderEventActionEmulate: reader_do_emulate(app);                  return true;
     case ReaderEventActionRescan:  reader_start_nfc_phase(app);             return true;
@@ -459,11 +450,6 @@ static bool reader_input_callback(InputEvent* event, void* context) {
         // teardown stays inside reader_custom_event_callback().
         view_dispatcher_send_custom_event(
             app->view_dispatcher, EVENT_MAKE(ReaderEventActionLoad, app->gen));
-        return true;
-    }
-
-    if(event->key == InputKeyOk && state == ReaderStateError) {
-        reader_start_nfc_phase(app);
         return true;
     }
 

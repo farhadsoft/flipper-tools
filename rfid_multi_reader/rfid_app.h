@@ -47,7 +47,6 @@ typedef enum {
     RfidModeAuto,
     RfidModeHf,
     RfidModeLf,
-    RfidModeUhf,
 } RfidMode;
 
 typedef enum {

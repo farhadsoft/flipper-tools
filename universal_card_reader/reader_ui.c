@@ -68,17 +68,45 @@ static void draw_dots(Canvas* canvas, int x, int y, uint8_t frame) {
     }
 }
 
-// Unreachable today — see the TODO on ReaderEventError in reader_app.h.
-static void draw_cross(Canvas* canvas, int x, int y) {
-    canvas_draw_line(canvas, x, y, x + 10, y + 10);
-    canvas_draw_line(canvas, x + 1, y, x + 11, y + 10);
-    canvas_draw_line(canvas, x + 10, y, x, y + 10);
-    canvas_draw_line(canvas, x + 11, y, x + 1, y + 10);
-}
-
 // Highlight frame around the active band / emulation label.
 static void draw_band(Canvas* canvas) {
     canvas_draw_rframe(canvas, 10, 44, 108, 12, 3);
+}
+
+static void draw_state_scanning(Canvas* canvas, const ReaderModel* m) {
+    const int cx = 64, cy = 30;
+    draw_radar(canvas, cx, cy, m->frame);
+    draw_card_icon(canvas, cx, cy);
+
+    const char* active = m->lf ? "< 125 kHz RFID >" : "< 13.56 MHz NFC >";
+    const char* idle = m->lf ? "13.56 MHz NFC" : "125 kHz RFID";
+
+    // Active band boxed, the idle one left plain underneath.
+    draw_band(canvas);
+    draw_centered(canvas, 53, active);
+
+    int idle_w = canvas_string_width(canvas, idle);
+    canvas_draw_str(canvas, 2, 63, idle);
+    draw_dots(canvas, idle_w + 5, 62, m->frame);
+    const char* hint = "OK:load";
+    canvas_draw_str(canvas, SCREEN_W - canvas_string_width(canvas, hint) - 2, 63, hint);
+}
+
+static void draw_state_reading(Canvas* canvas, const ReaderModel* m) {
+    draw_card_icon(canvas, 64, 28);
+    draw_centered(canvas, 48, "Reading card");
+
+    // Progress bar with a block sweeping left to right.
+    canvas_draw_rframe(canvas, 14, 53, 100, 8, 2);
+    int pos = (m->frame * 3) % 116; // 0..115, wraps past the right edge
+    int x = 16 + pos - 24;
+    int w = 24;
+    if(x < 16) {
+        w -= (16 - x);
+        x = 16;
+    }
+    if(x + w > 112) w = 112 - x;
+    if(w > 0) canvas_draw_box(canvas, x, 55, w, 4);
 }
 
 void reader_draw_callback(Canvas* canvas, void* model) {
@@ -87,52 +115,12 @@ void reader_draw_callback(Canvas* canvas, void* model) {
     draw_title_bar(canvas, "UNIVERSAL READER");
 
     switch(m->state) {
-    case ReaderStateScanning: {
-        const int cx = 64, cy = 30;
-        draw_radar(canvas, cx, cy, m->frame);
-        draw_card_icon(canvas, cx, cy);
-
-        const char* active = m->lf ? "< 125 kHz RFID >" : "< 13.56 MHz NFC >";
-        const char* idle = m->lf ? "13.56 MHz NFC" : "125 kHz RFID";
-
-        // Active band boxed, the idle one left plain underneath.
-        draw_band(canvas);
-        draw_centered(canvas, 53, active);
-
-        int idle_w = canvas_string_width(canvas, idle);
-        canvas_draw_str(canvas, 2, 63, idle);
-        draw_dots(canvas, idle_w + 5, 62, m->frame);
-        const char* hint = "OK:load";
-        canvas_draw_str(canvas, SCREEN_W - canvas_string_width(canvas, hint) - 2, 63, hint);
+    case ReaderStateScanning:
+        draw_state_scanning(canvas, m);
         break;
-    }
 
-    case ReaderStateReading: {
-        draw_card_icon(canvas, 64, 28);
-        draw_centered(canvas, 48, "Reading card");
-
-        // Progress bar with a block sweeping left to right.
-        canvas_draw_rframe(canvas, 14, 53, 100, 8, 2);
-        int pos = (m->frame * 3) % 116; // 0..115, wraps past the right edge
-        int x = 16 + pos - 24;
-        int w = 24;
-        if(x < 16) {
-            w -= (16 - x);
-            x = 16;
-        }
-        if(x + w > 112) w = 112 - x;
-        if(w > 0) canvas_draw_box(canvas, x, 55, w, 4);
-        break;
-    }
-
-    // Unreachable today — see the TODO on ReaderEventError in reader_app.h.
-    case ReaderStateError:
-        draw_cross(canvas, 8, 24);
-        canvas_set_font(canvas, FontPrimary);
-        canvas_draw_str(canvas, 26, 34, "Read failed");
-        canvas_set_font(canvas, FontSecondary);
-        canvas_draw_str(canvas, 26, 45, "retry");
-        canvas_draw_str(canvas, 2, 63, "OK: rescan   Back: exit");
+    case ReaderStateReading:
+        draw_state_reading(canvas, m);
         break;
 
     case ReaderStateNotice:

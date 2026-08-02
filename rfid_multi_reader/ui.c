@@ -73,46 +73,52 @@ static void draw_band(Canvas* canvas) {
     canvas_draw_rframe(canvas, 10, 44, 108, 12, 3);
 }
 
+static void draw_state_scanning(Canvas* canvas, const RfidModel* m) {
+    const int cx = 64, cy = 30;
+    draw_radar(canvas, cx, cy, m->frame);
+    draw_card_icon(canvas, cx, cy);
+
+    // Active band boxed; the mode name left plain underneath with
+    // trailing animated dots, mirroring universal_card_reader's
+    // active/idle two-line layout.
+    draw_band(canvas);
+    draw_centered(canvas, 53, m->band);
+
+    int mode_w = canvas_string_width(canvas, m->mode);
+    canvas_draw_str(canvas, (SCREEN_W - mode_w) / 2 - 8, 63, m->mode);
+    draw_dots(canvas, (SCREEN_W + mode_w) / 2 - 2, 62, m->frame);
+}
+
+static void draw_state_reading(Canvas* canvas, const RfidModel* m) {
+    draw_card_icon(canvas, 64, 28);
+    draw_centered(canvas, 48, "Reading card");
+
+    // Progress bar with a block sweeping left to right.
+    canvas_draw_rframe(canvas, 14, 53, 100, 8, 2);
+    int pos = (m->frame * 3) % 116; // 0..115, wraps past the right edge
+    int x = 16 + pos - 24;
+    int w = 24;
+    if(x < 16) {
+        w -= (16 - x);
+        x = 16;
+    }
+    if(x + w > 112) w = 112 - x;
+    if(w > 0) canvas_draw_box(canvas, x, 55, w, 4);
+}
+
 void rfid_draw_callback(Canvas* canvas, void* model) {
     RfidModel* m = model;
     canvas_clear(canvas);
     draw_title_bar(canvas, "RFID MULTI-READER");
 
     switch(m->state) {
-    case RfidStateScanning: {
-        const int cx = 64, cy = 30;
-        draw_radar(canvas, cx, cy, m->frame);
-        draw_card_icon(canvas, cx, cy);
-
-        // Active band boxed; the mode name left plain underneath with
-        // trailing animated dots, mirroring universal_card_reader's
-        // active/idle two-line layout.
-        draw_band(canvas);
-        draw_centered(canvas, 53, m->band);
-
-        int mode_w = canvas_string_width(canvas, m->mode);
-        canvas_draw_str(canvas, (SCREEN_W - mode_w) / 2 - 8, 63, m->mode);
-        draw_dots(canvas, (SCREEN_W + mode_w) / 2 - 2, 62, m->frame);
+    case RfidStateScanning:
+        draw_state_scanning(canvas, m);
         break;
-    }
 
-    case RfidStateReading: {
-        draw_card_icon(canvas, 64, 28);
-        draw_centered(canvas, 48, "Reading card");
-
-        // Progress bar with a block sweeping left to right.
-        canvas_draw_rframe(canvas, 14, 53, 100, 8, 2);
-        int pos = (m->frame * 3) % 116; // 0..115, wraps past the right edge
-        int x = 16 + pos - 24;
-        int w = 24;
-        if(x < 16) {
-            w -= (16 - x);
-            x = 16;
-        }
-        if(x + w > 112) w = 112 - x;
-        if(w > 0) canvas_draw_box(canvas, x, 55, w, 4);
+    case RfidStateReading:
+        draw_state_reading(canvas, m);
         break;
-    }
 
     case RfidStateNotice:
         canvas_set_font(canvas, FontPrimary);

@@ -22,7 +22,6 @@
 #include "ui.h"
 #include "backend_hf.h"
 #include "backend_lf.h"
-#include "backend_uhf.h"
 
 /* ----------------------------- helpers -------------------------------- */
 
@@ -31,7 +30,6 @@ static const char* rfid_mode_label(RfidMode mode) {
     case RfidModeAuto: return "Auto";
     case RfidModeHf: return "HF only";
     case RfidModeLf: return "LF only";
-    case RfidModeUhf: return "UHF"; // unreachable while scanning
     default: return "";
     }
 }
@@ -44,7 +42,6 @@ static void rfid_build_rotation(RfidApp* app) {
 
     RfidBackend* hf = app->backends[RfidBandHf];
     RfidBackend* lf = app->backends[RfidBandLf];
-    RfidBackend* uhf = app->backends[RfidBandUhf];
 
     switch(app->mode) {
     case RfidModeAuto:
@@ -56,9 +53,6 @@ static void rfid_build_rotation(RfidApp* app) {
         break;
     case RfidModeLf:
         if(lf && lf->available()) app->rotation[app->rotation_len++] = lf;
-        break;
-    case RfidModeUhf: // unreachable: RfidEventMenuUhf never sets app->mode
-        if(uhf && uhf->available()) app->rotation[app->rotation_len++] = uhf;
         break;
     }
 }
@@ -362,7 +356,6 @@ static RfidApp* rfid_app_alloc(void) {
     // rfid_build_rotation()'s available() checks.
     app->backends[RfidBandHf] = rfid_backend_hf();
     app->backends[RfidBandLf] = rfid_backend_lf();
-    app->backends[RfidBandUhf] = rfid_backend_uhf();
     for(size_t i = 0; i < RfidBandCount; i++) {
         if(app->backends[i]) app->backends[i]->alloc(app->backends[i]);
     }

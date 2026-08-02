@@ -15,7 +15,6 @@ typedef void (*RfidReadCb)(void* ctx);
 typedef enum {
     RfidBandHf, // 13.56 MHz, built-in
     RfidBandLf, // 125 kHz, built-in
-    RfidBandUhf, // 860-960 MHz, external module only
     RfidBandCount,
 } RfidBand;
 
@@ -52,4 +51,3 @@ struct RfidBackend {
 
 RfidBackend* rfid_backend_hf(void);
 RfidBackend* rfid_backend_lf(void);
-RfidBackend* rfid_backend_uhf(void);

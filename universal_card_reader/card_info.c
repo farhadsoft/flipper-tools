@@ -174,6 +174,96 @@ static void ndef_printable(FuriString* out, const uint8_t* data, size_t len) {
     out_addf(out, "%s", tmp);
 }
 
+#define NDEF_FLAG_MESSAGE_END  0x40
+#define NDEF_FLAG_SHORT_RECORD 0x08
+#define NDEF_FLAG_ID_LENGTH    0x04
+#define NDEF_TNF_MASK          0x07
+#define NDEF_TNF_WELL_KNOWN    0x01
+#define NDEF_TEXT_UTF16_BIT    0x80
+#define NDEF_TEXT_LANG_MASK    0x3F
+#define NDEF_MAX_RECORDS       4
+
+typedef struct {
+    uint8_t tnf;
+    const uint8_t* type;
+    uint8_t type_len;
+    const uint8_t* payload;
+    uint32_t payload_len;
+    bool message_end;
+} NdefRecord;
+
+// Advances *pos past one record header + its type/id/payload. false = malformed, stop.
+static bool ndef_parse_record(const uint8_t* msg, size_t msg_len, size_t* pos, NdefRecord* rec) {
+    uint8_t flags = msg[(*pos)++];
+    rec->message_end = flags & NDEF_FLAG_MESSAGE_END;
+    bool sr = flags & NDEF_FLAG_SHORT_RECORD;
+    bool il = flags & NDEF_FLAG_ID_LENGTH;
+    rec->tnf = flags & NDEF_TNF_MASK;
+
+    if(*pos >= msg_len) return false;
+    rec->type_len = msg[(*pos)++];
+
+    if(sr) {
+        if(*pos >= msg_len) return false;
+        rec->payload_len = msg[(*pos)++];
+    } else {
+        if(*pos + 4 > msg_len) return false;
+        rec->payload_len = ((uint32_t)msg[*pos] << 24) | ((uint32_t)msg[*pos + 1] << 16) |
+                           ((uint32_t)msg[*pos + 2] << 8) | (uint32_t)msg[*pos + 3];
+        *pos += 4;
+    }
+
+    uint8_t id_len = 0;
+    if(il) {
+        if(*pos >= msg_len) return false;
+        id_len = msg[(*pos)++];
+    }
+    if(*pos + rec->type_len + id_len + rec->payload_len > msg_len) return false;
+
+    rec->type = msg + *pos;
+    *pos += (size_t)rec->type_len + id_len;
+    rec->payload = msg + *pos;
+    *pos += rec->payload_len;
+    return true;
+}
+
+static void ndef_render_record(FuriString* out, const NdefRecord* rec) {
+    uint8_t tnf = rec->tnf;
+    const uint8_t* type = rec->type;
+    uint8_t type_len = rec->type_len;
+    const uint8_t* payload = rec->payload;
+    uint32_t payload_len = rec->payload_len;
+
+    if(tnf == NDEF_TNF_WELL_KNOWN && type_len == 1 && type[0] == 'U' && payload_len >= 1) {
+        const char* prefix = "";
+        if(payload[0] < COUNT_OF(ndef_uri_prefixes)) {
+            prefix = ndef_uri_prefixes[payload[0]];
+        }
+        out_addf(out, "URI: %s", prefix);
+        ndef_printable(out, payload + 1, payload_len - 1);
+        out_addf(out, "\n");
+    } else if(tnf == NDEF_TNF_WELL_KNOWN && type_len == 1 && type[0] == 'T' && payload_len >= 1) {
+        uint8_t status = payload[0];
+        size_t lang_len = status & NDEF_TEXT_LANG_MASK;
+        if(status & NDEF_TEXT_UTF16_BIT) {
+            size_t hex_len = payload_len - 1 < 32 ? payload_len - 1 : 32;
+            out_addf(out, "Text (UTF-16): ");
+            out_hex(out, payload + 1, hex_len);
+            out_addf(out, "\n");
+        } else {
+            size_t off = 1 + lang_len;
+            if(off > payload_len) off = payload_len;
+            out_addf(out, "Text: ");
+            ndef_printable(out, payload + off, payload_len - off);
+            out_addf(out, "\n");
+        }
+    } else {
+        out_addf(out, "Record: type ");
+        ndef_printable(out, type, type_len);
+        out_addf(out, "\n");
+    }
+}
+
 // Parses one NDEF message: up to 4 records, only well-known (TNF 0x01) URI
 // and Text records are decoded. Silent on malformed data.
 static void ndef_render_message(FuriString* out, const uint8_t* msg, size_t msg_len) {
@@ -181,70 +271,14 @@ static void ndef_render_message(FuriString* out, const uint8_t* msg, size_t msg_
     size_t pos = 0;
     uint8_t rec = 0;
     bool me = false;
-    while(!me && pos < msg_len && rec < 4) {
-        uint8_t flags = msg[pos++];
-        me = flags & 0x40;
-        bool sr = flags & 0x08;
-        bool il = flags & 0x04;
-        uint8_t tnf = flags & 0x07;
-
-        if(pos >= msg_len) break;
-        uint8_t type_len = msg[pos++];
-
-        uint32_t payload_len;
-        if(sr) {
-            if(pos >= msg_len) break;
-            payload_len = msg[pos++];
-        } else {
-            if(pos + 4 > msg_len) break;
-            payload_len = ((uint32_t)msg[pos] << 24) | ((uint32_t)msg[pos + 1] << 16) |
-                          ((uint32_t)msg[pos + 2] << 8) | (uint32_t)msg[pos + 3];
-            pos += 4;
-        }
-
-        uint8_t id_len = 0;
-        if(il) {
-            if(pos >= msg_len) break;
-            id_len = msg[pos++];
-        }
-        if(pos + type_len + id_len + payload_len > msg_len) break;
-
-        const uint8_t* type = msg + pos;
-        pos += (size_t)type_len + id_len;
-        const uint8_t* payload = msg + pos;
-        pos += payload_len;
-
-        if(tnf == 0x01 && type_len == 1 && type[0] == 'U' && payload_len >= 1) {
-            const char* prefix = "";
-            if(payload[0] < COUNT_OF(ndef_uri_prefixes)) {
-                prefix = ndef_uri_prefixes[payload[0]];
-            }
-            out_addf(out, "URI: %s", prefix);
-            ndef_printable(out, payload + 1, payload_len - 1);
-            out_addf(out, "\n");
-        } else if(tnf == 0x01 && type_len == 1 && type[0] == 'T' && payload_len >= 1) {
-            uint8_t status = payload[0];
-            size_t lang_len = status & 0x3F;
-            if(status & 0x80) {
-                size_t hex_len = payload_len - 1 < 32 ? payload_len - 1 : 32;
-                out_addf(out, "Text (UTF-16): ");
-                out_hex(out, payload + 1, hex_len);
-                out_addf(out, "\n");
-            } else {
-                size_t off = 1 + lang_len;
-                if(off > payload_len) off = payload_len;
-                out_addf(out, "Text: ");
-                ndef_printable(out, payload + off, payload_len - off);
-                out_addf(out, "\n");
-            }
-        } else {
-            out_addf(out, "Record: type ");
-            ndef_printable(out, type, type_len);
-            out_addf(out, "\n");
-        }
+    while(!me && pos < msg_len && rec < NDEF_MAX_RECORDS) {
+        NdefRecord parsed;
+        if(!ndef_parse_record(msg, msg_len, &pos, &parsed)) break;
+        me = parsed.message_end;
+        ndef_render_record(out, &parsed);
         rec++;
     }
-    if(rec == 4 && !me) out_addf(out, "(...more)\n");
+    if(rec == NDEF_MAX_RECORDS && !me) out_addf(out, "(...more)\n");
 }
 
 // Best-effort NDEF extraction from already-read MfUltralight pages: the TLV
@@ -444,6 +478,70 @@ static void card_info_mf_classic(FuriString* out, const NfcDevice* device) {
     }
 }
 
+// prints "Label: value\n", or "Label: fallback\n" when value is empty
+static void out_field(FuriString* out, const char* label, const char* value, const char* fallback) {
+    if(value[0]) {
+        out_addf(out, "%s: %s\n", label, value);
+    } else {
+        out_addf(out, "%s: %s\n", label, fallback);
+    }
+}
+
+// prints "Label: value\n" only when value is non-empty
+static void out_field_opt(FuriString* out, const char* label, const char* value) {
+    if(value[0]) out_addf(out, "%s: %s\n", label, value);
+}
+
+static void card_info_emv_identity(FuriString* out, const EmvData* emv) {
+    for(uint8_t i = 0; i < emv->aid_count; i++) {
+        out_addf(out, i == 0 ? "AID: " : "AID+: ");
+        out_hex(out, emv->aid[i], emv->aid_len[i]);
+        out_addf(out, "\n");
+    }
+    if(emv->label[0]) out_addf(out, "App: %s\n", emv->label);
+
+    out_field(out, "PAN", emv->pan, "not available over contactless");
+    out_field(out, "Expiry", emv->expiry, "not disclosed");
+    out_field(out, "Name", emv->name, "not disclosed");
+
+    out_field_opt(out, "Service Code", emv->service_code);
+    out_field_opt(out, "Pref Name", emv->app_pref_name);
+    out_field_opt(out, "Country", emv->issuer_country);
+    out_field_opt(out, "Seq #", emv->card_seq_num);
+    if(emv->track2_len > 0) {
+        out_addf(out, "Track2: ");
+        out_hex(out, emv->track2, emv->track2_len);
+        out_addf(out, "\n");
+    }
+}
+
+static void card_info_emv_log(FuriString* out, const EmvData* emv) {
+    if(!emv->log_count) return;
+    out_addf(out, "Txn log: %u records\n", (unsigned)emv->log_count);
+    for(uint8_t r = 0; r < emv->log_rows; r++) {
+        const EmvLogRow* row = &emv->log[r];
+        char date_str[12];
+        char amount_str[16];
+        char cur_fallback[8];
+        const char* cur_str = "--";
+        if(row->has_date) {
+            format_emv_date(row->date, date_str, sizeof(date_str));
+        } else {
+            snprintf(date_str, sizeof(date_str), "--/--/--");
+        }
+        if(row->has_amount) {
+            format_emv_amount(row->amount, amount_str, sizeof(amount_str));
+        } else {
+            snprintf(amount_str, sizeof(amount_str), "--");
+        }
+        if(row->has_currency) {
+            cur_str = format_emv_currency(row->currency, cur_fallback, sizeof(cur_fallback));
+        }
+        out_addf(out, "%s %s %s\n", date_str, amount_str, cur_str);
+    }
+    if(emv->log_rows == 0) out_addf(out, "(log format not given)\n");
+}
+
 static void card_info_emv(FuriString* out, const NfcDevice* device, const EmvData* emv) {
     if(!emv->aid_selected && !emv->ppse_ok) {
         if(device && dev_has(device, NfcProtocolIso14443_4a)) {
@@ -453,74 +551,8 @@ static void card_info_emv(FuriString* out, const NfcDevice* device, const EmvDat
     }
 
     out_addf(out, "\n[EMV / Bank card]\n");
-    for(uint8_t i = 0; i < emv->aid_count; i++) {
-        out_addf(out, i == 0 ? "AID: " : "AID+: ");
-        out_hex(out, emv->aid[i], emv->aid_len[i]);
-        out_addf(out, "\n");
-    }
-    if(emv->label[0]) out_addf(out, "App: %s\n", emv->label);
-
-    if(emv->pan[0]) {
-        out_addf(out, "PAN: %s\n", emv->pan);
-    } else {
-        out_addf(out, "PAN: not available over contactless\n");
-    }
-
-    if(emv->expiry[0]) {
-        out_addf(out, "Expiry: %s\n", emv->expiry);
-    } else {
-        out_addf(out, "Expiry: not disclosed\n");
-    }
-
-    if(emv->name[0]) {
-        out_addf(out, "Name: %s\n", emv->name);
-    } else {
-        out_addf(out, "Name: not disclosed\n");
-    }
-
-    if(emv->service_code[0]) {
-        out_addf(out, "Service Code: %s\n", emv->service_code);
-    }
-    if(emv->app_pref_name[0]) {
-        out_addf(out, "Pref Name: %s\n", emv->app_pref_name);
-    }
-    if(emv->issuer_country[0]) {
-        out_addf(out, "Country: %s\n", emv->issuer_country);
-    }
-    if(emv->card_seq_num[0]) {
-        out_addf(out, "Seq #: %s\n", emv->card_seq_num);
-    }
-    if(emv->track2_len > 0) {
-        out_addf(out, "Track2: ");
-        out_hex(out, emv->track2, emv->track2_len);
-        out_addf(out, "\n");
-    }
-
-    if(emv->log_count) {
-        out_addf(out, "Txn log: %u records\n", (unsigned)emv->log_count);
-        for(uint8_t r = 0; r < emv->log_rows; r++) {
-            const EmvLogRow* row = &emv->log[r];
-            char date_str[12];
-            char amount_str[16];
-            char cur_fallback[8];
-            const char* cur_str = "--";
-            if(row->has_date) {
-                format_emv_date(row->date, date_str, sizeof(date_str));
-            } else {
-                snprintf(date_str, sizeof(date_str), "--/--/--");
-            }
-            if(row->has_amount) {
-                format_emv_amount(row->amount, amount_str, sizeof(amount_str));
-            } else {
-                snprintf(amount_str, sizeof(amount_str), "--");
-            }
-            if(row->has_currency) {
-                cur_str = format_emv_currency(row->currency, cur_fallback, sizeof(cur_fallback));
-            }
-            out_addf(out, "%s %s %s\n", date_str, amount_str, cur_str);
-        }
-        if(emv->log_rows == 0) out_addf(out, "(log format not given)\n");
-    }
+    card_info_emv_identity(out, emv);
+    card_info_emv_log(out, emv);
 }
 
 /* ------------------------------ public API --------------------------- */
