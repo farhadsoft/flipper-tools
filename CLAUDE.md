@@ -65,13 +65,15 @@ universal_card_reader/          <- the app; run ufbt HERE, not at repo root
 Installs to `/ext/apps/Tools/universal_card_reader.fap` (from `fap_category`),
 i.e. **Apps → Tools** on the device.
 
-The repo directory is named after an earlier NFC-only app that lived at the root
-and was deleted once this one superseded it — that is the only reason the folder
-and the app have different names. Nothing should be added back at the root.
+The repo is `flipper-tools` — a neutral name, because it holds Flipper Zero
+tooling rather than a single app. An earlier NFC-only app
+(`universal_nfc_reader.c`) once lived at the root and was deleted when this one
+superseded it. Nothing belongs at the root except shared tooling: `cap.py` and
+its `logs/` output.
 
 **Git repository, branch `main`.** Commits here carry a real body: what changed,
 why, and an on-device **Verified** block. Build output (`dist/`,
-`.vscode/compile_commands.json`) and serial captures (`cap_*.log`) are ignored.
+`.vscode/compile_commands.json`) and serial captures (`logs/`) are ignored.
 
 ## Architecture
 
@@ -156,8 +158,15 @@ Verified device: Momentum `mntm-dev`, API 87.1, **COM3**. Helper script:
 `cap.py` at the repo root — a pyserial capture with a hard deadline,
 `--cmd`/`--cmd-delay` for pre-capture CLI commands (repeatable) so `log`
 attaches immediately after, `--deadline` for the capture window, `--out` to
-also write the transcript to a file (`python cap.py --cmd "log debug"
---deadline 15 --out cap_x.log`).
+name the transcript (`python cap.py --cmd "log debug" --deadline 15
+--out logs/cap_x.log`).
+
+**Every capture transcript goes to `logs/` — never write a log at the repo
+root.** `cap.py` enforces it rather than relying on the caller: with no `--out`
+it writes `logs/cap_<timestamp>.log`, a bare `--out cap_x.log` is redirected to
+`logs/cap_x.log`, and only an `--out` carrying a path separator is taken
+verbatim. It prints the resolved path to stderr before opening the port.
+`logs/` and `*.log` are gitignored, so captures are never committed.
 
 - With an NFC card on the antenna the NFC phase wins in ~300 ms every time, so
   **the LF path is only exercised with the card removed.** Confirm alternation by
