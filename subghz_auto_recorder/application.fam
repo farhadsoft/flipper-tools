@@ -1,0 +1,23 @@
+App(
+    appid="subghz_auto_recorder",
+    name="SubGHz Auto Recorder",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="subghz_auto_recorder_app",
+    # requires= names other *apps*, not services: ufbt's AppBuildset raises
+    # AppBuilderException for any entry missing from the app registry
+    # (scripts/fbt/appmanifest.py, _check_unsatisfied). Both existing FAPs in
+    # this repo open RECORD_STORAGE / RECORD_DIALOGS and call
+    # dialog_file_browser_show() with exactly this line, so do NOT "complete"
+    # it with storage/dialogs -- that risks breaking the build for no benefit.
+    requires=["gui"],
+    # 12 KB: the GUI thread runs the draw callback, every subghz_devices_*
+    # start/stop, and subghz_protocol_raw_save_to_file_init(), which opens a
+    # FlipperFormat file and writes the header. Same class of work that forced
+    # universal_card_reader from 8 KB to 12 KB. Confirm with `top` Stack Min.
+    stack_size=12 * 1024,
+    fap_category="Sub-GHz",
+    fap_description="Listens on one frequency, auto-records detected signals to .sub, replays them.",
+    fap_author="farhadsoft",
+    fap_version="1.0",
+    fap_icon="icon.png",
+)

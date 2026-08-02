@@ -613,6 +613,228 @@ on them.
 
 ---
 
+# SubGHz Auto Recorder
+
+Third FAP in this repo, `subghz_auto_recorder/`. Listens on one user-picked
+Sub-GHz frequency + modulation, auto-detects an incoming transmission by RSSI
+threshold, records it to its own RAW `.sub` file, and can browse/replay
+(TX)/rename/delete saved captures. A different radio and a different SDK
+surface from NFC/LF, so **neither `universal_card_reader/` nor
+`rfid_multi_reader/` is touched by this app.**
+
+## Verified firmware / SDK — re-check before you build (STEP 0)
+
+Last verified **2026-08-02** (`device_info` over the CLI). Same device and
+SDK as the other two apps above. `hardware_region_provisioned` is `DE`
+(Germany) — a real, non-`--`/`00` region, so the Sub-GHz region gate is
+actually enforceable and testable on this device (see Testing below).
+
+| | Device | ufbt SDK |
+|---|---|---|
+| Target | `hardware_target` 7 | `hw_target` f7 |
+| Firmware | `mntm-dev`, commit `8ed809fb`, built 03-06-2026 | official `1.4.3`, channel `release` |
+| Fork | `Momentum` (Next-Flip/Momentum-Firmware) | Official |
+| API | 87.1 | 87.1 |
+| Region | `hardware_region_provisioned` `DE` | — |
+| Port | COM4 confirmed this session | — |
+
+Every Sub-GHz symbol used was confirmed present in
+`~/.ufbt/current/sdk_headers/f7_sdk/targets/f7/api_symbols.csv` this session,
+and every struct/enum this app touches was read fresh from the SDK headers
+(not from memory) before being used.
+
+## Layout
+
+```
+subghz_auto_recorder/           <- the app; run ufbt HERE, not at repo root
+  application.fam                appid subghz_auto_recorder, entry subghz_auto_recorder_app,
+                                 Sub-GHz category, stack_size 12*1024
+  recorder_app.h                 shared types/constants/App struct; no with_view_model calls
+  subghz_auto_recorder.c         app lifetime, event router, menus, capture state machine,
+                                 storage/naming, saved-signals browse/rename/delete
+  recorder_radio.c / .h          radio session lifecycle, RAW capture mechanics, replay TX
+  recorder_ui.c / .h             drawing + the only with_view_model call site
+  icon.png / make_icon.py        10x10 1-bit icon (antenna mast + waves), regenerate with Pillow
+  README.md                      app-level instructions
+```
+
+Installs to `/ext/apps/Sub-GHz/subghz_auto_recorder.fap`, i.e.
+**Apps → Sub-GHz**. Captures land in `/ext/subghz/auto_rec/` — inside the
+firmware's own `SUBGHZ_RAW_FOLDER`, forced by
+`subghz_protocol_raw_save_to_file_init()`, so they are also visible from the
+stock Sub-GHz app's Saved browser.
+
+## Architecture
+
+Six views on one `ViewDispatcher`: a custom animated status View
+(`SubRecViewStatus` — listening/sending/notice, the only `with_view_model`
+call site), two Submenus (`SubRecViewMenu` main menu,
+`SubRecViewFileMenu` per-file actions), a `VariableItemList`
+(`SubRecViewSettings`), a `NumberInput` (`SubRecViewNumber`, custom
+frequency in kHz) and a `TextInput` (`SubRecViewText`, rename). No per-view
+`view_set_previous_callback` anywhere — every Back goes through
+`sub_rec_navigation_callback()`, exactly like the other two apps.
+
+Capture is driven entirely from a 25 ms `SubRecEventRssiTick`: the timer
+callback only posts (never touches the radio or the view model);
+`sub_rec_handle_rssi_tick()` on the GUI thread reads RSSI, decimates the
+repaint to ~8 Hz, and calls into `recorder_radio.c`'s
+`sub_rec_capture_begin()`/`sub_rec_capture_end()` when the state machine
+says so. A notice is an overlay flag (`app->notice_active`), never a state,
+so a message raised while listening leaves the radio armed underneath it.
+
+Five load-bearing invariants (violating any of them either crashes the
+device or wedges the CC1101 driver):
+
+1. **`FuriHalSubGhzPreset` ids 4..8 are not fork-stable.** Only ids 0..3
+   (`IDLE`, `Ook270Async`, `Ook650Async`, `2FSKDev238Async`) are ever
+   compiled in or passed to `subghz_devices_load_preset()`; `sub_rec_mods[]`
+   only names those three, and `sub_rec_presets_self_check()` — the first
+   statement of `sub_rec_app_alloc()`, before `malloc()` — asserts the
+   firmware's own `subghz_block_generic_get_preset_name()` maps each label
+   back to the exact `Preset:` string, so a typo fails the launch instead of
+   silently corrupting every capture.
+2. **`SubGhzRadioPreset` gained a `float latitude/longitude` tail on
+   Momentum.** `SubRecPreset` wraps it with zeroed `float fork_tail[4]`
+   headroom; every firmware call is handed `&app->preset.base`, never a bare
+   `SubGhzRadioPreset` on the stack.
+3. **`subghz_devices_set_frequency()` `furi_crash`es on an invalid
+   frequency.** Every call site is preceded by
+   `subghz_devices_is_frequency_valid()`.
+4. **The CC1101 driver `furi_check`s its own state at four entry points**
+   (`start_async_rx`/`_tx` need Idle, `stop_async_rx`/`_tx` need the matching
+   Async state). `SubRecState` mirrors this: `sub_rec_listen_start()` and
+   `sub_rec_listen_stop()` both gate on `app->state` before touching the
+   radio — the `listen_stop` guard is not defensive padding, it is what
+   keeps `sub_rec_app_free()` from crashing on the ordinary
+   launch-then-Back-on-the-menu path, since it runs unconditionally on every
+   exit.
+5. **Replay's abort path and its success-teardown path are two different
+   functions** (`sub_rec_tx_abort()` vs `sub_rec_tx_stop()`) because
+   `stop_async_tx()` `furi_check`s that async TX is actually running — an
+   abort before `start_async_tx()` succeeded must never call it.
+   `sub_rec_replay()` runs every check that can fail *before* the first
+   allocation and before the radio is touched, so a chained re-entry (the
+   rolling-code notice) never leaks `transmitter`/`fff_tx` or double-arms
+   the radio.
+
+Rolling-code detection: `sub_rec_decoded_callback()` (SubGhzWorker thread)
+sets `volatile bool app->rolling` when a decoded protocol's type is
+`SubGhzProtocolTypeDynamic` (`== 2`, fork-stable). The flag is consumed at
+capture end, appending `_RC` to the filename — the only persistence of the
+warning; nothing reads it back out of the file.
+
+## Testing this app
+
+Same device/port/`cap.py` mechanics as the other two apps. Two CLI
+behaviours specific to this app's testing, worth recording for next time:
+
+- **`loader close` does not reliably force-close an app blocked inside
+  `dialog_file_browser_show()`.** It reports `"...was closed"` and
+  `uptime`/`loader info` still show the app running, indefinitely — the
+  dialog runs its own blocking input loop and never observes the loader's
+  close request. This is narrower than RFID Multi-Reader's note above
+  ("`loader close` force-closes... from any UI state"): that held for every
+  UI state reached through this app's *own* `ViewDispatcher`, but not for
+  the separate, blocking `DialogsApp` file browser. Recovery there is a real
+  `input send back short` (which the dialog's own loop *does* consume,
+  returning `picked = false`), never `loader close`.
+- **The file browser shows a non-file "up" entry first**, even though
+  `opts.base_path` blocks navigating above it — `input send ok short`
+  immediately after opening the browser does nothing observable; one
+  `input send down short` first, then `ok`, actually picks the (only) file.
+  Confirmed by writing a checkpoint marker to a `_trace.txt` file from each
+  branch of `sub_rec_do_browse()`/`sub_rec_menu_callback()` — a `top`/
+  `log debug` snapshot cannot resolve this on its own, but a file-based trace
+  survives across calls without any timing pressure and is worth reaching
+  for again before assuming a UI/CLI hang is a firmware bug.
+- **The main menu `Submenu` remembers its cursor position across
+  re-entries and wraps at the list boundary.** Two `down` presses only land
+  on "Saved signals" from a *freshly launched* app (cursor starts on item 0);
+  after any other visit the cursor is wherever it was left, and blind
+  `down`-counting from an assumed item 0 lands on the wrong row. Always
+  relaunch for a known-fresh cursor, or drive one step at a time and check
+  `top` for the state that step should have caused (radio worker thread
+  present/absent) before sending the next input.
+
+**Verified 2026-08-02, on device, build clean, zero warnings, APPCHK Target
+7 / API 87.1:**
+- **Cold exit** (crash-rule-4 guard), both paths: Back on the main menu
+  without ever entering Listen, and Listen → Back → Back. `uptime` refused
+  while the app was open and answered again afterwards, strictly climbing
+  across every relaunch — no reboot, no wedge.
+- **Listen + the one-time ethics gate**: `top` shows exactly one
+  `SubGhzWorker` thread appear after the notice auto-dismisses (no keypress),
+  and disappear cleanly on Back. Confirmed across many relaunches.
+- **False-positive rate**: armed 65 s with no transmitter nearby;
+  `storage list /ext/subghz/auto_rec` stayed `Empty` throughout — `saved`
+  never left 0.
+- **Replay, full success**: selected a hand-written RAW `.sub`
+  (433.92 MHz / `FuriHalSubGhzPresetOok650Async`, in-region), pressed
+  Replay, and `top` caught `SubGhzFEWorker` present for the whole recorded
+  duration (a 2 s test payload) before it cleanly disappeared — the entire
+  parse → preset-match → transmitter alloc/deserialize → `set_tx` →
+  `start_async_tx` → poll-to-completion chain ran with no crash.
+- **Replay abort paths**: a file with `Preset: FuriHalSubGhzPresetCustom`
+  (never a compiled-in id) was refused before `SubGhzFEWorker` ever spawned;
+  a file deleted between being picked in the browser and pressing Replay hit
+  the `storage_file_exists()` guard the same way. Both left `uptime`
+  answering afterwards.
+- **Region refusal**: a file naming 915000000 Hz — a frequency this app's
+  own `sub_rec_freqs[]` table lists (so hardware-valid on the CC1101) —
+  never spawned `SubGhzFEWorker` when replayed on this `DE`-provisioned
+  device, consistent with the region gate (`subghz_devices_set_tx()`)
+  refusing it rather than the separate frequency-validity check. [INFERENCE:
+  the CLI cannot show which of the two notices fired; re-run with `log
+  debug` started before a single retry to confirm the exact message if this
+  matters again.]
+- **Thread hygiene**: exactly one `SubGhzWorker` while listening, exactly
+  one `SubGhzFEWorker` while sending, neither present at any other time,
+  across dozens of launches — no duplicate-thread or leaked-thread case
+  found.
+- **Stack baseline (cold / Listen / replay teardown)**: `Stack Min` for the
+  app thread stayed at **11300–11444 of 12284 bytes** through cold launch,
+  listening, browsing, and a full replay teardown — only **840–984 bytes**
+  ever used in those measured windows. This margin is far more than the 4 KB
+  bar that would justify dropping to `stack_size = 8 * 1024`.
+- **Stack peak (capture + replay init) — not yet measured**: the deepest
+  GUI-thread call chains are expected in (1) `sub_rec_capture_begin()` →
+  `subghz_protocol_raw_save_to_file_init()` opening a FlipperFormat file and
+  writing the RAW header, and (2) `sub_rec_replay()` →
+  `subghz_protocol_raw_gen_fff_data()` + `subghz_transmitter_deserialize()`
+  parsing that file. The 840–984 byte baseline above was taken while the
+  app was idle, listening, or tearing down a completed replay; it did **not**
+  catch either of those two peak moments. Do **not** reduce `stack_size`
+  below `12 * 1024` until `top` is captured in a single window that contains
+  both a real RSSI-triggered capture and an immediate replay of that same
+  file, and the resulting `Stack Min` confirms a comfortable margin. The
+  measurement must be repeated in full after any reduction.
+- **Code review** (`code-standards` skill, mandatory pass): two findings.
+  `VariableItem* s_freq_item` was a file-static mutable global — moved onto
+  `SubRecApp` as `app->freq_item` (violates this file's own "no mutable
+  globals" check). The notice-overlay clear (`app->notice_active` +
+  `sub_rec_set_notice(..., false)`) was duplicated at two call sites —
+  factored into `sub_rec_clear_notice()`. Both are local, low-risk fixes;
+  rebuilt clean and re-verified Listen/ethics-gate and the Settings →
+  Custom-frequency path (which reads `app->freq_item`) on device after.
+  Everything else checked — thread affinity, allocation pairing, `furi_check`
+  preconditions, single-writer fields, fork-ABI surface, const/scope,
+  short-circuit side effects, error-path logging — passed with no changes;
+  see the session's chat log for the full per-item report.
+
+**Not verified on device (no RF transmitter was available this session):**
+the RSSI-triggered auto-capture path end to end (arm → detect → record →
+save), preset-name round-trip via a *live* capture in each of the three
+modulations, and the continuous-carrier/cooldown behaviour (`CAPTURE_MAX_MS`
+capping one file, `carrier` status, no back-to-back files). The startup
+preset self-check (invariant 1 above) exercises the same
+`subghz_block_generic_get_preset_name()` call the live-capture test would
+observe indirectly, on real hardware, for all three modulations — strong
+but not equivalent evidence. Test all three with a fixed-code transmitter
+(garage/doorbell remote) before relying on the capture path in the field.
+
+---
+
 # Code review — mandatory final step
 
 Every task that writes or changes C in this repo ends with a review pass. The
