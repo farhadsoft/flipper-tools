@@ -4,8 +4,9 @@ dist/
 # ufbt-generated compile database (absolute local paths, regenerated every build)
 **/.vscode/compile_commands.json
 
-# device log captures from the debug-loop workflow (CLAUDE.md "Log capture")
-cap_*.log
+# runtime capture logs from the debug-loop workflow (CLAUDE.md "Log capture")
+logs/
+*.log
 
 # OS cruft
 .DS_Store
