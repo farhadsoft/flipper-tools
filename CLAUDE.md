@@ -51,7 +51,11 @@ headers, `nfc_device.h`) is identical or additive-only.
 universal_card_reader/          <- the app; run ufbt HERE, not at repo root
   application.fam              appid universal_card_reader, entry universal_card_reader_app,
                                Tools category, stack_size 12*1024
-  universal_card_reader.c      app/phase machinery, poller callback, views
+  universal_card_reader.c      app lifetime, event router, save, view callbacks
+  reader_app.h                 shared types/constants; no with_view_model calls
+  reader_ui.c / reader_ui.h    drawing + the only with_view_model call site
+  reader_nfc.c / reader_nfc.h  protocol whitelists, NFC scan/poll/emulate
+  reader_lf.c / reader_lf.h    LF RFID scan/read/emulate
   card_info.c / card_info.h    card report renderer + minimal NDEF parser
   emv.c / emv.h                read-only EMV (bank card) APDU chain
   icon.png / make_icon.py      10x10 1-bit icon, regenerate with Pillow
@@ -78,7 +82,7 @@ TextBox info view (`ReaderViewInfo`) that renders the report built by
 pointer — the string must stay alive and unmodified while shown, so
 `text_box_reset()` precedes every rebuild), and a Submenu actions view
 (`ReaderViewActions`: Save / Emulate / Rescan / Exit), reached with **Back**
-from the info view. Phase timing lives in the defines at the top:
+from the info view. Phase timing lives in the defines at the top of `reader_app.h`:
 `NFC_PHASE_MS` 1200, `LF_PHASE_MS` 1600, `READ_TIMEOUT_MS` 2500,
 `ANIM_PERIOD_MS` 80, `NOTICE_MS` 1600; per-protocol read bounds come from
 `reader_read_timeout_for()`.
@@ -93,15 +97,20 @@ render in the TextBox info screen → **Back** opens the actions menu → Save
 (`reader_do_save()`, via `nfc_device_save()`/`lfrfid_dict_file_save()`) /
 Emulate / Rescan / Exit.
 
+Since the module split, `reader_ui.c` is the only file that calls
+`with_view_model()`; every other module reads or writes state through its
+exported wrappers (`reader_set_state()`, `reader_get_state()`,
+`reader_bump_frame()`, `reader_set_notice()`).
+
 **Five invariants that are load-bearing — breaking any of them wedges or freezes the device:**
 
-1. **No fork-sensitive enum values.** `reader_poll_protocol()` picks the
+1. **No fork-sensitive enum values.** `reader_poll_protocol()` (in `reader_nfc.c`) picks the
    most-derived pollable protocol from a compile-time whitelist (ids 0..11),
    and `dev_has()` in card_info.c guards every `nfc_device_get_data()` call —
    both via firmware-evaluated `nfc_protocol_has_parent()`. Never reintroduce
    `NfcProtocolInvalid` or `NfcProtocolNum`; the verified device (Momentum)
    numbers them differently from the SDK we compile against.
-   `reader_emulatable_protocols` is the same idea applied to emulation: only
+   `reader_emulatable_protocols` (also in `reader_nfc.c`) is the same idea applied to emulation: only
    protocols whose *entire* ancestor chain has a non-NULL entry in the
    firmware's `nfc_listeners_api[]` may reach `nfc_listener_alloc()` — that
    table is walked with no NULL check at all beyond the leaf protocol, so an
@@ -114,7 +123,8 @@ Emulate / Rescan / Exit.
    in `reader_start_lf_phase()` / `reader_start_lf_emulation()`, not in
    `reader_app_alloc()`, and `reader_stop_lf()` calls
    `lfrfid_worker_stop_thread()` to *join* before NFC may start.
-   `lfrfid_worker_stop()` alone does not wait.
+   `lfrfid_worker_stop()` alone does not wait. `reader_start_lf_phase()`,
+   `reader_start_lf_emulation()`, and `reader_stop_lf()` all live in `reader_lf.c`.
 4. **Back is owned by the ViewDispatcher's navigation callback**, never by a
    module view's `previous_callback`. `view_previous()` passes `view->context`,
    and `text_box_alloc()`/`submenu_alloc()` set that context to the
@@ -133,7 +143,7 @@ Emulate / Rescan / Exit.
    the moment *any* phase timer fired — the ordinary NFC/LF phase timeout,
    not just the Notice path. Read a plain `ReaderApp` field instead
    (`app->notice_active`), the same way `app->gen` / `app->lf_phase` are
-   already read cross-thread elsewhere in this file — see below.
+   already read cross-thread elsewhere in this app — see below.
 
 `protocol_dict_alloc(lfrfid_protocols, LFRFIDProtocolMax)` passes our
 compile-time count against the firmware's array. Safe when the fork has more
