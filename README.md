@@ -1,28 +1,69 @@
 # flipper-tools
 
-Holds one Flipper Zero app: **[universal_card_reader](universal_card_reader/)** —
-reads both NFC 13.56 MHz and LF RFID 125 kHz cards in a single FAP by alternating
-timed phases. Contactless EMV bank cards get a full application-layer read (AID,
-PAN, expiry, cardholder name, transaction log), not just a UID.
+Flipper Zero üçün RFID/NFC alətləri toplusu.
 
-Build and flash from that directory, not from here:
+Hazırda iş sahəsində bir FAP var: **[universal_card_reader](universal_card_reader/)** —
+tək bir tətbiqdə həm 13.56 MHz NFC, həm də 125 kHz LF RFID kartları
+oxuyur.
+
+## Repo strukturu
+
+```
+flipper-tools/
+├── universal_card_reader/   # Universal Card Reader FAP-i
+│   ├── application.fam      # manifest
+│   ├── universal_card_reader.c
+│   ├── reader_nfc.c / .h    # NFC skan/poll/emulyasiya
+│   ├── reader_lf.c / .h     # LF RFID işçi axını
+│   ├── card_info.c / .h     # ekranda göstərilən hesabat
+│   ├── emv.c / .h           # kontaktsız ödəniş kartı EMV oxuma
+│   ├── reader_ui.c / .h     # cihaz UI-si
+│   ├── icon.png             # 10x10 menyu ikonu
+│   └── README.md            # tətbiq səviyyəli təlimat
+├── doc/
+│   └── emv-read-diagnosis.md  # EMV oxuma diaqnozu (tarixi)
+├── cap.py                   # serial CLI log yazma köməkçisi
+├── logs/                    # cap.py çıxışları (gitignore-dadır)
+├── CLAUDE.md                # inkişaf qaydaları
+└── README.md                # bu fayl
+```
+
+## Qurma ön şərtləri
+
+- Flipper Zero (rəsmi firmware 1.x və ya eyni API səviyyəsində fork)
+- `ufbt` — `pip install --upgrade ufbt`
+
+## Qurma və işə salma
+
+FAP-i app qovluğundan yığ:
 
 ```sh
 cd universal_card_reader
-ufbt          # -> dist/universal_card_reader.fap
-ufbt launch   # build, upload and run on a connected Flipper (USB)
+ufbt        # -> dist/universal_card_reader.fap
+ufbt launch # yığ, yüklə və bağlı cihazda işə sal
 ```
 
-Then on the device: **Apps → Tools → Universal Card Reader**.
+`ufbt launch` USB portu tutur; əgər qFlipper açıqdırsa, əvvəlcə onu bağla.
+Cihazda: **Apps → Tools → Universal Card Reader**.
 
-See [universal_card_reader/README.md](universal_card_reader/README.md) for usage,
-supported protocols and the firmware-fork compatibility notes, and `CLAUDE.md`
-for development guidance.
+Ətraflı qurma, dəstəklənən protokollar, EMV davranışı və düymə
+naviqasiyası üçün bax: [universal_card_reader/README.md](universal_card_reader/README.md).
+İnkişaf qaydaları (log tutma, firmware fork uyğunluğu, hardware
+ardıcıllığı) üçün bax: [CLAUDE.md](CLAUDE.md).
 
-The repo is named `flipper-tools`, not after the app, because it is meant to
-hold Flipper Zero tooling generally: the `cap.py` serial-capture helper and its
-`logs/` output sit here alongside the app directory. An earlier NFC-only app
-(`universal_nfc_reader.c`) once lived at this level and was removed when the
-dual-band app superseded it.
+## Log/debug workflow
 
-Use only on cards and tags you own or are authorised to test.
+`cap.py` ilə cihazın serial CLI çıxışını tut:
+
+```sh
+python cap.py --port COM3 --cmd "log info" --deadline 15.0
+```
+
+Transkriptlər avtomatik `logs/` qovluğuna yazılır (məs. `logs/cap_*.log`).
+Ətraflı CLI əmrləri və log təhlükəsizliyi qaydaları üçün bax `CLAUDE.md`.
+
+## Etik/qanuni qeyd
+
+Yalnız öz kartlarınızı və ya sınamaq üçün açıq icazəniz olan kartları
+oxuyun. Digər şəxslərin və ya təşkilatların icazəsiz oxunması/qeyd
+edilməsi çox ölkədə qanun pozuntusudur.
