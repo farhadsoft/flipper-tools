@@ -613,6 +613,108 @@ on them.
 
 ---
 
+# Code review — mandatory final step
+
+Every task that writes or changes C in this repo ends with a review pass. The
+review is **not** optional, and it is not the same thing as "the build is
+warning-clean" or "it worked on the device". Those are entry conditions for the
+review, not substitutes for it.
+
+**Invoke the `code-standards` skill for this pass.** Do not perform the review
+from memory — load the skill and apply it.
+
+## When it runs
+
+After the implementation compiles warning-clean under `ufbt` and after any
+on-device verification listed in the task, but **before** writing the commit
+message. If the review produces changes, rebuild and re-verify: a fix made after
+the last build has not been tested.
+
+For a task split across several sessions, the review runs at the end of each
+session that touched C, not only at the very end. A reviewed-then-extended file
+is unreviewed again.
+
+## What "SOLID / Clean Code" means in this codebase
+
+The `code-standards` skill is written in object-oriented vocabulary. This is
+embedded C with no classes, so translate before applying — and do not invent
+structure that C does not need:
+
+| Principle | What it means here |
+|---|---|
+| Single responsibility | One `.c` file owns one concern (`recorder_radio.c` = radio, `recorder_ui.c` = drawing). A function does one thing at one level of abstraction. |
+| Open/closed | New protocols, presets or modulations arrive as new rows in a `static const` table, not as new `if` branches scattered through the flow. |
+| Liskov / interface segregation | Header exposes the narrowest useful surface. Anything not called from another `.c` file is `static`. |
+| Dependency inversion | Modules take the app struct or an explicit context pointer; no module reaches into another module's internals or its view model. |
+| DRY | Shared logic gets one implementation and one call site pattern (e.g. `sub_rec_capture_finish()` serving both callers). |
+| KISS / YAGNI | No abstraction layer for a second radio, a second file format or a second device that the task did not ask for. |
+| TDA ("tell, don't ask") | Callers invoke a setter that owns the field and its side effects; they do not read a field, decide, and write it back from outside the owning module. |
+
+## Repo-specific checks the generic standards will miss
+
+Run these explicitly — a generic C reviewer does not know this codebase's failure
+modes:
+
+1. **Thread affinity.** Every radio call, every `with_view_model()`, every file
+   open/close is on the GUI thread. Worker/timer callbacks only post events.
+   Any field written on one thread and read on another is `volatile` (or
+   atomic) and is documented at its declaration.
+2. **Allocation pairing.** Every `*_alloc()` has exactly one `*_free()` on every
+   path, including error paths. Pointers are set to `NULL` after free. Early
+   `return NULL` from an alloc function frees everything it already built —
+   or, better, runs before anything is built.
+3. **`furi_check` / `furi_crash` preconditions.** Any firmware call that asserts
+   a state (`stop_async_tx`, `worker_start`/`_stop`, `set_frequency`) is guarded
+   by the corresponding query, or is reachable only from a state where the
+   precondition provably holds. Abort paths and success paths get **separate**
+   teardown functions when their preconditions differ.
+4. **Single-writer fields.** A field with a designated setter has exactly one
+   writer. Grep for direct assignments to any field the code claims a setter
+   owns; a bypass means the UI or the model silently desyncs from the logic.
+5. **Fork-ABI surface.** No enum value outside the range this repo has verified
+   stable across official and Momentum firmware. No `sizeof` assumption about a
+   firmware struct that a fork extends.
+6. **Magic numbers.** Timings, thresholds, buffer sizes and limits live in the
+   app header as named `#define`s with a comment saying *why that value*, not
+   just what it is.
+7. **Const and scope.** Lookup tables are `static const`. Anything not in a
+   header is `static`. No mutable globals.
+8. **Short-circuit side effects.** No `++`, assignment or call inside the
+   right-hand operand of `&&` / `||` — it will silently not execute.
+9. **Error paths carry information.** A failure that the user can see gets a
+   notice; a failure only a developer can act on gets `FURI_LOG_E` with the
+   offending value, not a bare "failed".
+
+## Deliberate deviations are not defects
+
+This repo contains copy-paste that is intentional: draw helpers duplicated into
+each app rather than shared, per-app option structs mirroring each other,
+resilience/config blocks copied so one app's tuning cannot move another's. Where
+the existing code or an execution plan says a duplication is deliberate, **do not
+"fix" it** in the name of DRY.
+
+More generally: the invariants in this file outrank every principle in the
+`code-standards` skill. If applying a principle would weaken an invariant —
+thread affinity, single view-model call site, navigation via the dispatcher
+callback only, generation-stamped events — the invariant wins, and the review
+records why rather than proposing the refactor.
+
+## Output
+
+Report the review in chat as plain text, not as a file:
+
+- **Findings**, each with severity (`defect` / `smell` / `note`), the file and
+  function, and the concrete fix.
+- **What was changed** as a result, and what was left alone with the reason.
+- **Explicit statement** if nothing was found — "review run, no findings" is a
+  valid result and must be stated, not implied by silence.
+
+A `defect` is fixed before the commit message is written. A `smell` is fixed if
+the fix is local and low-risk, otherwise recorded in the report. A `note` is
+recorded only.
+
+---
+
 # context-mode — MANDATORY routing rules
 
 You have context-mode MCP tools available. These rules are NOT optional — they protect your context window from flooding. A single unrouted command can dump 56 KB into context and waste the entire session.
