@@ -31,6 +31,19 @@
 // one is sized from this instead of an arbitrary number -- SubRecModel
 // truncates anything longer anyway.
 #define REC_TEXT_LINE_MAX 32
+// storage_dir_read() truncates into a too-small buffer, and a truncated name
+// builds a path that does not exist -- storage_simply_remove() returns true
+// for an already-absent item (storage.h), so a truncated name would be
+// counted as deleted while the real file stayed. 255 is the FatFS long-name
+// cap, +1 for the NUL, so truncation cannot happen.
+#define REC_NAME_MAX 256
+// Clear all re-enumerates until a pass deletes nothing. Deleting the entry
+// f_readdir just returned does not skip entries on FAT (the slot is marked
+// free, nothing is relocated), but the re-enumeration means this app does not
+// depend on that. The cap only guards a storage layer that reports a
+// successful remove for a file that stays enumerable, which would otherwise
+// spin the GUI thread forever.
+#define REC_CLEAR_MAX_PASSES 8
 
 #define RSSI_POLL_MS      25
 #define RSSI_REDRAW_EVERY 5 // repaint every 5th poll (~8 Hz); see recorder_ui.c
@@ -71,6 +84,11 @@ typedef enum {
     SubRecEventFileDelete,
     SubRecEventFileRename,
     SubRecEventFileBack,
+    SubRecEventSavedBrowse,
+    SubRecEventSavedClearAll,
+    SubRecEventSavedBack,
+    SubRecEventConfirmYes,
+    SubRecEventConfirmNo,
 } SubRecCustomEvent;
 
 typedef enum {
@@ -80,6 +98,8 @@ typedef enum {
     SubRecViewFileMenu, // Submenu: per-file actions
     SubRecViewNumber, // NumberInput: custom frequency in kHz
     SubRecViewText, // TextInput: rename
+    SubRecViewSaved, // Submenu: Saved-signals actions (browse / clear all)
+    SubRecViewConfirm, // Submenu: destructive-action confirmation
 } SubRecView;
 
 // Momentum's SubGhzRadioPreset appends float latitude/longitude past the
@@ -114,6 +134,8 @@ typedef struct {
     View* view; // status view (SubRecViewStatus)
     Submenu* menu; // main menu
     Submenu* file_menu; // per-file actions
+    Submenu* saved_menu; // saved-signals actions
+    Submenu* confirm_menu; // Clear all confirmation
     VariableItemList* settings;
     // The Frequency row, captured so the settings enter callback (which only
     // receives a list-position index, not a value-index) can check whether

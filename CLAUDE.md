@@ -784,12 +784,14 @@ stock Sub-GHz app's Saved browser.
 
 ## Architecture
 
-Six views on one `ViewDispatcher`: a custom animated status View
+Eight views on one `ViewDispatcher`: a custom animated status View
 (`SubRecViewStatus` — listening/sending/notice, the only `with_view_model`
-call site), two Submenus (`SubRecViewMenu` main menu,
-`SubRecViewFileMenu` per-file actions), a `VariableItemList`
-(`SubRecViewSettings`), a `NumberInput` (`SubRecViewNumber`, custom
-frequency in kHz) and a `TextInput` (`SubRecViewText`, rename). No per-view
+call site), four Submenus (`SubRecViewMenu` main menu,
+`SubRecViewFileMenu` per-file actions, `SubRecViewSaved` saved-signals
+actions — Browse files / Clear all / Back, `SubRecViewConfirm` the
+Clear-all confirmation), a `VariableItemList` (`SubRecViewSettings`), a
+`NumberInput` (`SubRecViewNumber`, custom frequency in kHz) and a
+`TextInput` (`SubRecViewText`, rename). No per-view
 `view_set_previous_callback` anywhere — every Back goes through
 `sub_rec_navigation_callback()`, exactly like the other two apps.
 
@@ -897,7 +899,12 @@ behaviours specific to this app's testing, worth recording for next time:
   `down`-counting from an assumed item 0 lands on the wrong row. Always
   relaunch for a known-fresh cursor, or drive one step at a time and check
   `top` for the state that step should have caused (radio worker thread
-  present/absent) before sending the next input.
+  present/absent) before sending the next input. **`SubRecViewSaved` and
+  `SubRecViewConfirm` do not share this quirk** — `sub_rec_show_saved_menu()`
+  and `sub_rec_clear_all_start()` call `submenu_set_selected_item()` to force
+  the cursor onto row 0 (Browse files / Cancel) on every entry, so blind CLI
+  navigation starting from either is deterministic even though the main
+  menu's is not.
 
 **Verified 2026-08-02, on device, build clean, zero warnings, APPCHK Target
 7 / API 87.1:**
@@ -988,6 +995,90 @@ preset self-check (invariant 1 above) exercises the same
 observe indirectly, on real hardware, for all three modulations — strong
 but not equivalent evidence. Test all three with a fixed-code transmitter
 (garage/doorbell remote) before relying on the capture path in the field.
+
+**Verified 2026-08-03 — bulk "Clear all captures" added under Saved
+signals, on device, CLI-only (no physical presses).** `Saved signals` on
+the main menu now opens a 3-row Submenu (`SubRecViewSaved`: Browse files /
+Clear all / Back) instead of the file browser directly; `Clear all` counts
+`.sub` files in `REC_DIR` (`sub_rec_count_captures()`), shows a `Delete N
+files?` confirm Submenu (`SubRecViewConfirm`) with **Cancel** force-selected
+on every entry, and only `Delete all` wipes (`sub_rec_clear_all()`,
+re-enumerating passes until one deletes nothing, capped at
+`REC_CLEAR_MAX_PASSES` 8). Build clean, zero warnings, APPCHK Target 7 /
+API 87.1, both before and after the c-review fix below.
+
+Two safety proofs, one continuous CLI session, `input send <key> short`
+throughout (this app's Submenu navigation accepts it — see above): planted
+`T1.sub`/`T2.sub`/`T3.sub` (dummy content — extension is all
+`sub_rec_is_capture()` checks) alongside the 32 pre-existing real captures,
+plus `keep.txt` and `keep_dir` to prove the scope stays non-recursive and
+`.sub`-only. `storage list /ext/subghz/auto_rec` before: 35 `.sub` files +
+`keep.txt` + `keep_dir`. Down×2+OK → Saved signals; down+OK → Clear all →
+confirm (cursor forced to **Cancel**); OK → **Cancel** — `storage list`
+immediately after: all 35 `.sub` files, `keep.txt`, `keep_dir`,
+byte-identical to before — nothing touched. Down+OK → Clear all again;
+down+OK → **Delete all** — `storage list` after: only `keep.txt` and
+`keep_dir`, zero `.sub` files. Confirms both halves: the confirmation gate
+genuinely gates, and the wipe is genuinely scoped (the non-`.sub` file and
+the subdirectory both survive).
+
+**Empty short-circuit, proven by depth, not by screen text** (the confirm
+header/notice text — `Delete N files?`, `N deleted` — has no CLI screen
+channel, same limitation as every other notice in this app; verified by
+code inspection of `sub_rec_clear_all_start()`/`sub_rec_clear_all()`
+instead). On the now-empty folder: `Clear all` → `No captures` notice →
+auto-dismisses to the **saved menu**, not the confirm view. Proof: `uptime`
+refused (saved menu) → Back → `uptime` refused (main menu) → Back →
+`uptime` **answered** — exactly two Back presses to exit, meaning the
+confirm view was never pushed. `uptime` climbed monotonically across the
+whole session (1h20m50s → 1h21m23s → 1h28m18s after the re-verify below) —
+no crash, no reboot.
+
+**`flipper-c-review` found one defect, fixed and re-verified.**
+`sub_rec_count_captures()`/`sub_rec_clear_pass()` called
+`storage_dir_close()` only inside `if(storage_dir_open(...))`, skipping it
+on an open failure — `storage.h`'s own `@warning` on `storage_dir_open()`
+requires calling `storage_dir_close()` unconditionally. Moved both calls
+after the `if` (mirrors the already-unconditional `storage_file_free()`
+beneath it). `REC_DIR` reliably exists in normal operation (created at
+`sub_rec_app_alloc()`), so this never fired in the sessions above; fixed
+anyway per the documented contract. Rebuilt clean; re-verified count+Cancel
+(fresh launch, Saved signals → Clear all showed the confirm view correctly
+counting the real 32 files, Cancel preserved all of them byte-for-byte,
+clean two-Back exit, `uptime` still climbing) without re-running the
+Delete-all path a second time. Everything else on the checklist — thread
+affinity (no radio/worker/timer call in any new function), allocation
+pairing (both new `Submenu`s and both new `storage_file_alloc()` handles
+freed on every path), `furi_check` preconditions (no state-checked firmware
+call added), single-writer fields (`selected_path`/`rc_warned` reset
+mirrors `sub_rec_do_delete()`'s existing idiom, no documented setter
+bypassed), fork-ABI surface (no firmware enum touched; `FileInfo`/
+`file_info_is_dir()` are storage-layer, not on this repo's documented drift
+list), magic numbers (`REC_NAME_MAX`/`REC_CLEAR_MAX_PASSES` both
+named+commented), const/scope (all six new functions `static`, zero new
+file-statics), short-circuit side effects (none) — passed with no changes.
+
+**`flipper-perf-review`: no defects.** Thread hygiene and heap are
+satisfied by construction — the diff adds zero `subghz_devices_*`/
+`*_worker_*`/`furi_timer_start`/`with_view_model`/`malloc`/
+`furi_string_alloc` calls (grep-confirmed), so there is nothing new for
+`top`/`Heap:` to catch; not independently sampled this pass for that
+reason. Stack: `sub_rec_clear_pass()`'s frame is `REC_NAME_MAX` (256) +
+`sizeof(REC_DIR)+1+REC_NAME_MAX` (21+1+256=278) + a `FileInfo` (~16) ≈
+550 bytes, ~650-700 bytes deep including its caller `sub_rec_clear_all()`
+— against the most recent measured baseline of 11288/12284 free (`Stack
+peak` entry above), clears the 4096-byte pass bar with a wide margin; not
+freshly re-sampled on-device this pass (Clear all is only reachable from
+Idle, never concurrent with the capture/replay path that baseline covers,
+so the two never stack on top of each other). SD write volume: N/A, this
+feature only deletes. `uptime` monotonic throughout (see above) — no
+crash, no leak signal.
+
+Real captures were backed up (`storage copy` to `/ext/subghz/ar_backup/`)
+before every destructive step above and restored after (`storage list`
+before/after: identical 32 files, byte-identical sizes) — the
+auto-recorded data in this session's `/ext/subghz/auto_rec/` is unchanged
+end to end.
 
 ---
 

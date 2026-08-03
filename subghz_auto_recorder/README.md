@@ -2,7 +2,7 @@
 
 Flipper Zero FAP — `application.fam` description: **Listens on one frequency, auto-records detected signals to .sub, replays them.**
 
-- **Version:** 1.0 (`fap_version` in `application.fam`)
+- **Version:** 1.1 (`fap_version` in `application.fam`)
 - **Category:** Sub-GHz
 - **Stack size:** 12 KB
 - **Author:** farhadsoft
@@ -34,9 +34,13 @@ thread; the worker thread and the three timers only ever post via
    `carrier` means the previous capture was cut short by the 10 s cap and
    the transmitter is still keying — recording resumes once it releases.
 4. **Back** while listening stops the radio and returns to the menu.
-5. **Saved signals** opens the file browser scoped to
-   `/ext/subghz/auto_rec/`. Pick a file for **Replay** / **Rename** /
-   **Delete**.
+5. **Saved signals** opens a menu: **Browse files** / **Clear all** / **Back**.
+   Browse files opens the file browser scoped to `/ext/subghz/auto_rec/` —
+   pick a file for **Replay** / **Rename** / **Delete**. **Clear all** asks
+   `Delete N files?` with **Cancel** preselected; choosing **Delete all**
+   removes every `.sub` file directly in `/ext/subghz/auto_rec/`
+   (subdirectories and non-`.sub` files are left alone) and reports how many
+   were deleted.
 6. **Replay** re-transmits the file on its own recorded frequency and
    preset. A file whose name contains `_RC` (rolling code detected during
    capture) shows a warning first; replaying it anyway will very likely
@@ -117,7 +121,7 @@ as a 10x10 1-bit PNG with `make_icon.py`.
 
 | File | Purpose |
 |---|---|
-| `subghz_auto_recorder.c` | App lifecycle, event router, menus, capture state machine, storage/naming, saved-signals browse/rename/delete |
+| `subghz_auto_recorder.c` | App lifecycle, event router, menus, capture state machine, storage/naming, saved-signals browse/rename/delete/clear-all |
 | `recorder_app.h` | Shared structs, enums, constants — no `with_view_model()` calls |
 | `recorder_radio.c/h` | Radio session lifecycle, RAW capture mechanics, and Replay (TX) |
 | `recorder_ui.c/h` | Device UI — the only file that calls `with_view_model()` |

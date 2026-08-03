@@ -306,6 +306,126 @@ static void sub_rec_do_delete(SubRecApp* app) {
     sub_rec_show_notice(app, "Deleted", name, "", SubRecViewMenu, 0);
 }
 
+/* --------------------------- saved-signals menu ------------------------- */
+
+// Every entry point resets the cursor to the first row: this app's Submenus
+// remember their position across re-entries (CLAUDE.md, "Testing this app"),
+// which makes blind CLI navigation land on the wrong row.
+static void sub_rec_show_saved_menu(SubRecApp* app) {
+    submenu_set_selected_item(app->saved_menu, SubRecEventSavedBrowse);
+    sub_rec_switch_view(app, SubRecViewSaved);
+}
+
+// True for a regular .sub file entry as returned by storage_dir_read().
+// `len > 4` matches the existing idiom in sub_rec_do_rename_start(); a file
+// named exactly ".sub" (no stem) is not treated as a capture. The comparison
+// is case-sensitive, matching what this app writes.
+static bool sub_rec_is_capture(const FileInfo* info, const char* name) {
+    if(file_info_is_dir(info)) return false;
+    size_t len = strlen(name);
+    return (len > 4) && (strcmp(name + len - 4, ".sub") == 0);
+}
+
+// Counts .sub files directly in REC_DIR. No recursion, no other subghz folder.
+static uint32_t sub_rec_count_captures(SubRecApp* app) {
+    uint32_t n = 0;
+    File* dir = storage_file_alloc(app->storage);
+    if(storage_dir_open(dir, REC_DIR)) {
+        FileInfo info;
+        char name[REC_NAME_MAX];
+        while(storage_dir_read(dir, &info, name, sizeof(name))) {
+            if(sub_rec_is_capture(&info, name)) n++;
+        }
+    }
+    // storage_dir_open() docs (storage.h): storage_dir_close() must be
+    // called even when the open failed -- never skip it inside the `if`.
+    storage_dir_close(dir);
+    storage_file_free(dir);
+    return n;
+}
+
+// One enumeration pass. Removes every .sub file directly in REC_DIR that it
+// can, returns how many it removed, and adds removal failures to *failed.
+static uint32_t sub_rec_clear_pass(SubRecApp* app, uint32_t* failed) {
+    uint32_t removed = 0;
+    File* dir = storage_file_alloc(app->storage);
+    if(storage_dir_open(dir, REC_DIR)) {
+        FileInfo info;
+        char name[REC_NAME_MAX];
+        char path[sizeof(REC_DIR) + 1 + REC_NAME_MAX];
+        while(storage_dir_read(dir, &info, name, sizeof(name))) {
+            if(!sub_rec_is_capture(&info, name)) continue;
+            snprintf(path, sizeof(path), "%s/%s", REC_DIR, name);
+            // Same check sub_rec_do_delete() uses: false is a real failure --
+            // storage_simply_remove() also returns true when the item is
+            // already gone, so reporting a deleted count off an unchecked
+            // call would be a lie the user acts on.
+            if(storage_simply_remove(app->storage, path)) {
+                removed++;
+            } else {
+                FURI_LOG_E(TAG, "clear all: remove failed: %s", path);
+                (*failed)++;
+            }
+        }
+    }
+    // storage_dir_open() docs (storage.h): storage_dir_close() must be
+    // called even when the open failed -- never skip it inside the `if`.
+    storage_dir_close(dir);
+    storage_file_free(dir);
+    return removed;
+}
+
+// GUI thread. Reachable only from the main menu, and every path from the
+// status view to the main menu runs sub_rec_listen_stop(), so app->state is
+// Idle here and no capture can be writing into REC_DIR underneath this.
+static void sub_rec_clear_all(SubRecApp* app) {
+    uint32_t deleted = 0, failed = 0;
+    for(uint32_t pass = 0; pass < REC_CLEAR_MAX_PASSES; pass++) {
+        uint32_t n = sub_rec_clear_pass(app, &failed);
+        if(n == 0) break;
+        deleted += n;
+    }
+
+    // Nothing may act on a file that no longer exists -- same reset
+    // sub_rec_do_delete() performs.
+    furi_string_reset(app->selected_path);
+    app->rc_warned = false;
+
+    char line[REC_TEXT_LINE_MAX];
+    if(failed) {
+        snprintf(
+            line,
+            sizeof(line),
+            "%lu ok, %lu failed",
+            (unsigned long)deleted,
+            (unsigned long)failed);
+    } else {
+        snprintf(line, sizeof(line), "%lu deleted", (unsigned long)deleted);
+    }
+    FURI_LOG_I(TAG, "clear all: %s", line);
+    sub_rec_show_notice(app, failed ? "Clear failed" : "Cleared", line, "", SubRecViewMenu, 0);
+}
+
+static void sub_rec_clear_all_start(SubRecApp* app) {
+    uint32_t n = sub_rec_count_captures(app);
+    FURI_LOG_I(TAG, "clear all: %lu captures", (unsigned long)n);
+    if(n == 0) {
+        sub_rec_show_notice(app, "No captures", "nothing to clear", "", SubRecViewSaved, 0);
+        return;
+    }
+
+    // The Submenu header is drawn with FontPrimary and is never truncated, so
+    // this must stay short: 16-17 chars for any realistic count.
+    char header[REC_TEXT_LINE_MAX];
+    snprintf(header, sizeof(header), "Delete %lu files?", (unsigned long)n);
+    submenu_set_header(app->confirm_menu, header);
+    // Cancel is row 0 and the cursor is forced onto it on every entry: a
+    // reflexive second OK must cancel, never wipe. This is the safety
+    // property the confirmation exists for.
+    submenu_set_selected_item(app->confirm_menu, SubRecEventConfirmNo);
+    sub_rec_switch_view(app, SubRecViewConfirm);
+}
+
 static void sub_rec_rename_result(void* context) {
     SubRecApp* app = context;
 
@@ -520,8 +640,14 @@ static bool sub_rec_navigation_callback(void* context) {
         return true;
     }
 
+    if(app->current_view == SubRecViewConfirm) {
+        sub_rec_show_saved_menu(app); // Back from the confirm == Cancel
+        return true;
+    }
+
     if(app->current_view == SubRecViewSettings || app->current_view == SubRecViewNumber ||
-       app->current_view == SubRecViewFileMenu || app->current_view == SubRecViewText) {
+       app->current_view == SubRecViewFileMenu || app->current_view == SubRecViewText ||
+       app->current_view == SubRecViewSaved) {
         sub_rec_switch_view(app, SubRecViewMenu);
         return true;
     }
@@ -571,7 +697,7 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
         sub_rec_switch_view(app, SubRecViewSettings);
         return true;
     case SubRecEventMenuSaved:
-        sub_rec_do_browse(app);
+        sub_rec_show_saved_menu(app);
         return true;
     case SubRecEventMenuExit:
         view_dispatcher_stop(app->view_dispatcher);
@@ -587,6 +713,21 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
         return true;
     case SubRecEventFileBack:
         sub_rec_switch_view(app, SubRecViewMenu);
+        return true;
+    case SubRecEventSavedBrowse:
+        sub_rec_do_browse(app);
+        return true;
+    case SubRecEventSavedClearAll:
+        sub_rec_clear_all_start(app);
+        return true;
+    case SubRecEventSavedBack:
+        sub_rec_switch_view(app, SubRecViewMenu);
+        return true;
+    case SubRecEventConfirmYes:
+        sub_rec_clear_all(app);
+        return true;
+    case SubRecEventConfirmNo:
+        sub_rec_show_saved_menu(app);
         return true;
     default:
         return false;
@@ -633,6 +774,25 @@ static SubRecApp* sub_rec_app_alloc(void) {
     submenu_add_item(app->file_menu, "Rename", SubRecEventFileRename, sub_rec_menu_callback, app);
     submenu_add_item(app->file_menu, "Delete", SubRecEventFileDelete, sub_rec_menu_callback, app);
     submenu_add_item(app->file_menu, "Back", SubRecEventFileBack, sub_rec_menu_callback, app);
+
+    app->saved_menu = submenu_alloc();
+    view_dispatcher_add_view(
+        app->view_dispatcher, SubRecViewSaved, submenu_get_view(app->saved_menu));
+    submenu_set_header(app->saved_menu, "Saved signals");
+    submenu_add_item(
+        app->saved_menu, "Browse files", SubRecEventSavedBrowse, sub_rec_menu_callback, app);
+    submenu_add_item(
+        app->saved_menu, "Clear all", SubRecEventSavedClearAll, sub_rec_menu_callback, app);
+    submenu_add_item(app->saved_menu, "Back", SubRecEventSavedBack, sub_rec_menu_callback, app);
+
+    app->confirm_menu = submenu_alloc();
+    view_dispatcher_add_view(
+        app->view_dispatcher, SubRecViewConfirm, submenu_get_view(app->confirm_menu));
+    // Cancel first: see sub_rec_clear_all_start(). The header is set per entry.
+    submenu_add_item(
+        app->confirm_menu, "Cancel", SubRecEventConfirmNo, sub_rec_menu_callback, app);
+    submenu_add_item(
+        app->confirm_menu, "Delete all", SubRecEventConfirmYes, sub_rec_menu_callback, app);
 
     app->settings = variable_item_list_alloc();
     view_dispatcher_add_view(
@@ -695,6 +855,10 @@ static void sub_rec_app_free(SubRecApp* app) {
     submenu_free(app->menu);
     view_dispatcher_remove_view(app->view_dispatcher, SubRecViewFileMenu);
     submenu_free(app->file_menu);
+    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewSaved);
+    submenu_free(app->saved_menu);
+    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewConfirm);
+    submenu_free(app->confirm_menu);
     view_dispatcher_remove_view(app->view_dispatcher, SubRecViewSettings);
     variable_item_list_free(app->settings);
     view_dispatcher_remove_view(app->view_dispatcher, SubRecViewNumber);
