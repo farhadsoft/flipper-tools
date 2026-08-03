@@ -428,21 +428,30 @@ static void hf_read(RfidBackend* self, RfidReadCb cb, void* ctx) {
 
 // Per-protocol read bound: in-callback work (PPSE probe, Classic key passes,
 // ISO15693 full block dump) needs longer than a bare transport activation.
+// Per-protocol read bounds. Same values and rationale as universal_card_reader's
+// reader_app.h:28-33; duplicated rather than shared because they describe this
+// backend's poller work, which the vtable deliberately hides from the app layer.
+#define HF_MFC_READ_TIMEOUT_MS        12000 // 2 key passes x up to 80 sector requests
+#define HF_MFUL_READ_TIMEOUT_MS       8000  // full page dump inside the poller callback
+#define HF_ISO15693_READ_TIMEOUT_MS   8000  // full block dump inside activate
+#define HF_FELICA_READ_TIMEOUT_MS     6000  // system/service enumeration
+#define HF_ISO14443_4A_READ_TIMEOUT_MS 3000 // one PPSE APDU now, not the whole EMV chain
+#define HF_READ_TIMEOUT_MS            2500  // plain transports: activation only
 static uint32_t hf_read_timeout_ms(RfidBackend* self) {
     HfImpl* impl = self->impl;
     switch(impl->poll_protocol) {
     case NfcProtocolMfClassic:
-        return 12000;
+        return HF_MFC_READ_TIMEOUT_MS;
     case NfcProtocolMfUltralight:
-        return 8000;
+        return HF_MFUL_READ_TIMEOUT_MS;
     case NfcProtocolIso15693_3:
-        return 8000;
+        return HF_ISO15693_READ_TIMEOUT_MS;
     case NfcProtocolFelica:
-        return 6000;
+        return HF_FELICA_READ_TIMEOUT_MS;
     case NfcProtocolIso14443_4a:
-        return 3000; // one PPSE APDU now, not the whole EMV chain
+        return HF_ISO14443_4A_READ_TIMEOUT_MS;
     default:
-        return 2500; // plain transports
+        return HF_READ_TIMEOUT_MS;
     }
 }
 

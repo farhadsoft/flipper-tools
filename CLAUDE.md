@@ -466,6 +466,20 @@ new=True, and (b) a sparse file omitting the early optional fields —
 old=False (Blocked), new=True (emulates). Build clean, APPCHK pass
 (Target 7, API 87.1, Momentum mntm-dev, COM4).
 
+**Verified 2026-08-03 — thread hygiene and stack margin under HF/LF phase
+alternation.** ~5 cycles (`NFC_PHASE_MS` 1200 + `LF_PHASE_MS` 1600) sampled
+across 16 `top` blocks. `top`'s AppID column attributes a spawned worker's
+row to its owning app, not only the GUI thread's own row: filtering to the
+row whose `stack` is 12284 (the thread `stack_size` actually controls) shows
+`Stack Min` constant at 11780 throughout; `NfcScanWorker`/`NfcWorker`'s block
+indices were exactly disjoint from `LfrfidWorker`'s, confirming no radio
+leak across the phase transition. (One block briefly mislabelled the shared
+system `TimersSrv` row under this app's AppID — a `top` in-place-redraw
+artifact of the raw serial capture, not a real worker; `TimersSrv`'s own
+`Stack Min` is a longstanding constant unrelated to any app.) Three
+open/close cycles: `Heap` after close was 136648/54232 (free/minimum) on
+cycle 1, then exactly 136624/54232 on both cycles 2 and 3 — stable, no leak.
+
 ---
 
 # RFID Multi-Reader
@@ -610,6 +624,26 @@ connects - HF `scan_start`/`scan_stop` and LF `scan_start`/`scan_stop` - are
 each independently confirmed working). Test all of the above with the
 matching cards, and Auto alternation with the antenna clear, before relying
 on them.
+
+**Verified 2026-08-03 — Auto rotation stack margin, backend disjointness,
+and a static-review note closed by measurement.** 16 `top` blocks during
+Auto (HF+LF) rotation with no card present: the app thread (`stack` 8188,
+matching `stack_size`) held `Stack Min` constant at 7692 — clears the
+4096-byte bar with room to spare, and higher than the 7424 baseline above
+(this run never reached a card read, which costs more stack than an
+unanswered poll). `LfrfidWorker`'s block indices were exactly disjoint from
+`NfcScanWorker`/`NfcWorker`'s, confirming `rfid_stop_all()`'s stop-then-start
+ordering holds under repeated rotation, not just a single manual switch.
+`rfid_stop_all()` (`rfid_multi_reader.c:64-69`) does not stop `anim_timer`
+before joining the outgoing backend's worker thread, unlike
+`universal_card_reader`'s invariant 6 above — a static-review finding,
+recorded rather than fixed because the join is bounded in milliseconds
+against a 16-deep, ~1.28 s queue at `ANIM_PERIOD_MS` 80. `log debug` across
+9 consecutive phase transitions measured that join cost directly: LF
+transitions ran 1672–1688 ms against a 1600 ms nominal, HF transitions ran
+1254–1272 ms against 1200 ms — 54–88 ms of overhead each time, confirming
+the gap stays two orders of magnitude under the queue's headroom. Zero
+`[W]`/`[E]` log lines across the whole window.
 
 ---
 
@@ -797,18 +831,32 @@ behaviours specific to this app's testing, worth recording for next time:
   listening, browsing, and a full replay teardown — only **840–984 bytes**
   ever used in those measured windows. This margin is far more than the 4 KB
   bar that would justify dropping to `stack_size = 8 * 1024`.
-- **Stack peak (capture + replay init) — not yet measured**: the deepest
-  GUI-thread call chains are expected in (1) `sub_rec_capture_begin()` →
-  `subghz_protocol_raw_save_to_file_init()` opening a FlipperFormat file and
-  writing the RAW header, and (2) `sub_rec_replay()` →
-  `subghz_protocol_raw_gen_fff_data()` + `subghz_transmitter_deserialize()`
-  parsing that file. The 840–984 byte baseline above was taken while the
-  app was idle, listening, or tearing down a completed replay; it did **not**
-  catch either of those two peak moments. Do **not** reduce `stack_size`
-  below `12 * 1024` until `top` is captured in a single window that contains
-  both a real RSSI-triggered capture and an immediate replay of that same
-  file, and the resulting `Stack Min` confirms a comfortable margin. The
-  measurement must be repeated in full after any reduction.
+- **Stack peak (capture + replay init) — measured 2026-08-03.** `Stack Min`
+  is a FreeRTOS watermark, not an instantaneous reading
+  (`furi_thread_get_stack_space()`, "Get thread stack watermark" —
+  `~/.ufbt/current/sdk_headers/f7_sdk/furi/core/thread.h:471–477`): it only
+  falls, so one `top` sampled at the end of a session covers every code path
+  that session executed, as long as the app was never closed and relaunched
+  in between. Every SubGHz `Stack Min` recorded in this file before today —
+  including the 11300–11444 baseline just above — was measured on a binary
+  that predated this pass's reflash (installed image was 26844 bytes; the
+  current tree builds 27036 bytes, `storage md5` confirmed the two match
+  after reflashing); none of it is evidence about the build actually running
+  today, and it is not combined with today's figure. Measured fresh, one
+  continuous session, app never relaunched: Trigger set to the most
+  sensitive slot (index 0, −85 dBm), ~30 s of ambient listening on the
+  default 433.92 MHz fired **19 real captures** (`storage list
+  /ext/subghz/auto_rec` went `Empty` → 19 `.sub` files, 0–13589 bytes), then
+  **Replay** on the first of them ran to completion (no `_RC` suffix, so
+  `sub_rec_replay()` skipped the rolling-code gate and transmitted
+  directly). A single `top` taken after both chains had run read **`Stack
+  Min` 11288 of 12284 bytes** — clears the 4096-byte pass bar by a wide
+  margin. Because a real capture fired and the margin clears 4096, the flat
+  "never reduce `stack_size`" instruction this bullet used to carry no
+  longer applies by its own stated condition — recorded as an **option
+  only, never auto-applied**: only ~1000 of 12288 bytes were used, so a
+  future pass could try `8 * 1024` and re-run this same capture+replay
+  protocol to confirm the margin still clears 4096 before shipping it.
 - **Code review** (`code-standards` skill, mandatory pass): two findings.
   `VariableItem* s_freq_item` was a file-static mutable global — moved onto
   `SubRecApp` as `app->freq_item` (violates this file's own "no mutable
