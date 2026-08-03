@@ -527,6 +527,43 @@ place (`storage list` sizes unchanged) before this session ended. Needs a
 physical-button pass through steps 2-5 of this feature's own verification
 plan before the new menu itself can be called device-verified.
 
+**Verified 2026-08-03 — Open/Rename/Delete confirmed on device by physical
+button presses (Momentum mntm-dev, API 87.1).** `dialog_file_browser_show()`'s
+`ok` still cannot be driven over the CLI (see the corrected note above), so
+the pick step for every file-menu action below used a real finger on the
+device, not `cap.py` — closing out the previous entry's "needs a
+physical-button pass through steps 2-5"; all 6 steps of this feature's
+verification plan are done. **Open** (`reader_open_selected()`, dispatching
+by extension to the same `reader_load_nfc_file()`/`reader_load_emv_file()`
+backends the pre-menu direct-pick path always used) rendered a picked `.nfc`
+and a picked `.emv` identically to before. **Rename** (`reader_rename_result()`)
+changed the stem in place — directory and extension untouched, extension
+still picking the loader — and the renamed file reopened correctly through
+the same Open path. **Delete** (`reader_do_delete()`) removed the file and
+landed back on `ReaderViewActions`; `storage list
+/ext/apps_data/universal_card_reader` (checked at doc time) shows the folder
+empty — both pre-existing files (`Mifare_Plus_...nfc`, `EMV_...emv`) are
+gone, confirming the removal was real, not just a notice. Uptime climbed
+monotonically through the session with no crash or reboot.
+
+**EMV rename (STEP 0.4 of the plan): renames freely, no restriction.**
+`reader_rename_result()` never calls `emv_load()` or reads a single byte of
+the file — it is a pure `storage_common_rename()` on the path string, gated
+only by a `storage_file_exists()` collision check, so `.emv` is exactly as
+renameable as `.nfc`/`.rfid`. Content is gated only on Load: `emv_load()`'s
+`Universal EMV Card`/version header check (see the 2026-08-02 Load entry
+above) runs on Open, never on Rename — matching this session's "renamed
+file still loads" result for the EMV case STEP 0.4 targeted.
+
+**Not exercised, proven by argument instead:** the failed-rename branch
+(`storage_common_rename()` returning anything but `FSE_OK`) and the
+failed-delete branch (`storage_simply_remove()` returning `false`) both need
+a write-protected/read-only SD card to force, which this session didn't
+have. Both rest on the checked `storage_*` return values already in
+`reader_rename_result()`/`reader_do_delete()` — the same "trust the checked
+return value over forcing a hard-to-reach path" precedent this file already
+applies to the v2 EMV early-return (Second fix 2026-08-02 above).
+
 ---
 
 # RFID Multi-Reader
@@ -822,13 +859,37 @@ behaviours specific to this app's testing, worth recording for next time:
   returning `picked = false`), never `loader close`.
 - **The file browser shows a non-file "up" entry first**, even though
   `opts.base_path` blocks navigating above it — `input send ok short`
-  immediately after opening the browser does nothing observable; one
-  `input send down short` first, then `ok`, actually picks the (only) file.
-  Confirmed by writing a checkpoint marker to a `_trace.txt` file from each
-  branch of `sub_rec_do_browse()`/`sub_rec_menu_callback()` — a `top`/
-  `log debug` snapshot cannot resolve this on its own, but a file-based trace
-  survives across calls without any timing pressure and is worth reaching
-  for again before assuming a UI/CLI hang is a firmware bug.
+  immediately after opening the browser does nothing observable.
+  **Corrected 2026-08-03 — this bullet used to claim a preceding `down
+  short` then `ok` picks the file; that was wrong** (the `_trace.txt`
+  checkpoint that seemed to confirm it was not actually observing a
+  successful pick). Cross-checked against Universal Card Reader's
+  identical `dialog_file_browser_show()` call (see that app's Testing
+  section): the dialog responds to **physical button presses** normally
+  — a file can be picked on the device. It does **not** accept a file
+  selection over the CLI: `input send ok` is not delivered to a file
+  entry in this modal (~10 input-sequence variants tried, `down` then
+  `ok` among them), although `Back` and ordinary `Submenu` navigation
+  over the CLI work. Any verification that requires picking a saved file
+  must therefore be done with physical presses; `cap.py` cannot automate
+  it.
+- **Provenance correction, 2026-08-03 — every file-pick-dependent result
+  below needed a physical press at that step, whether the entry says so
+  or not.** `sub_rec_switch_view(app, SubRecViewFileMenu)` (in
+  `sub_rec_do_browse()`) only runs once `dialog_file_browser_show()`
+  returns `picked = true`, so `SubRecEventFileReplay` is unreachable
+  without a genuine pick — and the CLI cannot produce one, per the
+  correction above. **Replay, full success**, both halves of **Replay
+  abort paths**, and **Region refusal** (2026-08-02, below) never
+  claimed a CLI pick in the first place — read their pick step as
+  physical press, now made explicit. The 2026-08-03 **Stack peak**
+  entry's "Replay on the first of them" is less certain: it sits in a
+  session otherwise built around scripted `top`/`storage list` sampling,
+  the same style that produced the (wrong) `down`+`ok` claim above.
+  [INFERENCE: it may have relied on that same broken technique instead
+  of a real press — re-run it with a physical pick before trusting that
+  its `Stack Min` reading reflects the replay path, not only the capture
+  one.]
 - **The main menu `Submenu` remembers its cursor position across
   re-entries and wraps at the list boundary.** Two `down` presses only land
   on "Saved signals" from a *freshly launched* app (cursor starts on item 0);
