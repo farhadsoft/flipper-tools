@@ -80,6 +80,13 @@
 // (17 == COUNT_OF(sub_rec_freqs)).
 #define SCAN_SETTLE_MS 2
 
+// Analyze view. The waveform is downsampled to one level per screen column at
+// parse time, so drawing is O(WAVE_COLS) and the model holds a fixed buffer
+// however long the capture is -- a 100 ms and a 10 s capture cost the same.
+#define WAVE_COLS     120 // waveform columns; x = 4..123
+#define ANA_MOD_MAX   24  // "AM650", or an unrecognised Preset string, truncated
+#define ANA_PROTO_MAX 16
+
 // Generation-stamped events -- identical scheme to universal_card_reader
 // (reader_app.h invariant 2). Keep every SubRecCustomEvent value below 256.
 #define EVENT_ID(e)         ((e) & 0xFFu)
@@ -92,6 +99,7 @@ typedef enum {
     SubRecStateRecording, // RX up, RAW file open
     SubRecStateSending, // async TX in progress
     SubRecStateScanning, // sweeping the table, plain RX, no worker
+    SubRecStateAnalyzing, // inspecting a saved capture; no radio, no writes
 } SubRecState;
 // There is deliberately no SubRecStateNotice: a notice is an overlay flag
 // (app->notice_active), not a state. Making it a state would clobber the
@@ -116,6 +124,8 @@ typedef enum {
     SubRecEventConfirmNo,
     SubRecEventMenuScan,
     SubRecEventScanLock,
+    SubRecEventFileAnalyze,
+    SubRecEventAnalyzePage,
 } SubRecCustomEvent;
 
 typedef enum {
@@ -156,6 +166,20 @@ static const uint32_t sub_rec_freqs[] = {
 };
 #define SUB_REC_FREQ_DEFAULT_IDX 10 // 433.92 MHz
 
+// One saved capture's parsed header plus its downsampled waveform. Filled by
+// sub_rec_analyze_load() on the GUI thread and handed to the model in a single
+// setter call, so a half-parsed capture is never drawn.
+typedef struct {
+    uint32_t freq; // Hz, from the file's Frequency field
+    uint32_t samples; // total RAW_Data values
+    uint32_t bytes; // file size
+    uint32_t total_us; // sum of |duration|
+    uint16_t wave_len; // columns filled; 0 == nothing to draw
+    char mod[ANA_MOD_MAX]; // short label, else the raw Preset string
+    char proto[ANA_PROTO_MAX]; // Protocol field; "RAW" for every capture today
+    uint8_t wave[WAVE_COLS]; // 0/1 level per column
+} SubRecAnalysis;
+
 typedef struct {
     SubRecState state;
     bool cooldown;
@@ -172,6 +196,8 @@ typedef struct {
     char notice_l2[REC_TEXT_LINE_MAX];
     int8_t scan_dbm[COUNT_OF(sub_rec_freqs)]; // per-frequency RSSI, floor-filled at scan start
     uint8_t scan_peak; // index of the strongest entry seen; also the OK-lock target
+    SubRecAnalysis ana;
+    uint8_t ana_page; // 0 = info, 1 = waveform
 } SubRecModel;
 
 typedef struct {
@@ -215,6 +241,7 @@ typedef struct {
     uint8_t scan_idx; // next table entry to measure
     uint8_t scan_peak; // best entry in the sweep in progress
     int8_t scan_peak_dbm; // its RSSI; reset to the floor at each wrap
+    uint8_t ana_page; // mirrors the model's copy; sole writer is sub_rec_set_analyze_page()
 
     uint32_t saved;
     uint32_t dropped;

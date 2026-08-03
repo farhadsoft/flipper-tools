@@ -21,6 +21,7 @@
 #include <furi_hal.h>
 #include <dialogs/dialogs.h>
 #include <lib/subghz/blocks/generic.h>
+#include <lib/toolbox/strint.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -462,6 +463,152 @@ static void sub_rec_clear_all_start(SubRecApp* app) {
     sub_rec_switch_view(app, SubRecViewConfirm);
 }
 
+/* ------------------------------ analyze -------------------------------- */
+
+// Walks every RAW_Data value from the current RW position to EOF, summing
+// |duration| into *total_us, and returns the value count. `tmp` is caller-owned
+// scratch, reused per line so the loop allocates nothing.
+//
+// One flipper_format_read_string() per RAW_Data occurrence, then strint_to_int32()
+// across the line: this is the firmware's own RAW reader
+// (lib/subghz/subghz_file_encoder_worker.c, subghz_file_encoder_worker_data_parse()),
+// and it is what lets a line of any length be read without a fixed 512-int32
+// buffer. A short fixed-size flipper_format_read_int32() would silently drop the
+// rest of every line -- the same class of bug as the UCR EMV AID load-back.
+static uint32_t sub_rec_raw_totals(FlipperFormat* ff, FuriString* tmp, uint32_t* total_us) {
+    uint32_t n = 0;
+    uint32_t sum = 0;
+    while(flipper_format_read_string(ff, "RAW_Data", tmp)) {
+        char* p = (char*)furi_string_get_cstr(tmp);
+        int32_t v;
+        while(strint_to_int32(p, &p, &v, 10) == StrintParseNoError) {
+            // total_us is uint32_t: real captures cap at CAPTURE_MAX_MS (1e7 us), well
+            // within range. A crafted file that wraps it yields a wrong-looking waveform
+            // but cannot crash -- unsigned wrap is defined and both zero-guards still
+            // hold. Switch to uint64_t only if a real file ever overflows.
+            // -(int64_t)v, never -v: negating INT32_MIN as int32_t is UB.
+            sum += (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+            n++;
+        }
+    }
+    *total_us = sum;
+    return n;
+}
+
+// Second walk, with the total duration known: one 0/1 level per screen column,
+// sampled at the column's time midpoint. Pulses narrower than col_us alias --
+// this shows burst shape, not measurement-grade edges.
+static void sub_rec_raw_wave(FlipperFormat* ff, FuriString* tmp, uint32_t col_us, uint8_t* wave) {
+    uint32_t t = 0; // start time of the current sample
+    uint32_t mid = col_us / 2; // midpoint of the next unfilled column
+    uint16_t col = 0;
+    uint8_t level = 0; // silence before the first edge
+
+    while(col < WAVE_COLS && flipper_format_read_string(ff, "RAW_Data", tmp)) {
+        char* p = (char*)furi_string_get_cstr(tmp);
+        int32_t v;
+        while(col < WAVE_COLS && strint_to_int32(p, &p, &v, 10) == StrintParseNoError) {
+            uint32_t d = (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+            level = (v > 0) ? 1 : 0; // 0 is the encoder's reset marker -> low
+            while(col < WAVE_COLS && mid < t + d) {
+                wave[col++] = level;
+                mid += col_us;
+            }
+            t += d;
+        }
+    }
+    // Integer rounding can leave trailing columns unfilled; hold the last level.
+    while(col < WAVE_COLS) wave[col++] = level;
+}
+
+// GUI thread. Pure read: parses the picked .sub's header and RAW payload and
+// publishes the result to the view model. Touches no radio and writes nothing.
+// Returns false after showing its own notice.
+static bool sub_rec_analyze_load(SubRecApp* app) {
+    const char* path = furi_string_get_cstr(app->selected_path);
+    SubRecAnalysis a;
+    memset(&a, 0, sizeof(a));
+
+    FileInfo info;
+    if(storage_common_stat(app->storage, path, &info) == FSE_OK) a.bytes = (uint32_t)info.size;
+
+    // Buffered, unlike sub_rec_replay()'s plain flipper_format_file_alloc():
+    // replay reads two header fields, this streams the whole RAW payload twice.
+    // The buffered stream caches 1024 bytes against the raw stream's 32-byte
+    // reads -- 32x fewer storage round-trips on the GUI thread.
+    FlipperFormat* ff = flipper_format_buffered_file_alloc(app->storage);
+    FuriString* tmp = furi_string_alloc();
+    bool ok = false;
+
+    // Single exit: every failure breaks to the one cleanup below, so neither the
+    // format handle nor the scratch string can leak on an early return.
+    do {
+        if(!flipper_format_buffered_file_open_existing(ff, path)) break;
+
+        // Rewind before each field: seek_to_key() only scans FORWARD from the
+        // current position, so a file ordering its fields differently from what
+        // this app writes would otherwise read as missing.
+        flipper_format_rewind(ff);
+        if(!flipper_format_read_uint32(ff, "Frequency", &a.freq, 1)) break;
+
+        flipper_format_rewind(ff);
+        if(!flipper_format_read_string(ff, "Preset", tmp)) break;
+        // Same reverse lookup sub_rec_replay() does, for the same reason: never
+        // derive a preset id from the file. Unknown -> show the raw string.
+        snprintf(a.mod, sizeof(a.mod), "%s", furi_string_get_cstr(tmp));
+        for(size_t i = 0; i < COUNT_OF(sub_rec_mods); i++) {
+            if(furi_string_cmp_str(tmp, sub_rec_mods[i].file_preset) == 0) {
+                snprintf(a.mod, sizeof(a.mod), "%s", sub_rec_mods[i].label);
+                break;
+            }
+        }
+
+        // Optional: a foreign .sub may omit it. Not a parse failure.
+        flipper_format_rewind(ff);
+        if(flipper_format_read_string(ff, "Protocol", tmp)) {
+            snprintf(a.proto, sizeof(a.proto), "%s", furi_string_get_cstr(tmp));
+        } else {
+            snprintf(a.proto, sizeof(a.proto), "?");
+        }
+
+        flipper_format_rewind(ff);
+        a.samples = sub_rec_raw_totals(ff, tmp, &a.total_us);
+
+        if(a.samples && a.total_us) {
+            uint32_t col_us = a.total_us / WAVE_COLS;
+            if(col_us == 0) col_us = 1; // capture shorter than one column per sample
+            flipper_format_rewind(ff);
+            sub_rec_raw_wave(ff, tmp, col_us, a.wave);
+            a.wave_len = WAVE_COLS;
+        }
+        // wave_len stays 0 for an empty or zero-duration payload; the waveform
+        // page prints "no samples" instead of dividing by zero.
+        ok = true;
+    } while(false);
+
+    flipper_format_free(ff); // closes the file; safe even if the open failed
+    furi_string_free(tmp);
+
+    if(!ok) {
+        FURI_LOG_W(TAG, "analyze: unreadable file: %s", path);
+        sub_rec_show_notice(app, "Unreadable file", "", "", SubRecViewFileMenu, 0);
+        return false;
+    }
+    FURI_LOG_I(
+        TAG, "analyze: %lu samples, %lu us", (unsigned long)a.samples, (unsigned long)a.total_us);
+    sub_rec_set_analyze(app, &a);
+    return true;
+}
+
+// No ethics gate: analysis is passive inspection of a file the user already has --
+// nothing is recorded, nothing is transmitted. Same reasoning as Frequency scan.
+static void sub_rec_handle_file_analyze(SubRecApp* app) {
+    if(!sub_rec_analyze_load(app)) return; // notice already shown
+    sub_rec_set_analyze_page(app, 0); // always open on Info
+    sub_rec_switch_view(app, SubRecViewStatus);
+    sub_rec_set_state(app, SubRecStateAnalyzing, false);
+}
+
 static void sub_rec_rename_result(void* context) {
     SubRecApp* app = context;
 
@@ -672,6 +819,12 @@ static bool sub_rec_navigation_callback(void* context) {
             sub_rec_scan_stop(app);
             sub_rec_switch_view(app, SubRecViewMenu);
             break;
+        case SubRecStateAnalyzing:
+            // No radio was ever started, so nothing to stop -- just drop back to
+            // the file menu the capture was picked from.
+            sub_rec_set_state(app, SubRecStateIdle, false);
+            sub_rec_switch_view(app, SubRecViewFileMenu);
+            break;
         case SubRecStateIdle:
         default:
             sub_rec_switch_view(app, SubRecViewMenu);
@@ -707,11 +860,22 @@ static bool sub_rec_navigation_callback(void* context) {
 // view_input() returns false.
 static bool sub_rec_status_input_callback(InputEvent* event, void* context) {
     SubRecApp* app = context;
-    if(app->state != SubRecStateScanning) return false;
-    if(event->key != InputKeyOk || event->type != InputTypeShort) return false;
-    view_dispatcher_send_custom_event(
-        app->view_dispatcher, EVENT_MAKE(SubRecEventScanLock, app->gen));
-    return true;
+    if(event->type != InputTypeShort) return false;
+
+    if(app->state == SubRecStateScanning) {
+        if(event->key != InputKeyOk) return false;
+        view_dispatcher_send_custom_event(
+            app->view_dispatcher, EVENT_MAKE(SubRecEventScanLock, app->gen));
+        return true;
+    }
+    if(app->state == SubRecStateAnalyzing) {
+        // Two pages, so direction is irrelevant -- both keys toggle.
+        if(event->key != InputKeyLeft && event->key != InputKeyRight) return false;
+        view_dispatcher_send_custom_event(
+            app->view_dispatcher, EVENT_MAKE(SubRecEventAnalyzePage, app->gen));
+        return true;
+    }
+    return false;
 }
 
 // Shared by both submenus: `index` is the SubRecCustomEvent the row was
@@ -767,6 +931,12 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
         return true;
     case SubRecEventFileReplay:
         sub_rec_replay(app);
+        return true;
+    case SubRecEventFileAnalyze:
+        sub_rec_handle_file_analyze(app);
+        return true;
+    case SubRecEventAnalyzePage:
+        sub_rec_set_analyze_page(app, app->ana_page ? 0 : 1);
         return true;
     case SubRecEventFileDelete:
         sub_rec_do_delete(app);
@@ -836,6 +1006,7 @@ static SubRecApp* sub_rec_app_alloc(void) {
     view_dispatcher_add_view(
         app->view_dispatcher, SubRecViewFileMenu, submenu_get_view(app->file_menu));
     submenu_add_item(app->file_menu, "Replay", SubRecEventFileReplay, sub_rec_menu_callback, app);
+    submenu_add_item(app->file_menu, "Analyze", SubRecEventFileAnalyze, sub_rec_menu_callback, app);
     submenu_add_item(app->file_menu, "Rename", SubRecEventFileRename, sub_rec_menu_callback, app);
     submenu_add_item(app->file_menu, "Delete", SubRecEventFileDelete, sub_rec_menu_callback, app);
     submenu_add_item(app->file_menu, "Back", SubRecEventFileBack, sub_rec_menu_callback, app);

@@ -42,15 +42,20 @@ thread; the worker thread and the three timers only ever post via
 5. **Back** while listening stops the radio and returns to the menu.
 6. **Saved signals** opens a menu: **Browse files** / **Clear all** / **Back**.
    Browse files opens the file browser scoped to `/ext/subghz/auto_rec/` --
-   pick a file for **Replay** / **Rename** / **Delete**. **Clear all** asks
-   `Delete N files?` with **Cancel** preselected; choosing **Delete all**
-   removes every `.sub` file directly in `/ext/subghz/auto_rec/`
-   (subdirectories and non-`.sub` files are left alone) and reports how many
-   were deleted.
+   pick a file for **Replay** / **Analyze** / **Rename** / **Delete**.
+   **Clear all** asks `Delete N files?` with **Cancel** preselected; choosing
+   **Delete all** removes every `.sub` file directly in
+   `/ext/subghz/auto_rec/` (subdirectories and non-`.sub` files are left
+   alone) and reports how many were deleted.
 7. **Replay** re-transmits the file on its own recorded frequency and
    preset. A file whose name contains `_RC` (rolling code detected during
    capture) shows a warning first; replaying it anyway will very likely
    not open a rolling-code receiver -- see Limitations.
+8. **Analyze** is read-only: no radio call, no file write. It shows an
+   **Info** page (frequency, modulation, protocol, sample count, file size)
+   and a **Waveform** page (the burst's pulse train, downsampled to 120
+   columns). **Left**/**Right** toggles between the two pages; **Back**
+   returns to the file menu.
 
 ## Storage
 
@@ -96,6 +101,9 @@ counter on screen).
   `cc1101_*` symbol is exported to FAPs (`api_symbols.csv` contains zero
   `cc1101_` functions -- checked), so this app uses the selected preset's AGC
   instead.
+- **The Analyze waveform is midpoint-sampled to 120 columns**, so a pulse
+  narrower than `total duration / 120` can vanish or double. It shows the
+  burst's shape, not measurement-grade edges.
 
 ## Troubleshooting
 

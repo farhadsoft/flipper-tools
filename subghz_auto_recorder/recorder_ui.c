@@ -19,6 +19,13 @@
 #define SCAN_BASE_Y    52 // bars occupy rows SCAN_BASE_Y-h .. SCAN_BASE_Y-1
 #define SCAN_MAX_H     34
 
+// Analyze waveform: a baseline across the band plus a full-height column
+// wherever the level is high, so a run of high columns reads as a solid block --
+// the classic OOK burst shape on a 1-bit screen.
+#define WAVE_X0   4
+#define WAVE_Y_HI 24
+#define WAVE_Y_LO 46
+
 static void draw_centered(Canvas* canvas, int cy, const char* str) {
     int w = canvas_string_width(canvas, str);
     canvas_draw_str(canvas, (SCREEN_W - w) / 2, cy, str);
@@ -141,6 +148,51 @@ static void draw_scanning(Canvas* canvas, const SubRecModel* m) {
     draw_centered(canvas, 63, buf);
 }
 
+static void draw_analyzing(Canvas* canvas, const SubRecModel* m) {
+    char buf[40];
+
+    if(m->ana_page == 0) {
+        draw_title_bar(canvas, "Info  >waveform");
+        // Same "%lu.%02lu MHz" integer split every other screen in this app uses;
+        // no float printf is dragged in. Line 63 is deliberately left free.
+        snprintf(
+            buf,
+            sizeof(buf),
+            "%lu.%02lu MHz  %s",
+            (unsigned long)(m->ana.freq / 1000000),
+            (unsigned long)(m->ana.freq / 10000 % 100),
+            m->ana.mod);
+        draw_centered_fit(canvas, 24, buf, 124);
+        snprintf(buf, sizeof(buf), "Proto: %s", m->ana.proto);
+        draw_centered_fit(canvas, 34, buf, 124);
+        snprintf(buf, sizeof(buf), "Samples: %lu", (unsigned long)m->ana.samples);
+        draw_centered_fit(canvas, 44, buf, 124);
+        snprintf(buf, sizeof(buf), "Size: %lu B", (unsigned long)m->ana.bytes);
+        draw_centered_fit(canvas, 54, buf, 124);
+        return;
+    }
+
+    draw_title_bar(canvas, "Waveform  >info");
+    if(m->ana.wave_len == 0) {
+        draw_centered(canvas, 38, "no samples");
+        return;
+    }
+    canvas_draw_line(canvas, WAVE_X0, WAVE_Y_LO, WAVE_X0 + WAVE_COLS - 1, WAVE_Y_LO);
+    for(uint16_t c = 0; c < m->ana.wave_len; c++) {
+        if(m->ana.wave[c]) {
+            canvas_draw_line(canvas, WAVE_X0 + c, WAVE_Y_HI, WAVE_X0 + c, WAVE_Y_LO);
+        }
+    }
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%lu spl  %lu.%02lu ms",
+        (unsigned long)m->ana.samples,
+        (unsigned long)(m->ana.total_us / 1000),
+        (unsigned long)(m->ana.total_us % 1000 / 10));
+    draw_centered_fit(canvas, 63, buf, 124);
+}
+
 void sub_rec_draw_callback(Canvas* canvas, void* model) {
     const SubRecModel* m = model;
     canvas_clear(canvas);
@@ -162,6 +214,9 @@ void sub_rec_draw_callback(Canvas* canvas, void* model) {
         break;
     case SubRecStateScanning:
         draw_scanning(canvas, m);
+        break;
+    case SubRecStateAnalyzing:
+        draw_analyzing(canvas, m);
         break;
     case SubRecStateIdle:
     default:
@@ -246,4 +301,13 @@ void sub_rec_reset_scan(SubRecApp* app) {
             m->scan_peak = app->freq_idx;
         },
         true);
+}
+
+void sub_rec_set_analyze(SubRecApp* app, const SubRecAnalysis* a) {
+    with_view_model(app->view, SubRecModel * m, { m->ana = *a; }, false);
+}
+
+void sub_rec_set_analyze_page(SubRecApp* app, uint8_t page) {
+    app->ana_page = page;
+    with_view_model(app->view, SubRecModel * m, { m->ana_page = page; }, true);
 }

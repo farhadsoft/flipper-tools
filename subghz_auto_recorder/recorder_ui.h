@@ -21,3 +21,10 @@ void sub_rec_set_scan(SubRecApp* app, uint8_t idx, int8_t dbm, uint8_t peak, boo
 // Floor-fills scan_dbm[] and points scan_peak at the current frequency, so the
 // first frame of a scan is a flat floor instead of the previous sweep.
 void sub_rec_reset_scan(SubRecApp* app);
+
+// Publishes one parsed capture. update=false: sub_rec_set_analyze_page() repaints
+// immediately after, and repainting here would draw new data under the old page.
+void sub_rec_set_analyze(SubRecApp* app, const SubRecAnalysis* a);
+// Sole writer of app->ana_page and the model's copy -- same pairing as
+// sub_rec_set_state(). 0 = info, 1 = waveform.
+void sub_rec_set_analyze_page(SubRecApp* app, uint8_t page);

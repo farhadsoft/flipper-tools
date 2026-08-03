@@ -809,6 +809,15 @@ new View, and the sweep is clocked by the same 25 ms rssi_timer —
 sub_rec_handle_rssi_tick() branches to sub_rec_scan_step() first and
 returns, so the listen path's RSSI/capture logic never runs while scanning.
 
+Analyze reuses the same pattern again: one more SubRecState
+(SubRecStateAnalyzing) drawn on SubRecViewStatus, reached from the per-file
+menu, with no radio and no timer of its own -- it parses a saved `.sub`'s
+header and RAW payload straight from storage on the GUI thread and hands the
+result to the view model in one `sub_rec_set_analyze()` call. Analyze's
+waveform fits the entire capture into 120 columns; auto-trimming
+leading/trailing silence (or a left/right pan) is the natural next step and
+is deliberately not in the first version.
+
 Six load-bearing invariants (violating any of them either crashes the
 device or wedges the CC1101 driver):
 
@@ -1171,6 +1180,23 @@ rebuild, one continuous CLI session, `uptime` climbing strictly throughout
   closed"` (never the file-browser hang documented elsewhere in this
   section); `uptime` answered immediately after and kept advancing — no
   crash-reboot anywhere in this session's device testing.
+
+**Analyze view (header info + RAW waveform) — added 2026-08-03.** Build:
+`ufbt -c && ufbt` clean from scratch, zero warnings, `APPCHK` Target 7 / API
+87.1. Ground truth captured via `cap.py` against the largest existing
+capture, `AR_4339_083553.sub` (`storage list` + `storage read`, COM4):
+`Frequency: 433920000` (433.92 MHz), `Preset: FuriHalSubGhzPresetOok650Async`
+(-> `AM650`), `Protocol: RAW`, `Size: 11150` B, **2421** total `RAW_Data`
+values summed across all 5 `RAW_Data:` lines in the file (not just the
+first — the exact failure mode the `read_string` + `strint_to_int32` walk in
+`sub_rec_raw_totals()` exists to avoid). `uptime` climbing normally after
+launch, no reset.
+**Not yet verified on device: the Info/Waveform pages themselves, page
+toggle, Back-to-file-menu, and the no-radio/no-write check during Analyze.**
+All four require picking a file from `dialog_file_browser_show()`, which —
+per the CLI limitation documented above (Testing this app) — cannot be
+driven over the CLI; only a physical button press can pick a file. Static
+review (below) covers what CLI/build verification cannot.
 
 ---
 
