@@ -55,6 +55,30 @@
 #define NOTICE_MS         1600
 #define RSSI_FLOOR_DBM    (-95.0f) // left edge of the on-screen bar
 #define RSSI_CEIL_DBM     (-35.0f) // right edge
+// Settle time between switching the CC1101 to RX on a new frequency and
+// reading RSSI. Taken from the stock frequency analyzer worker
+// (applications/main/subghz/helpers/subghz_frequency_analyzer_worker.c:
+// furi_delay_ms(2) after cc1101_switch_to_rx, in both its coarse and fine
+// sweeps). Runs on the GUI thread, once per RSSI_POLL_MS tick.
+//
+// That stock figure was tuned under the analyzer worker's own flat-response
+// AGC override (AGCCTRL0..2, MDMCFG3/4) -- registers no FAP can write, since
+// api_symbols.csv exports zero cc1101_* functions. This app settles under
+// the selected preset's AGC instead, so 2 ms is inherited from the stock
+// worker, not validated under this app's own AGC.
+//
+// Tuning ladder if a delta-gate measurement ever shows it is too short:
+// 2 -> 4 -> 8 ms, never below 2 (the stock figure; below it the CC1101 may
+// not have settled at all) and never above 15 (the tick is RSSI_POLL_MS
+// 25 ms and the handler also runs idle/set_frequency/flush_rx/set_rx over
+// SPI plus the wrap repaint; 15 ms still leaves ~10 ms of headroom).
+//
+// Raising this does not lengthen the sweep: rssi_timer is periodic at
+// RSSI_POLL_MS regardless of handler runtime, so the extra delay is
+// absorbed inside the tick, not added on top of it. Measured at 2 ms:
+// sweeps ran 422-430 ms, mean 425 ms -- exactly 17 * 25 ms
+// (17 == COUNT_OF(sub_rec_freqs)).
+#define SCAN_SETTLE_MS 2
 
 // Generation-stamped events -- identical scheme to universal_card_reader
 // (reader_app.h invariant 2). Keep every SubRecCustomEvent value below 256.
@@ -67,6 +91,7 @@ typedef enum {
     SubRecStateArmed, // RX up, no capture file open
     SubRecStateRecording, // RX up, RAW file open
     SubRecStateSending, // async TX in progress
+    SubRecStateScanning, // sweeping the table, plain RX, no worker
 } SubRecState;
 // There is deliberately no SubRecStateNotice: a notice is an overlay flag
 // (app->notice_active), not a state. Making it a state would clobber the
@@ -89,6 +114,8 @@ typedef enum {
     SubRecEventSavedBack,
     SubRecEventConfirmYes,
     SubRecEventConfirmNo,
+    SubRecEventMenuScan,
+    SubRecEventScanLock,
 } SubRecCustomEvent;
 
 typedef enum {
@@ -112,6 +139,23 @@ typedef struct {
     float fork_tail[4];
 } SubRecPreset;
 
+// Official firmware default list (lib/subghz/subghz_setting.c
+// subghz_frequency_list[]), FREQUENCY_FLAG_DEFAULT stripped. Defined here
+// (not extern'd from recorder_radio.c) so COUNT_OF() works in every
+// translation unit that includes this header without a second, easily
+// stale, hand-maintained size constant -- and it lives here, in
+// recorder_app.h, because SubRecModel below sizes scan_dbm[] from
+// COUNT_OF(sub_rec_freqs), and recorder_ui.c includes only recorder_app.h,
+// not recorder_radio.h. Header-defined means one const copy per
+// including translation unit (three, ~204 bytes of flash total) -- accepted
+// deliberately over an extern plus a hand-maintained element count.
+static const uint32_t sub_rec_freqs[] = {
+    300000000, 303875000, 304250000, 310000000, 315000000, 318000000,
+    390000000, 418000000, 433075000, 433420000, 433920000, 434420000,
+    434775000, 438900000, 868350000, 915000000, 925000000,
+};
+#define SUB_REC_FREQ_DEFAULT_IDX 10 // 433.92 MHz
+
 typedef struct {
     SubRecState state;
     bool cooldown;
@@ -126,6 +170,8 @@ typedef struct {
     char notice_title[24];
     char notice_l1[REC_TEXT_LINE_MAX];
     char notice_l2[REC_TEXT_LINE_MAX];
+    int8_t scan_dbm[COUNT_OF(sub_rec_freqs)]; // per-frequency RSSI, floor-filled at scan start
+    uint8_t scan_peak; // index of the strongest entry seen; also the OK-lock target
 } SubRecModel;
 
 typedef struct {
@@ -166,6 +212,9 @@ typedef struct {
     uint8_t mod_idx;
     uint8_t trigger_idx;
     uint32_t custom_freq; // 0 = use the table
+    uint8_t scan_idx; // next table entry to measure
+    uint8_t scan_peak; // best entry in the sweep in progress
+    int8_t scan_peak_dbm; // its RSSI; reset to the floor at each wrap
 
     uint32_t saved;
     uint32_t dropped;

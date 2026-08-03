@@ -2,18 +2,6 @@
 
 #include "recorder_app.h"
 
-// Official firmware default list (lib/subghz/subghz_setting.c
-// subghz_frequency_list[]), FREQUENCY_FLAG_DEFAULT stripped. Defined here
-// (not extern'd from recorder_radio.c) so COUNT_OF() works in every
-// translation unit that includes this header without a second, easily
-// stale, hand-maintained size constant.
-static const uint32_t sub_rec_freqs[] = {
-    300000000, 303875000, 304250000, 310000000, 315000000, 318000000,
-    390000000, 418000000, 433075000, 433420000, 433920000, 434420000,
-    434775000, 438900000, 868350000, 915000000, 925000000,
-};
-#define SUB_REC_FREQ_DEFAULT_IDX 10 // 433.92 MHz
-
 // Only fork-stable preset ids -- FuriHalSubGhzPreset ids 4..8 drift between
 // official and Momentum firmware; never compile in anything above id 3.
 typedef struct {
@@ -41,6 +29,16 @@ void sub_rec_radio_alloc(SubRecApp* app);
 void sub_rec_radio_free(SubRecApp* app);
 void sub_rec_listen_start(SubRecApp* app);
 void sub_rec_listen_stop(SubRecApp* app);
+
+// Frequency-sweep RSSI scan, driven by the same rssi_timer as listen mode
+// (see sub_rec_scan_step()). Deliberately never calls
+// subghz_devices_start_async_rx()/_stop_async_rx(): the sweep only ever
+// calls subghz_devices_set_rx(), which does not move
+// furi_hal_subghz.state off SubGhzStateIdle, so stop_async_rx() would
+// furi_check.
+void sub_rec_scan_start(SubRecApp* app);
+void sub_rec_scan_stop(SubRecApp* app);
+void sub_rec_scan_step(SubRecApp* app); // one table entry per RSSI tick
 
 // Auto-capture mechanics, called from the RSSI tick handler's decision logic
 // in subghz_auto_recorder.c.

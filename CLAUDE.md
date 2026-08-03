@@ -803,7 +803,13 @@ repaint to ~8 Hz, and calls into `recorder_radio.c`'s
 says so. A notice is an overlay flag (`app->notice_active`), never a state,
 so a message raised while listening leaves the radio armed underneath it.
 
-Five load-bearing invariants (violating any of them either crashes the
+Frequency scan adds one more SubRecState (SubRecStateScanning) and nothing
+else structural: it draws on the existing SubRecViewStatus rather than a
+new View, and the sweep is clocked by the same 25 ms rssi_timer —
+sub_rec_handle_rssi_tick() branches to sub_rec_scan_step() first and
+returns, so the listen path's RSSI/capture logic never runs while scanning.
+
+Six load-bearing invariants (violating any of them either crashes the
 device or wedges the CC1101 driver):
 
 1. **`FuriHalSubGhzPreset` ids 4..8 are not fork-stable.** Only ids 0..3
@@ -837,6 +843,11 @@ device or wedges the CC1101 driver):
    allocation and before the radio is touched, so a chained re-entry (the
    rolling-code notice) never leaks `transmitter`/`fff_tx` or double-arms
    the radio.
+6. **Scan mode uses plain `set_rx` and must never call `stop_async_rx`.**
+   `furi_hal_subghz_rx()` (behind `subghz_devices_set_rx()`) leaves
+   `furi_hal_subghz.state` at `SubGhzStateIdle` — only `start_async_rx`/`_tx`
+   move it off Idle — so `sub_rec_scan_stop()` calls `subghz_devices_idle()`
+   only, and `subghz_devices_stop_async_rx()` would `furi_check`.
 
 Rolling-code detection: `sub_rec_decoded_callback()` (SubGhzWorker thread)
 sets `volatile bool app->rolling` when a decoded protocol's type is
@@ -893,7 +904,7 @@ behaviours specific to this app's testing, worth recording for next time:
   its `Stack Min` reading reflects the replay path, not only the capture
   one.]
 - **The main menu `Submenu` remembers its cursor position across
-  re-entries and wraps at the list boundary.** Two `down` presses only land
+  re-entries and wraps at the list boundary.** Three down presses only land
   on "Saved signals" from a *freshly launched* app (cursor starts on item 0);
   after any other visit the cursor is wherever it was left, and blind
   `down`-counting from an assumed item 0 lands on the wrong row. Always
@@ -1079,6 +1090,87 @@ before every destructive step above and restored after (`storage list`
 before/after: identical 32 files, byte-identical sizes) — the
 auto-recorded data in this session's `/ext/subghz/auto_rec/` is unchanged
 end to end.
+
+**Frequency-scan comment/sensitivity follow-up — measured 2026-08-03.** Review
+of the scan feature's plan raised three items; the input-callback-context item
+was already closed (no code change — `view_set_context()` confirmed present
+and safe). The other two:
+
+1. *(peak-recompute wording, no behavior change)* `sub_rec_scan_step()`'s
+   `if(wrapped)` block in `recorder_radio.c` had a misleading trailing comment
+   claiming the wrap reset "keeps the displayed index" — replaced with a block
+   comment stating the peak is **recomputed every sweep that sees any
+   signal**, not a running maximum; the index only survives a sweep that reads
+   exactly the floor. `sub_rec_freqs[]`'s header comment in `recorder_app.h`
+   got one added clause: header-defined means one `static const` copy per
+   including translation unit (three TUs, ~204 bytes total), accepted
+   deliberately over an `extern` plus a hand-maintained count.
+2. *(`SCAN_SETTLE_MS` provenance, value unchanged)* Extended the
+   `SCAN_SETTLE_MS` comment in `recorder_app.h`: the inherited `2` ms figure
+   was tuned under the stock frequency-analyzer worker's own AGC override,
+   registers this FAP cannot write (`api_symbols.csv` exports zero `cc1101_*`
+   functions) — so it is inherited, not validated under this app's
+   preset-driven AGC. Documented the tuning ladder (2 → 4 → 8, hard floor 2 /
+   hard ceiling 15) and the fact that raising it does not lengthen the sweep,
+   since `rssi_timer` is periodic at `RSSI_POLL_MS` regardless of handler
+   runtime.
+
+Rebuilt after both comment edits (`-Werror` tree catches a malformed
+comment): zero warnings, `APPCHK` Target 7 / API 87.1. Regression re-verify
+(`ufbt launch` → Frequency scan → `log debug`, 20 s window): **51** `scan
+peak` lines, **0** `[W]`/`[E]` lines, every frequency one of the 17 table
+values — clears the ≥30-line bar. Sweep period computed from these 51 lines'
+own timestamps (50 consecutive deltas): 411–439 ms, mean **425.0 ms = 17 × 25
+ms** exactly (`COUNT_OF(sub_rec_freqs)` × `RSSI_POLL_MS`) — confirms the
+settle delay is absorbed inside the periodic tick, not added to it. `top`
+sampled live on the same launch: `Stack Min` **11432 of 12284** (above the
+11288 capture+replay baseline recorded above, because the scan path opens no
+file), heap `minimum` **62264** — matches the previously recorded figure
+exactly.
+
+**Sensitivity gate (dBm delta) — unverified, no keyed transmitter available.**
+The pass condition needs a live 433.92 MHz remote held within ~20 cm, button
+down, during a 20 s capture; none was available this session (confirmed
+before running the gate rather than inferring a result from ambient data —
+ambient alone already put `433920000` at the sweep peak at −83/−79/−69 dBm in
+this session's regression capture, exactly the kind of reading the delta gate
+exists to not be fooled by). Per the plan's documented contingency:
+`SCAN_SETTLE_MS` **stays 2**, no branch from the delta-gate table was applied,
+and no dBm number is recorded for the sensitivity claim. Reference ambient
+baseline for whenever the gate does run (COM4, Momentum `mntm-dev` 8ed809fb,
+AM650, DE region, `SCAN_SETTLE_MS 2`): sweep-peak **−84 dBm in 51 of 79
+ambient sweeps, −83 in 27**, one −58 outlier at 868.35 MHz (single EU SRD
+transient; 868.35 sat at the floor the other 78 times) — pass bar is ≥50% of
+sweeps naming `433920000` with median ≥ −70 dBm.
+
+**Interactive on-device verification — OK-lock and Back-during-scan, measured
+2026-08-03.** Neither had a written record in this file before this pass (the
+plan that scoped this pass asserted both were exercised on a prior build,
+"V6" — that session's `top`/`uptime` evidence was never committed here, so
+treated as unverified until re-checked). Re-verified fresh against today's
+rebuild, one continuous CLI session, `uptime` climbing strictly throughout
+(3h56m36s → 4h5m41s → 4h7m30s, no reset):
+
+- **OK during scan → lock → Listen.** Fresh launch, entered Frequency scan,
+  pressed OK: `top` sampled roughly every second across the transition shows
+  the app thread alone at first (ethics notice showing, `Stack Min`
+  11444/12284, consistent with the low-11400s scan-only baseline above), then
+  exactly one `SubGhzWorker` appears (notice auto-dismissed,
+  `sub_rec_handle_menu_listen()` ran) and stays present, `Blocked`/`Ready`
+  alternating, %CPU 7–8%, for the rest of the sample window — normal
+  Listen-mode steady state, no duplicate or leaked thread. Heap `minimum`
+  settled at **56888** once the worker spawned (lower than the 62264
+  scan-only figure above, expected: `SubGhzWorker` allocates its own
+  stack/buffers that pure scanning never touches).
+- **Back during scan.** Fresh launch, entered Frequency scan, pressed Back,
+  then streamed `log debug` for 6 s: **zero** `scan peak` lines and zero
+  `[W]`/`[E]` lines appeared — confirms `sub_rec_scan_stop()`'s
+  `furi_timer_stop(app->rssi_timer)` genuinely halts the sweep rather than
+  merely navigating the view away while the timer keeps firing behind it.
+- **Clean exit.** `loader close` after each of the above reported `"...was
+  closed"` (never the file-browser hang documented elsewhere in this
+  section); `uptime` answered immediately after and kept advancing — no
+  crash-reboot anywhere in this session's device testing.
 
 ---
 

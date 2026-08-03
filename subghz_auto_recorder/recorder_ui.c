@@ -12,6 +12,13 @@
 #define BAR_W 120
 #define BAR_H 8
 
+// Scan bar graph: one bar per sub_rec_freqs[] entry, centred.
+#define SCAN_BAR_W     6
+#define SCAN_BAR_PITCH 7
+#define SCAN_X0        ((SCREEN_W - ((int)COUNT_OF(sub_rec_freqs) * SCAN_BAR_PITCH - 1)) / 2)
+#define SCAN_BASE_Y    52 // bars occupy rows SCAN_BASE_Y-h .. SCAN_BASE_Y-1
+#define SCAN_MAX_H     34
+
 static void draw_centered(Canvas* canvas, int cy, const char* str) {
     int w = canvas_string_width(canvas, str);
     canvas_draw_str(canvas, (SCREEN_W - w) / 2, cy, str);
@@ -95,6 +102,45 @@ static void draw_sending(Canvas* canvas, const SubRecModel* m) {
     draw_centered(canvas, 44, "...");
 }
 
+// Frequency-scan status screen: a 17-bar RSSI graph (one bar per
+// sub_rec_freqs[] entry), a peak marker, and the peak's frequency + dBm.
+// Shares draw_rssi_bar()'s dBm->pixel mapping (RSSI_FLOOR_DBM/CEIL_DBM,
+// clamp01()) so the two screens read on the same scale.
+static void draw_scanning(Canvas* canvas, const SubRecModel* m) {
+    draw_title_bar(canvas, "Scan   OK=tune");
+
+    canvas_draw_line(
+        canvas,
+        SCAN_X0,
+        SCAN_BASE_Y,
+        SCAN_X0 + (int)COUNT_OF(sub_rec_freqs) * SCAN_BAR_PITCH - 2,
+        SCAN_BASE_Y);
+
+    for(size_t i = 0; i < COUNT_OF(sub_rec_freqs); i++) {
+        int h = (int)(
+            clamp01(((float)m->scan_dbm[i] - RSSI_FLOOR_DBM) / (RSSI_CEIL_DBM - RSSI_FLOOR_DBM)) *
+            SCAN_MAX_H);
+        if(h > 0) {
+            canvas_draw_box(
+                canvas, SCAN_X0 + (int)i * SCAN_BAR_PITCH, SCAN_BASE_Y - h, SCAN_BAR_W, h);
+        }
+    }
+
+    canvas_draw_box(
+        canvas, SCAN_X0 + (int)m->scan_peak * SCAN_BAR_PITCH + 1, SCAN_BASE_Y + 2, 4, 2);
+
+    uint32_t f = sub_rec_freqs[m->scan_peak];
+    char buf[32];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%lu.%02lu MHz  %d dBm",
+        (unsigned long)(f / 1000000),
+        (unsigned long)(f / 10000 % 100),
+        (int)m->scan_dbm[m->scan_peak]);
+    draw_centered(canvas, 63, buf);
+}
+
 void sub_rec_draw_callback(Canvas* canvas, void* model) {
     const SubRecModel* m = model;
     canvas_clear(canvas);
@@ -113,6 +159,9 @@ void sub_rec_draw_callback(Canvas* canvas, void* model) {
         break;
     case SubRecStateSending:
         draw_sending(canvas, m);
+        break;
+    case SubRecStateScanning:
+        draw_scanning(canvas, m);
         break;
     case SubRecStateIdle:
     default:
@@ -173,6 +222,28 @@ void sub_rec_set_freq_line(SubRecApp* app, const char* line, float trigger) {
         {
             snprintf(m->freq_line, sizeof(m->freq_line), "%s", line ? line : "");
             m->trigger = trigger;
+        },
+        true);
+}
+
+void sub_rec_set_scan(SubRecApp* app, uint8_t idx, int8_t dbm, uint8_t peak, bool update) {
+    with_view_model(
+        app->view,
+        SubRecModel * m,
+        {
+            m->scan_dbm[idx] = dbm;
+            m->scan_peak = peak;
+        },
+        update);
+}
+
+void sub_rec_reset_scan(SubRecApp* app) {
+    with_view_model(
+        app->view,
+        SubRecModel * m,
+        {
+            memset(m->scan_dbm, (int8_t)RSSI_FLOOR_DBM, sizeof(m->scan_dbm));
+            m->scan_peak = app->freq_idx;
         },
         true);
 }

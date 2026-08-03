@@ -17,3 +17,7 @@ void sub_rec_set_notice(SubRecApp* app, const char* title, const char* l1, const
 void sub_rec_set_counts(SubRecApp* app, uint32_t saved, uint32_t dropped, const char* last_file);
 // Sole writer of the model's `trigger` (the RSSI-bar tick position).
 void sub_rec_set_freq_line(SubRecApp* app, const char* line, float trigger);
+void sub_rec_set_scan(SubRecApp* app, uint8_t idx, int8_t dbm, uint8_t peak, bool update);
+// Floor-fills scan_dbm[] and points scan_peak at the current frequency, so the
+// first frame of a scan is a flat floor instead of the previous sweep.
+void sub_rec_reset_scan(SubRecApp* app);

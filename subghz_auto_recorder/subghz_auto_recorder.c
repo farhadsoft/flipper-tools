@@ -162,6 +162,11 @@ static void sub_rec_notice_timer_callback(void* context) {
 // permanently busy. Repaint on a state change, an above/below edge, or every
 // RSSI_REDRAW_EVERY-th tick.
 static void sub_rec_handle_rssi_tick(SubRecApp* app) {
+    if(app->state == SubRecStateScanning) {
+        sub_rec_scan_step(app);
+        return;
+    }
+
     float rssi = subghz_devices_get_rssi(app->device);
     float trig = sub_rec_triggers[app->trigger_idx];
     bool above = (rssi >= trig);
@@ -245,6 +250,36 @@ static void sub_rec_handle_menu_listen(SubRecApp* app) {
     }
     sub_rec_switch_view(app, SubRecViewStatus);
     sub_rec_listen_start(app);
+}
+
+// No ethics gate: scanning is passive RSSI only -- nothing is recorded and
+// nothing is transmitted. The gate stays on Auto-record and Replay, which
+// are the actions it is about.
+static void sub_rec_handle_menu_scan(SubRecApp* app) {
+    sub_rec_switch_view(app, SubRecViewStatus);
+    sub_rec_scan_start(app);
+}
+
+static void sub_rec_handle_scan_lock(SubRecApp* app) {
+    if(app->state != SubRecStateScanning) return;
+    uint8_t idx = app->scan_peak;
+    sub_rec_scan_stop(app); // must reach SubRecStateIdle before listen_start's guard
+    app->freq_idx = idx;
+    app->custom_freq = 0;
+    // The VariableItemList is built once in sub_rec_app_alloc() and
+    // variable_item_set_current_value_index() does not fire the change
+    // callback, so the Frequency row's text is set by hand -- same two-call
+    // idiom as sub_rec_freq_number_result().
+    variable_item_set_current_value_index(app->freq_item, idx);
+    char buf[16];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%lu.%02lu MHz",
+        (unsigned long)(sub_rec_freqs[idx] / 1000000),
+        (unsigned long)(sub_rec_freqs[idx] / 10000 % 100));
+    variable_item_set_current_value_text(app->freq_item, buf);
+    sub_rec_handle_menu_listen(app); // carries the one-time ethics gate
 }
 
 // GUI thread only. dialog_file_browser_show() blocks this thread until the
@@ -376,8 +411,9 @@ static uint32_t sub_rec_clear_pass(SubRecApp* app, uint32_t* failed) {
 }
 
 // GUI thread. Reachable only from the main menu, and every path from the
-// status view to the main menu runs sub_rec_listen_stop(), so app->state is
-// Idle here and no capture can be writing into REC_DIR underneath this.
+// status view to the main menu runs sub_rec_listen_stop() or
+// sub_rec_scan_stop(), so app->state is Idle here and no capture can be
+// writing into REC_DIR underneath this.
 static void sub_rec_clear_all(SubRecApp* app) {
     uint32_t deleted = 0, failed = 0;
     for(uint32_t pass = 0; pass < REC_CLEAR_MAX_PASSES; pass++) {
@@ -632,6 +668,10 @@ static bool sub_rec_navigation_callback(void* context) {
             sub_rec_tx_stop(app);
             sub_rec_switch_view(app, SubRecViewFileMenu);
             break;
+        case SubRecStateScanning:
+            sub_rec_scan_stop(app);
+            sub_rec_switch_view(app, SubRecViewMenu);
+            break;
         case SubRecStateIdle:
         default:
             sub_rec_switch_view(app, SubRecViewMenu);
@@ -655,6 +695,23 @@ static bool sub_rec_navigation_callback(void* context) {
     // SubRecViewMenu: let the dispatcher stop -- run() returns and
     // sub_rec_app_free() does the rest.
     return false;
+}
+
+// Runs on the GUI thread (ViewDispatcher input path). This view was created
+// with view_alloc() + view_set_context(app->view, app), so its context really
+// is the app -- unlike a Submenu/TextBox view, whose context is the module
+// (universal_card_reader's CLAUDE.md invariant 4; this app's own invariant 4
+// is the unrelated CC1101 furi_check-state list above). Returning false for
+// everything else is what keeps Back flowing to sub_rec_navigation_callback():
+// view_dispatcher_handle_input() only consults the navigation callback when
+// view_input() returns false.
+static bool sub_rec_status_input_callback(InputEvent* event, void* context) {
+    SubRecApp* app = context;
+    if(app->state != SubRecStateScanning) return false;
+    if(event->key != InputKeyOk || event->type != InputTypeShort) return false;
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, EVENT_MAKE(SubRecEventScanLock, app->gen));
+    return true;
 }
 
 // Shared by both submenus: `index` is the SubRecCustomEvent the row was
@@ -692,6 +749,12 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
         return true;
     case SubRecEventMenuListen:
         sub_rec_handle_menu_listen(app);
+        return true;
+    case SubRecEventMenuScan:
+        sub_rec_handle_menu_scan(app);
+        return true;
+    case SubRecEventScanLock:
+        sub_rec_handle_scan_lock(app);
         return true;
     case SubRecEventMenuSettings:
         sub_rec_switch_view(app, SubRecViewSettings);
@@ -752,8 +815,9 @@ static SubRecApp* sub_rec_app_alloc(void) {
     view_allocate_model(app->view, ViewModelTypeLocking, sizeof(SubRecModel));
     view_set_context(app->view, app);
     view_set_draw_callback(app->view, sub_rec_draw_callback);
-    // No input callback: the status view never consumes anything but Back,
-    // which reaches sub_rec_navigation_callback() unconsumed by default.
+    // Back is still unconsumed here -- see sub_rec_status_input_callback()'s
+    // own comment on why returning false for everything else matters.
+    view_set_input_callback(app->view, sub_rec_status_input_callback);
 
     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
     view_dispatcher_set_custom_event_callback(app->view_dispatcher, sub_rec_custom_event_callback);
@@ -762,7 +826,8 @@ static SubRecApp* sub_rec_app_alloc(void) {
 
     app->menu = submenu_alloc();
     view_dispatcher_add_view(app->view_dispatcher, SubRecViewMenu, submenu_get_view(app->menu));
-    submenu_add_item(app->menu, "Listen", SubRecEventMenuListen, sub_rec_menu_callback, app);
+    submenu_add_item(app->menu, "Auto-record", SubRecEventMenuListen, sub_rec_menu_callback, app);
+    submenu_add_item(app->menu, "Frequency scan", SubRecEventMenuScan, sub_rec_menu_callback, app);
     submenu_add_item(app->menu, "Settings", SubRecEventMenuSettings, sub_rec_menu_callback, app);
     submenu_add_item(app->menu, "Saved signals", SubRecEventMenuSaved, sub_rec_menu_callback, app);
     submenu_add_item(app->menu, "Exit", SubRecEventMenuExit, sub_rec_menu_callback, app);
@@ -837,6 +902,7 @@ static void sub_rec_app_free(SubRecApp* app) {
     furi_timer_stop(app->tx_timer);
     furi_timer_stop(app->notice_timer);
 
+    sub_rec_scan_stop(app);
     sub_rec_listen_stop(app); // returns immediately when state == Idle (CLAUDE.md crash rule 5)
     if(app->state == SubRecStateSending) {
         sub_rec_tx_stop(app);

@@ -258,6 +258,109 @@ void sub_rec_listen_stop(SubRecApp* app) {
     sub_rec_set_state(app, SubRecStateIdle, false);
 }
 
+/* ----------------------------- frequency scan --------------------------- */
+
+// GUI thread only; mirrors sub_rec_listen_start()'s opening, but no
+// set_frequency here -- the sweep sets it per step in sub_rec_scan_step().
+void sub_rec_scan_start(SubRecApp* app) {
+    if(app->state != SubRecStateIdle) return;
+
+    app->gen++;
+
+    subghz_devices_reset(app->device);
+    subghz_devices_idle(app->device);
+    subghz_devices_load_preset(app->device, sub_rec_mods[app->mod_idx].preset, NULL);
+
+    app->scan_idx = 0;
+    // Locks the frequency already selected, not entry 0, if OK is pressed
+    // before the first sweep completes.
+    app->scan_peak = app->freq_idx;
+    app->scan_peak_dbm = (int8_t)RSSI_FLOOR_DBM;
+    sub_rec_reset_scan(app);
+
+    furi_timer_start(app->rssi_timer, furi_ms_to_ticks(RSSI_POLL_MS));
+    sub_rec_set_state(app, SubRecStateScanning, false);
+}
+
+// Guard matters: sub_rec_app_free() calls this unconditionally, matching how
+// sub_rec_listen_stop()'s guard is already documented as load-bearing.
+//
+// Never calls subghz_devices_stop_async_rx() here. Verified from firmware
+// source this session: subghz_devices_set_rx maps to furi_hal_subghz_rx(),
+// which only strobes SRX and waits for CC1101StateRX -- it does not touch
+// the driver's own furi_hal_subghz.state, which only start_async_rx/_tx
+// move off SubGhzStateIdle. stop_async_rx would therefore furi_check, and
+// subghz_devices_sleep() in sub_rec_radio_free() stays legal precisely
+// because the state var never moved.
+void sub_rec_scan_stop(SubRecApp* app) {
+    if(app->state != SubRecStateScanning) return;
+
+    furi_timer_stop(app->rssi_timer);
+    subghz_devices_idle(app->device);
+    app->gen++;
+    sub_rec_set_state(app, SubRecStateIdle, false);
+}
+
+// One entry per call. The idle -> set_frequency -> rx order is not free
+// choice: furi_hal_subghz_set_frequency() runs cc1101_calibrate() and
+// furi_checks that the chip reaches CC1101StateIDLE, so the idle strobe
+// must precede it -- the same order the stock analyzer worker uses.
+void sub_rec_scan_step(SubRecApp* app) {
+    uint8_t i = app->scan_idx;
+    uint32_t f = sub_rec_freqs[i];
+    int8_t dbm = (int8_t)RSSI_FLOOR_DBM;
+
+    // CLAUDE.md crash rule 3: subghz_devices_set_frequency() furi_crashes on
+    // an invalid frequency (cc1101_int_interconnect.c calls furi_crash inside
+    // its own validity check before delegating to
+    // furi_hal_subghz_set_frequency_and_path). Every entry in the table is
+    // valid today; an entry that stops being valid stays at the floor instead
+    // of taking the device down.
+    if(subghz_devices_is_frequency_valid(app->device, f)) {
+        subghz_devices_idle(app->device);
+        subghz_devices_set_frequency(app->device, f);
+        subghz_devices_flush_rx(app->device);
+        subghz_devices_set_rx(app->device);
+        furi_delay_ms(SCAN_SETTLE_MS);
+        float r = subghz_devices_get_rssi(app->device);
+        if(r < -128.0f) r = -128.0f; // int8_t range
+        if(r > 0.0f) r = 0.0f;
+        dbm = (int8_t)r;
+    } else {
+        // Should not happen with the current table -- logged so a future
+        // table edit that breaks this surfaces here instead of as a silent
+        // dead bar on screen.
+        FURI_LOG_W(TAG, "scan: table entry %lu Hz rejected as invalid", (unsigned long)f);
+    }
+
+    if(dbm > app->scan_peak_dbm) {
+        app->scan_peak_dbm = dbm;
+        app->scan_peak = i;
+    }
+
+    uint8_t next = (uint8_t)((i + 1) % COUNT_OF(sub_rec_freqs));
+    bool wrapped = (next == 0);
+    // Repaint once per completed sweep (~2.4 Hz), never per step: 40 Hz of
+    // with_view_model(..., true) is the load this app already refuses to put
+    // on the GUI thread -- see sub_rec_handle_rssi_tick()'s decimation.
+    sub_rec_set_scan(app, i, dbm, app->scan_peak, wrapped);
+    app->scan_idx = next;
+    if(wrapped) {
+        FURI_LOG_D(
+            TAG,
+            "scan peak %lu Hz %d dBm",
+            (unsigned long)sub_rec_freqs[app->scan_peak],
+            (int)app->scan_peak_dbm);
+        // Dropping the threshold to the floor means the next sweep's first
+        // above-floor entry claims scan_peak, so the peak is RECOMPUTED every
+        // sweep that sees any signal -- this is not a running maximum across
+        // sweeps. The index only carries over when an entire sweep reads
+        // exactly the floor (dead air), which is what stops the readout
+        // blanking between bursts.
+        app->scan_peak_dbm = (int8_t)RSSI_FLOOR_DBM;
+    }
+}
+
 /* --------------------------------- replay ------------------------------ */
 
 // Async TX is definitely running -- called from the TxPoll handler on normal
