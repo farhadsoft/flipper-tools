@@ -32,6 +32,11 @@
 // one is sized from this instead of an arbitrary number -- SubRecModel
 // truncates anything longer anyway.
 #define REC_TEXT_LINE_MAX 32
+
+// Longest capture label (the "Note:" key appended inside a .sub; see A1 in
+// the feature plan). Independent of REC_TEXT_LINE_MAX: a label is content,
+// not a status/notice line.
+#define REC_NOTE_MAX 32
 // storage_dir_read() truncates into a too-small buffer, and a truncated name
 // builds a path that does not exist -- storage_simply_remove() returns true
 // for an already-absent item (storage.h), so a truncated name would be
@@ -128,6 +133,7 @@ typedef enum {
     SubRecEventScanLock,
     SubRecEventFileAnalyze,
     SubRecEventAnalyzePage,
+    SubRecEventFileLabel,
 } SubRecCustomEvent;
 
 typedef enum {
@@ -182,6 +188,7 @@ typedef struct {
     uint32_t bit; // decoded bit count; 0 == not a decoded file, nothing to draw
     char key[ANA_KEY_MAX]; // Key as hex, only the bytes `bit` covers
     uint8_t wave[WAVE_COLS]; // 0/1 level per column
+    char note[REC_NOTE_MAX]; // "" == no Note key
 } SubRecAnalysis;
 
 typedef struct {
@@ -253,6 +260,7 @@ typedef struct {
     FuriString* capture_path;
     FuriString* selected_path;
     char rename_buf[REC_STEM_MAX];
+    char note_buf[REC_NOTE_MAX]; // selected file's Note; the TextInput edits this in place
 
     bool ethics_shown;
     // Written on the SubGhzWorker thread (sub_rec_decoded_callback), read on

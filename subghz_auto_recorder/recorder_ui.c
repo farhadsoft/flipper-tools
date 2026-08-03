@@ -167,10 +167,17 @@ static void draw_analyzing(Canvas* canvas, const SubRecModel* m) {
         draw_centered_fit(canvas, 24, buf, 124);
         snprintf(buf, sizeof(buf), "Proto: %s", m->ana.proto);
         draw_centered_fit(canvas, 34, buf, 124);
-        snprintf(buf, sizeof(buf), "Samples: %lu", (unsigned long)m->ana.samples);
+        snprintf(
+            buf,
+            sizeof(buf),
+            "%lu spl  %lu B",
+            (unsigned long)m->ana.samples,
+            (unsigned long)m->ana.bytes);
         draw_centered_fit(canvas, 44, buf, 124);
-        snprintf(buf, sizeof(buf), "Size: %lu B", (unsigned long)m->ana.bytes);
-        draw_centered_fit(canvas, 54, buf, 124);
+        if(m->ana.note[0]) {
+            snprintf(buf, sizeof(buf), "\"%s\"", m->ana.note);
+            draw_centered_fit(canvas, 54, buf, 124);
+        }
         if(m->ana.bit) {
             snprintf(buf, sizeof(buf), "Bit: %lu  Key: %s", (unsigned long)m->ana.bit, m->ana.key);
             draw_centered_fit(canvas, 63, buf, 124);

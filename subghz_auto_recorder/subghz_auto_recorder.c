@@ -283,6 +283,24 @@ static void sub_rec_handle_scan_lock(SubRecApp* app) {
     sub_rec_handle_menu_listen(app); // carries the one-time ethics gate
 }
 
+// GUI thread. Fills app->note_buf from the selected file's Note key; "" when
+// the key is absent or the file is unreadable. Buffered handle: the Note is
+// the LAST line, so the scan walks the whole RAW payload.
+static void sub_rec_read_note(SubRecApp* app) {
+    app->note_buf[0] = '\0';
+    if(furi_string_size(app->selected_path) == 0) return;
+    FlipperFormat* ff = flipper_format_buffered_file_alloc(app->storage);
+    FuriString* tmp = furi_string_alloc();
+    if(flipper_format_buffered_file_open_existing(ff, furi_string_get_cstr(app->selected_path))) {
+        flipper_format_rewind(ff);
+        if(flipper_format_read_string(ff, "Note", tmp)) {
+            snprintf(app->note_buf, sizeof(app->note_buf), "%s", furi_string_get_cstr(tmp));
+        }
+    }
+    flipper_format_free(ff);
+    furi_string_free(tmp);
+}
+
 // GUI thread only. dialog_file_browser_show() blocks this thread until the
 // user picks or cancels, so every periodic poster must be stopped first
 // (CLAUDE.md invariant 6): an 80 ms-class tick left running fills the
@@ -313,6 +331,7 @@ static void sub_rec_do_browse(SubRecApp* app) {
     furi_string_set(app->selected_path, path);
     furi_string_free(path);
     app->rc_warned = false; // cleared whenever a file is (re)picked
+    sub_rec_read_note(app); // populate the Label row's buffer for this pick
 
     const char* full = furi_string_get_cstr(app->selected_path);
     const char* base = strrchr(full, '/');
@@ -337,6 +356,7 @@ static void sub_rec_do_delete(SubRecApp* app) {
     // Clear the selection and the warning flag so nothing can act on a file
     // that no longer exists.
     furi_string_reset(app->selected_path);
+    app->note_buf[0] = '\0';
     app->rc_warned = false;
 
     sub_rec_show_notice(app, "Deleted", name, "", SubRecViewMenu, 0);
@@ -426,6 +446,7 @@ static void sub_rec_clear_all(SubRecApp* app) {
     // Nothing may act on a file that no longer exists -- same reset
     // sub_rec_do_delete() performs.
     furi_string_reset(app->selected_path);
+    app->note_buf[0] = '\0';
     app->rc_warned = false;
 
     char line[REC_TEXT_LINE_MAX];
@@ -571,6 +592,10 @@ static bool sub_rec_analyze_load(SubRecApp* app) {
             snprintf(a.proto, sizeof(a.proto), "?");
         }
 
+        // Read at pick time (sub_rec_do_browse); Analyze is only reachable
+        // from a pick, so this costs no extra file scan.
+        snprintf(a.note, sizeof(a.note), "%s", app->note_buf);
+
         // Decoded files carry Bit + an 8-byte big-endian Key
         // (subghz_block_generic_serialize); RAW captures carry neither, so both
         // are optional and a.bit == 0 means "do not draw the line".
@@ -682,6 +707,59 @@ static void sub_rec_do_rename_start(SubRecApp* app) {
     text_input_set_header_text(app->text, "New name");
     text_input_set_result_callback(
         app->text, sub_rec_rename_result, app, app->rename_buf, sizeof(app->rename_buf), false);
+    sub_rec_switch_view(app, SubRecViewText);
+}
+
+// Write side of the Label row -- TextInput result callback. Three branches,
+// all documented FlipperFormat primitives (no reliance on insert_or_update's
+// undocumented insert position).
+static void sub_rec_label_result(void* context) {
+    SubRecApp* app = context;
+    const char* path = furi_string_get_cstr(app->selected_path);
+    bool empty = (app->note_buf[0] == '\0');
+    bool ok = false;
+
+    FlipperFormat* ff = flipper_format_file_alloc(app->storage);
+    if(flipper_format_file_open_existing(ff, path)) {
+        flipper_format_rewind(ff);
+        bool exists = flipper_format_key_exist(ff, "Note");
+        flipper_format_rewind(ff);
+        if(exists && empty) {
+            ok = flipper_format_delete_key(ff, "Note");
+        } else if(exists) {
+            // In place: Note is already the last line, so the rewritten tail
+            // is empty and the line stays after every RAW_Data.
+            ok = flipper_format_update_string_cstr(ff, "Note", app->note_buf);
+        } else if(empty) {
+            ok = true; // nothing to clear
+        } else {
+            // MUST land after the last RAW_Data line: subghz_file_encoder_worker
+            // stops at the first line that isn't "RAW_Data: ..." once it has
+            // started reading data, so a Note before EOF would truncate replay.
+            // write_empty_line() first guarantees the append starts on a fresh
+            // line even for a foreign .sub with no trailing newline; at most
+            // one blank line is ever added.
+            ok = flipper_format_seek_to_end(ff) && flipper_format_write_empty_line(ff) &&
+                 flipper_format_write_string_cstr(ff, "Note", app->note_buf);
+        }
+    }
+    flipper_format_free(ff);
+
+    if(!ok) {
+        FURI_LOG_E(TAG, "label: write failed: %s", path);
+        sub_rec_read_note(app); // re-sync the buffer with what is on disk
+        sub_rec_show_notice(app, "Label failed", "", "", SubRecViewFileMenu, 0);
+        return;
+    }
+    FURI_LOG_I(TAG, "label: \"%s\" -> %s", app->note_buf, path);
+    sub_rec_show_notice(
+        app, empty ? "Label cleared" : "Label saved", app->note_buf, "", SubRecViewFileMenu, 0);
+}
+
+static void sub_rec_do_label_start(SubRecApp* app) {
+    text_input_set_header_text(app->text, "Label");
+    text_input_set_result_callback(
+        app->text, sub_rec_label_result, app, app->note_buf, sizeof(app->note_buf), false);
     sub_rec_switch_view(app, SubRecViewText);
 }
 
@@ -964,6 +1042,9 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
     case SubRecEventFileRename:
         sub_rec_do_rename_start(app);
         return true;
+    case SubRecEventFileLabel:
+        sub_rec_do_label_start(app);
+        return true;
     case SubRecEventFileBack:
         sub_rec_switch_view(app, SubRecViewMenu);
         return true;
@@ -1027,6 +1108,7 @@ static SubRecApp* sub_rec_app_alloc(void) {
         app->view_dispatcher, SubRecViewFileMenu, submenu_get_view(app->file_menu));
     submenu_add_item(app->file_menu, "Replay", SubRecEventFileReplay, sub_rec_menu_callback, app);
     submenu_add_item(app->file_menu, "Analyze", SubRecEventFileAnalyze, sub_rec_menu_callback, app);
+    submenu_add_item(app->file_menu, "Label", SubRecEventFileLabel, sub_rec_menu_callback, app);
     submenu_add_item(app->file_menu, "Rename", SubRecEventFileRename, sub_rec_menu_callback, app);
     submenu_add_item(app->file_menu, "Delete", SubRecEventFileDelete, sub_rec_menu_callback, app);
     submenu_add_item(app->file_menu, "Back", SubRecEventFileBack, sub_rec_menu_callback, app);
