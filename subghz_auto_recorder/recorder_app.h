@@ -23,6 +23,13 @@
 
 #define REC_DIR     EXT_PATH("subghz/auto_rec")
 #define REC_DIR_REL "auto_rec" // relative to SUBGHZ_RAW_FOLDER; see recorder_radio.c
+// storage_simply_mkdir() creates ONE level, so both are needed (same reason
+// sub_rec_ensure_dir() exists for REC_DIR).
+#define REC_CONF_ROOT    EXT_PATH("apps_data")
+#define REC_CONF_DIR     EXT_PATH("apps_data/subghz_auto_recorder")
+#define REC_CONF_PATH    REC_CONF_DIR "/settings.conf"
+#define REC_CONF_TYPE    "SubGhz Auto Recorder settings"
+#define REC_CONF_VERSION 1
 #define REC_STEM_MAX 48
 // Longest path this app builds: REC_DIR "/" <stem> "_RC_D.sub" (the decoded
 // sidecar of a rolling-code capture). EXT_PATH() is a string-literal concat, so

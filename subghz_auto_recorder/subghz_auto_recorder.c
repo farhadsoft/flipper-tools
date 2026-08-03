@@ -261,25 +261,39 @@ static void sub_rec_handle_menu_scan(SubRecApp* app) {
     sub_rec_scan_start(app);
 }
 
-static void sub_rec_handle_scan_lock(SubRecApp* app) {
-    if(app->state != SubRecStateScanning) return;
-    uint8_t idx = app->scan_peak;
-    sub_rec_scan_stop(app); // must reach SubRecStateIdle before listen_start's guard
-    app->freq_idx = idx;
-    app->custom_freq = 0;
-    // The VariableItemList is built once in sub_rec_app_alloc() and
-    // variable_item_set_current_value_index() does not fire the change
-    // callback, so the Frequency row's text is set by hand -- same two-call
-    // idiom as sub_rec_freq_number_result().
+// Sole writer of freq_idx/custom_freq outside the Frequency row's own change
+// callback. Re-syncs the row by hand: variable_item_set_current_value_index()
+// does not fire the change callback.
+static void sub_rec_set_frequency(SubRecApp* app, uint32_t freq) {
+    uint8_t idx = (uint8_t)COUNT_OF(sub_rec_freqs); // the "Custom" slot
+    for(size_t i = 0; i < COUNT_OF(sub_rec_freqs); i++) {
+        if(sub_rec_freqs[i] == freq) {
+            idx = (uint8_t)i;
+            break;
+        }
+    }
+    if(idx < COUNT_OF(sub_rec_freqs)) {
+        app->freq_idx = idx;
+        app->custom_freq = 0;
+    } else {
+        app->custom_freq = freq;
+    }
     variable_item_set_current_value_index(app->freq_item, idx);
     char buf[16];
     snprintf(
         buf,
         sizeof(buf),
         "%lu.%02lu MHz",
-        (unsigned long)(sub_rec_freqs[idx] / 1000000),
-        (unsigned long)(sub_rec_freqs[idx] / 10000 % 100));
+        (unsigned long)(freq / 1000000),
+        (unsigned long)(freq / 10000 % 100));
     variable_item_set_current_value_text(app->freq_item, buf);
+}
+
+static void sub_rec_handle_scan_lock(SubRecApp* app) {
+    if(app->state != SubRecStateScanning) return;
+    uint8_t idx = app->scan_peak;
+    sub_rec_scan_stop(app); // must reach SubRecStateIdle before listen_start's guard
+    sub_rec_set_frequency(app, sub_rec_freqs[idx]);
     sub_rec_handle_menu_listen(app); // carries the one-time ethics gate
 }
 
@@ -881,16 +895,7 @@ static void sub_rec_freq_number_result(void* context, int32_t number) {
         return;
     }
 
-    app->custom_freq = freq;
-    variable_item_set_current_value_index(app->freq_item, (uint8_t)COUNT_OF(sub_rec_freqs));
-    char buf[16];
-    snprintf(
-        buf,
-        sizeof(buf),
-        "%lu.%02lu MHz",
-        (unsigned long)(freq / 1000000),
-        (unsigned long)(freq / 10000 % 100));
-    variable_item_set_current_value_text(app->freq_item, buf);
+    sub_rec_set_frequency(app, freq);
     sub_rec_switch_view(app, SubRecViewSettings);
 }
 
@@ -937,13 +942,15 @@ static void sub_rec_build_settings(SubRecApp* app) {
 
     item = variable_item_list_add(
         app->settings, "Frequency", (uint8_t)(COUNT_OF(sub_rec_freqs) + 1), sub_rec_freq_changed, app);
-    variable_item_set_current_value_index(item, app->freq_idx);
+    uint32_t f = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
+    uint8_t fidx = app->custom_freq ? (uint8_t)COUNT_OF(sub_rec_freqs) : app->freq_idx;
+    variable_item_set_current_value_index(item, fidx);
     snprintf(
         buf,
         sizeof(buf),
         "%lu.%02lu MHz",
-        (unsigned long)(sub_rec_freqs[app->freq_idx] / 1000000),
-        (unsigned long)(sub_rec_freqs[app->freq_idx] / 10000 % 100));
+        (unsigned long)(f / 1000000),
+        (unsigned long)(f / 10000 % 100));
     variable_item_set_current_value_text(item, buf);
     app->freq_item = item;
 
@@ -1163,6 +1170,63 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
     }
 }
 
+// GUI thread, once, from sub_rec_app_alloc() AFTER sub_rec_radio_alloc()
+// (needs app->device for the frequency check) and BEFORE
+// sub_rec_build_settings() (which seeds the rows from these fields).
+// Every field is independent: a missing or out-of-range value keeps the
+// compiled-in default instead of failing the whole load.
+static void sub_rec_config_load(SubRecApp* app) {
+    FlipperFormat* ff = flipper_format_file_alloc(app->storage);
+    FuriString* type = furi_string_alloc();
+    uint32_t ver = 0, v = 0;
+    if(flipper_format_file_open_existing(ff, REC_CONF_PATH) &&
+       flipper_format_read_header(ff, type, &ver) &&
+       furi_string_cmp_str(type, REC_CONF_TYPE) == 0 && ver == REC_CONF_VERSION) {
+        flipper_format_rewind(ff);
+        if(flipper_format_read_uint32(ff, "Frequency", &v, 1) &&
+           subghz_devices_is_frequency_valid(app->device, v)) {
+            uint8_t idx = (uint8_t)COUNT_OF(sub_rec_freqs);
+            for(size_t i = 0; i < COUNT_OF(sub_rec_freqs); i++) {
+                if(sub_rec_freqs[i] == v) {
+                    idx = (uint8_t)i;
+                    break;
+                }
+            }
+            if(idx < COUNT_OF(sub_rec_freqs)) app->freq_idx = idx;
+            else app->custom_freq = v;
+        }
+        flipper_format_rewind(ff);
+        if(flipper_format_read_uint32(ff, "Modulation", &v, 1) && v < COUNT_OF(sub_rec_mods))
+            app->mod_idx = (uint8_t)v;
+        flipper_format_rewind(ff);
+        if(flipper_format_read_uint32(ff, "Trigger", &v, 1) && v < COUNT_OF(sub_rec_triggers))
+            app->trigger_idx = (uint8_t)v;
+    } else {
+        FURI_LOG_I(TAG, "config: none or wrong version, using defaults");
+    }
+    flipper_format_free(ff);
+    furi_string_free(type);
+}
+
+// GUI thread. Rewrites the whole file -- it is a few hundred bytes, so there
+// is no in-place update path to keep correct.
+static void sub_rec_config_save(SubRecApp* app) {
+    storage_simply_mkdir(app->storage, REC_CONF_ROOT);
+    storage_simply_mkdir(app->storage, REC_CONF_DIR);
+    FlipperFormat* ff = flipper_format_file_alloc(app->storage);
+    bool ok = false;
+    if(flipper_format_file_open_always(ff, REC_CONF_PATH)) {
+        uint32_t freq = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
+        uint32_t mod = app->mod_idx, trig = app->trigger_idx;
+        ok = flipper_format_write_header_cstr(ff, REC_CONF_TYPE, REC_CONF_VERSION) &&
+             flipper_format_write_uint32(ff, "Frequency", &freq, 1) &&
+             flipper_format_write_uint32(ff, "Modulation", &mod, 1) &&
+             flipper_format_write_uint32(ff, "Trigger", &trig, 1);
+    }
+    flipper_format_free(ff);
+    if(!ok) FURI_LOG_E(TAG, "config: save failed: %s", REC_CONF_PATH);
+}
+
 /* ------------------------------- app life ------------------------------ */
 
 static SubRecApp* sub_rec_app_alloc(void) {
@@ -1267,6 +1331,7 @@ static SubRecApp* sub_rec_app_alloc(void) {
     app->last_above = false;
 
     sub_rec_radio_alloc(app);
+    sub_rec_config_load(app);
     sub_rec_build_settings(app);
 
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
@@ -1315,6 +1380,7 @@ static void sub_rec_app_free(SubRecApp* app) {
     furi_string_free(app->selected_path);
     furi_string_free(app->preset.base.name);
 
+    sub_rec_config_save(app);
     furi_record_close(RECORD_STORAGE);
     view_dispatcher_free(app->view_dispatcher);
     furi_record_close(RECORD_GUI);
