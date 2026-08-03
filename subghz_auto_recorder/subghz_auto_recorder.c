@@ -202,19 +202,29 @@ static void sub_rec_handle_rssi_tick(SubRecApp* app) {
 // Clears the notice overlay on both the app field and the model together --
 // factored out so the two call sites (natural timeout, and Back dismissing
 // it early) cannot drift out of sync with each other.
+//
+// The gen bump retires a SubRecEventNoticeDone the one-shot timer may have
+// already posted: furi_timer_stop() cannot retract an event whose callback
+// has run, so without it a Back pressed at ~NOTICE_MS is overtaken by that
+// queued event, which then fires the chained action the user just cancelled
+// -- for the rolling-code gate, an unwanted transmit. Clearing notice_next
+// is the second half of the same cancel.
 static void sub_rec_clear_notice(SubRecApp* app) {
+    app->gen++;
     app->notice_active = false;
+    app->notice_next = 0;
     sub_rec_set_notice(app, "", "", "", false);
 }
 
 static void sub_rec_handle_notice_done(SubRecApp* app) {
+    SubRecCustomEvent next = app->notice_next;        // captured: clear resets it
+    SubRecView return_view = app->notice_return_view; // captured for the same reason
     sub_rec_clear_notice(app);
-    if(app->notice_next != 0) {
-        SubRecCustomEvent next = app->notice_next;
-        app->notice_next = 0;
+    if(next != 0) {
+        // Posted after the clear, so it carries the bumped gen.
         view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(next, app->gen));
     } else {
-        sub_rec_switch_view(app, app->notice_return_view);
+        sub_rec_switch_view(app, return_view);
     }
 }
 
@@ -280,7 +290,14 @@ static void sub_rec_do_delete(SubRecApp* app) {
     char name[40];
     snprintf(name, sizeof(name), "%s", base ? base + 1 : path);
 
-    storage_simply_remove(app->storage, path);
+    // false means a real failure -- storage_simply_remove() also returns true
+    // when the item is already gone (storage.h). Reporting "Deleted" on a
+    // failed remove is a lie the user acts on.
+    if(!storage_simply_remove(app->storage, path)) {
+        FURI_LOG_E(TAG, "delete failed: %s", path);
+        sub_rec_show_notice(app, "Delete failed", name, "", SubRecViewFileMenu, 0);
+        return;
+    }
     // Clear the selection and the warning flag so nothing can act on a file
     // that no longer exists.
     furi_string_reset(app->selected_path);

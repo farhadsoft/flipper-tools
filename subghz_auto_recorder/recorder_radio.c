@@ -18,11 +18,12 @@ static void sub_rec_pair(void* context, bool level, uint32_t duration) {
 // Overrun means the 4096-entry stream buffer filled while the worker thread
 // was not draining it -- the exact failure the capture-open window in
 // sub_rec_capture_begin() could cause. Logged so verification 4b can assert
-// its absence instead of guessing. app->state is read here purely for the
-// message.
+// its absence instead of guessing. Nothing GUI-owned is read here: app->state
+// is written on the GUI thread and is not volatile, and the surrounding
+// "capture saved/dropped" lines already place an overrun in its phase.
 static void sub_rec_overrun(void* context) {
     SubRecApp* app = context;
-    FURI_LOG_W(TAG, "worker overrun (state=%d)", (int)app->state);
+    FURI_LOG_W(TAG, "worker overrun");
     subghz_receiver_reset(app->receiver);
 }
 
@@ -147,7 +148,13 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
     const char* final_name = "";
     bool kept = spl >= MIN_RAW_SAMPLES;
     if(!kept) {
-        storage_simply_remove(app->storage, furi_string_get_cstr(app->capture_path));
+        const char* drop_path = furi_string_get_cstr(app->capture_path);
+        if(!storage_simply_remove(app->storage, drop_path)) {
+            // Still counted as dropped -- the capture is not kept either way.
+            // Logged because the junk file is left behind and nothing else
+            // cleans it up.
+            FURI_LOG_W(TAG, "drop: remove failed: %s", drop_path);
+        }
         app->dropped++;
     } else {
         // The rolling-code flag is only known now, after the burst has been
