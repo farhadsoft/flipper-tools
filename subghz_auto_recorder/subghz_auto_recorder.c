@@ -382,15 +382,53 @@ static bool sub_rec_is_capture(const FileInfo* info, const char* name) {
     return (len > 4) && (strcmp(name + len - 4, ".sub") == 0);
 }
 
+// Name-based classification of everything this app writes:
+//   <stem>.sub / <stem>_RC.sub        RAW capture
+//   <stem>_D.sub / <stem>_RC_D.sub    decoded sidecar
+// Only called for names sub_rec_is_capture() already accepted, so len > 4 and
+// the ".sub" tail are guaranteed.
+static bool sub_rec_match_any(const char* name) {
+    UNUSED(name);
+    return true;
+}
+static bool sub_rec_match_decoded(const char* name) {
+    size_t len = strlen(name);
+    return (len > 6) && (strcmp(name + len - 6, "_D.sub") == 0);
+}
+static bool sub_rec_match_raw(const char* name) {
+    return !sub_rec_match_decoded(name);
+}
+static bool sub_rec_match_rc(const char* name) {
+    return strstr(name, "_RC") != NULL;
+}
+
+typedef struct {
+    const char* row; // Saved-menu row label
+    const char* header; // confirm header, exactly one %lu
+    bool (*match)(const char* name);
+} SubRecClearKind;
+
+#define REC_CLEAR_ALL 0
+#define REC_CLEAR_RAW 1
+#define REC_CLEAR_DEC 2
+#define REC_CLEAR_RC  3
+
+static const SubRecClearKind sub_rec_clear_kinds[] = {
+    {"Clear all", "Delete %lu files?", sub_rec_match_any},
+    {"Delete RAW", "Delete %lu RAW?", sub_rec_match_raw},
+    {"Delete decoded", "Delete %lu decoded?", sub_rec_match_decoded},
+    {"Delete _RC", "Delete %lu _RC?", sub_rec_match_rc},
+};
+
 // Counts .sub files directly in REC_DIR. No recursion, no other subghz folder.
-static uint32_t sub_rec_count_captures(SubRecApp* app) {
+static uint32_t sub_rec_count_captures(SubRecApp* app, bool (*match)(const char*)) {
     uint32_t n = 0;
     File* dir = storage_file_alloc(app->storage);
     if(storage_dir_open(dir, REC_DIR)) {
         FileInfo info;
         char name[REC_NAME_MAX];
         while(storage_dir_read(dir, &info, name, sizeof(name))) {
-            if(sub_rec_is_capture(&info, name)) n++;
+            if(sub_rec_is_capture(&info, name) && match(name)) n++;
         }
     }
     // storage_dir_open() docs (storage.h): storage_dir_close() must be
@@ -402,7 +440,8 @@ static uint32_t sub_rec_count_captures(SubRecApp* app) {
 
 // One enumeration pass. Removes every .sub file directly in REC_DIR that it
 // can, returns how many it removed, and adds removal failures to *failed.
-static uint32_t sub_rec_clear_pass(SubRecApp* app, uint32_t* failed) {
+static uint32_t
+    sub_rec_clear_pass(SubRecApp* app, bool (*match)(const char*), uint32_t* failed) {
     uint32_t removed = 0;
     File* dir = storage_file_alloc(app->storage);
     if(storage_dir_open(dir, REC_DIR)) {
@@ -411,6 +450,7 @@ static uint32_t sub_rec_clear_pass(SubRecApp* app, uint32_t* failed) {
         char path[sizeof(REC_DIR) + 1 + REC_NAME_MAX];
         while(storage_dir_read(dir, &info, name, sizeof(name))) {
             if(!sub_rec_is_capture(&info, name)) continue;
+            if(!match(name)) continue;
             snprintf(path, sizeof(path), "%s/%s", REC_DIR, name);
             // Same check sub_rec_do_delete() uses: false is a real failure --
             // storage_simply_remove() also returns true when the item is
@@ -419,7 +459,7 @@ static uint32_t sub_rec_clear_pass(SubRecApp* app, uint32_t* failed) {
             if(storage_simply_remove(app->storage, path)) {
                 removed++;
             } else {
-                FURI_LOG_E(TAG, "clear all: remove failed: %s", path);
+                FURI_LOG_E(TAG, "clear: remove failed: %s", path);
                 (*failed)++;
             }
         }
@@ -435,10 +475,11 @@ static uint32_t sub_rec_clear_pass(SubRecApp* app, uint32_t* failed) {
 // status view to the main menu runs sub_rec_listen_stop() or
 // sub_rec_scan_stop(), so app->state is Idle here and no capture can be
 // writing into REC_DIR underneath this.
-static void sub_rec_clear_all(SubRecApp* app) {
+static void sub_rec_clear_run(SubRecApp* app) {
+    bool (*match)(const char*) = sub_rec_clear_kinds[app->clear_kind].match;
     uint32_t deleted = 0, failed = 0;
     for(uint32_t pass = 0; pass < REC_CLEAR_MAX_PASSES; pass++) {
-        uint32_t n = sub_rec_clear_pass(app, &failed);
+        uint32_t n = sub_rec_clear_pass(app, match, &failed);
         if(n == 0) break;
         deleted += n;
     }
@@ -460,13 +501,15 @@ static void sub_rec_clear_all(SubRecApp* app) {
     } else {
         snprintf(line, sizeof(line), "%lu deleted", (unsigned long)deleted);
     }
-    FURI_LOG_I(TAG, "clear all: %s", line);
+    FURI_LOG_I(TAG, "clear: %s", line);
     sub_rec_show_notice(app, failed ? "Clear failed" : "Cleared", line, "", SubRecViewMenu, 0);
 }
 
-static void sub_rec_clear_all_start(SubRecApp* app) {
-    uint32_t n = sub_rec_count_captures(app);
-    FURI_LOG_I(TAG, "clear all: %lu captures", (unsigned long)n);
+static void sub_rec_clear_start(SubRecApp* app, uint8_t kind) {
+    app->clear_kind = kind;
+    const SubRecClearKind* k = &sub_rec_clear_kinds[kind];
+    uint32_t n = sub_rec_count_captures(app, k->match);
+    FURI_LOG_I(TAG, "clear: %lu matching \"%s\"", (unsigned long)n, k->row);
     if(n == 0) {
         sub_rec_show_notice(app, "No captures", "nothing to clear", "", SubRecViewSaved, 0);
         return;
@@ -475,7 +518,7 @@ static void sub_rec_clear_all_start(SubRecApp* app) {
     // The Submenu header is drawn with FontPrimary and is never truncated, so
     // this must stay short: 16-17 chars for any realistic count.
     char header[REC_TEXT_LINE_MAX];
-    snprintf(header, sizeof(header), "Delete %lu files?", (unsigned long)n);
+    snprintf(header, sizeof(header), k->header, (unsigned long)n);
     submenu_set_header(app->confirm_menu, header);
     // Cancel is row 0 and the cursor is forced onto it on every entry: a
     // reflexive second OK must cancel, never wipe. This is the safety
@@ -1052,13 +1095,22 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
         sub_rec_do_browse(app);
         return true;
     case SubRecEventSavedClearAll:
-        sub_rec_clear_all_start(app);
+        sub_rec_clear_start(app, REC_CLEAR_ALL);
+        return true;
+    case SubRecEventSavedClearRaw:
+        sub_rec_clear_start(app, REC_CLEAR_RAW);
+        return true;
+    case SubRecEventSavedClearDecoded:
+        sub_rec_clear_start(app, REC_CLEAR_DEC);
+        return true;
+    case SubRecEventSavedClearRc:
+        sub_rec_clear_start(app, REC_CLEAR_RC);
         return true;
     case SubRecEventSavedBack:
         sub_rec_switch_view(app, SubRecViewMenu);
         return true;
     case SubRecEventConfirmYes:
-        sub_rec_clear_all(app);
+        sub_rec_clear_run(app);
         return true;
     case SubRecEventConfirmNo:
         sub_rec_show_saved_menu(app);
@@ -1121,6 +1173,16 @@ static SubRecApp* sub_rec_app_alloc(void) {
         app->saved_menu, "Browse files", SubRecEventSavedBrowse, sub_rec_menu_callback, app);
     submenu_add_item(
         app->saved_menu, "Clear all", SubRecEventSavedClearAll, sub_rec_menu_callback, app);
+    submenu_add_item(
+        app->saved_menu, "Delete RAW", SubRecEventSavedClearRaw, sub_rec_menu_callback, app);
+    submenu_add_item(
+        app->saved_menu,
+        "Delete decoded",
+        SubRecEventSavedClearDecoded,
+        sub_rec_menu_callback,
+        app);
+    submenu_add_item(
+        app->saved_menu, "Delete _RC", SubRecEventSavedClearRc, sub_rec_menu_callback, app);
     submenu_add_item(app->saved_menu, "Back", SubRecEventSavedBack, sub_rec_menu_callback, app);
 
     app->confirm_menu = submenu_alloc();
@@ -1130,7 +1192,7 @@ static SubRecApp* sub_rec_app_alloc(void) {
     submenu_add_item(
         app->confirm_menu, "Cancel", SubRecEventConfirmNo, sub_rec_menu_callback, app);
     submenu_add_item(
-        app->confirm_menu, "Delete all", SubRecEventConfirmYes, sub_rec_menu_callback, app);
+        app->confirm_menu, "Delete", SubRecEventConfirmYes, sub_rec_menu_callback, app);
 
     app->settings = variable_item_list_alloc();
     view_dispatcher_add_view(

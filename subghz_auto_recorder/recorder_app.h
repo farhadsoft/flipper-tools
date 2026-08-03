@@ -134,6 +134,9 @@ typedef enum {
     SubRecEventFileAnalyze,
     SubRecEventAnalyzePage,
     SubRecEventFileLabel,
+    SubRecEventSavedClearRaw,
+    SubRecEventSavedClearDecoded,
+    SubRecEventSavedClearRc,
 } SubRecCustomEvent;
 
 typedef enum {
@@ -283,6 +286,7 @@ typedef struct {
     SubRecState last_state;
     uint32_t tick_count; // redraw decimation
     bool rc_warned; // per selected file; cleared on (re)pick and on delete
+    uint8_t clear_kind; // index into sub_rec_clear_kinds[], set when the confirm opens
 
     uint32_t capture_start_tick;
     uint32_t last_above_tick;
