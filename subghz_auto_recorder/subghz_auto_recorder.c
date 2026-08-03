@@ -587,9 +587,16 @@ static void sub_rec_handle_stats(SubRecApp* app) {
 // and it is what lets a line of any length be read without a fixed 512-int32
 // buffer. A short fixed-size flipper_format_read_int32() would silently drop the
 // rest of every line -- the same class of bug as the UCR EMV AID load-back.
-static uint32_t sub_rec_raw_totals(FlipperFormat* ff, FuriString* tmp, uint32_t* total_us) {
+static uint32_t sub_rec_raw_totals(
+    FlipperFormat* ff,
+    FuriString* tmp,
+    uint32_t* total_us,
+    uint32_t* first_hi_us,
+    uint32_t* last_hi_us) {
     uint32_t n = 0;
     uint32_t sum = 0;
+    *first_hi_us = UINT32_MAX; // no high sample seen yet
+    *last_hi_us = 0;
     while(flipper_format_read_string(ff, "RAW_Data", tmp)) {
         char* p = (char*)furi_string_get_cstr(tmp);
         int32_t v;
@@ -599,7 +606,15 @@ static uint32_t sub_rec_raw_totals(FlipperFormat* ff, FuriString* tmp, uint32_t*
             // but cannot crash -- unsigned wrap is defined and both zero-guards still
             // hold. Switch to uint64_t only if a real file ever overflows.
             // -(int64_t)v, never -v: negating INT32_MIN as int32_t is UB.
-            sum += (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+            uint32_t d = (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+            // `sum` is still the offset BEFORE this sample -- read it here, add
+            // afterwards. 0 is the encoder's reset marker, so only v > 0 counts
+            // as signal.
+            if(v > 0) {
+                if(*first_hi_us == UINT32_MAX) *first_hi_us = sum;
+                *last_hi_us = sum + d;
+            }
+            sum += d;
             n++;
         }
     }
@@ -610,9 +625,14 @@ static uint32_t sub_rec_raw_totals(FlipperFormat* ff, FuriString* tmp, uint32_t*
 // Second walk, with the total duration known: one 0/1 level per screen column,
 // sampled at the column's time midpoint. Pulses narrower than col_us alias --
 // this shows burst shape, not measurement-grade edges.
-static void sub_rec_raw_wave(FlipperFormat* ff, FuriString* tmp, uint32_t col_us, uint8_t* wave) {
+static void sub_rec_raw_wave(
+    FlipperFormat* ff,
+    FuriString* tmp,
+    uint32_t win_start_us,
+    uint32_t col_us,
+    uint8_t* wave) {
     uint32_t t = 0; // start time of the current sample
-    uint32_t mid = col_us / 2; // midpoint of the next unfilled column
+    uint32_t mid = win_start_us + col_us / 2; // midpoint of the first window column
     uint16_t col = 0;
     uint8_t level = 0; // silence before the first edge
 
@@ -707,14 +727,38 @@ static bool sub_rec_analyze_load(SubRecApp* app) {
             }
         }
 
+        uint32_t first_hi = 0, last_hi = 0;
         flipper_format_rewind(ff);
-        a.samples = sub_rec_raw_totals(ff, tmp, &a.total_us);
+        a.samples = sub_rec_raw_totals(ff, tmp, &a.total_us, &first_hi, &last_hi);
+
+        // FIT = the signal span with 5% padding, so a short burst inside long
+        // gaps fills the screen instead of collapsing to two columns. No high
+        // sample (or a degenerate span) -> fall back to the whole capture.
+        uint32_t fs = 0, fu = a.total_us;
+        if(first_hi != UINT32_MAX && last_hi > first_hi) {
+            uint32_t span = last_hi - first_hi;
+            uint32_t pad = span / 20;
+            fs = (first_hi > pad) ? (first_hi - pad) : 0;
+            uint32_t fe = last_hi + pad;
+            if(fe > a.total_us) fe = a.total_us;
+            fu = fe - fs;
+        }
+        if(fu == 0) fu = 1;
+        app->ana_total_us = a.total_us;
+        app->ana_fit_start_us = fs;
+        app->ana_fit_us = fu;
+        app->ana_win_start_us = fs;
+        app->ana_win_us = fu;
+        app->ana_zoom = 0;
+        a.win_start_us = fs;
+        a.win_us = fu;
+        a.zoom = 0;
 
         if(a.samples && a.total_us) {
-            uint32_t col_us = a.total_us / WAVE_COLS;
-            if(col_us == 0) col_us = 1; // capture shorter than one column per sample
+            uint32_t col_us = fu / WAVE_COLS;
+            if(col_us == 0) col_us = 1;
             flipper_format_rewind(ff);
-            sub_rec_raw_wave(ff, tmp, col_us, a.wave);
+            sub_rec_raw_wave(ff, tmp, fs, col_us, a.wave);
             a.wave_len = WAVE_COLS;
         }
         // wave_len stays 0 for an empty or zero-duration payload; the waveform
@@ -734,6 +778,70 @@ static bool sub_rec_analyze_load(SubRecApp* app) {
         TAG, "analyze: %lu samples, %lu us", (unsigned long)a.samples, (unsigned long)a.total_us);
     sub_rec_set_analyze(app, &a);
     return true;
+}
+
+// GUI thread. Re-runs pass B only (totals are already cached in the app), so
+// one buffered open plus one RAW_Data scan per keypress -- half the cost of
+// opening Analyze, which scans twice. On failure the old window is kept and a
+// warning is logged; no notice, which would clobber the Analyze screen.
+static void
+    sub_rec_analyze_rewindow(SubRecApp* app, uint32_t start_us, uint32_t win_us, uint8_t zoom) {
+    if(win_us == 0) win_us = 1;
+    if(win_us > app->ana_total_us) win_us = app->ana_total_us ? app->ana_total_us : 1;
+    if(start_us + win_us > app->ana_total_us)
+        start_us = (app->ana_total_us > win_us) ? (app->ana_total_us - win_us) : 0;
+
+    uint8_t wave[WAVE_COLS];
+    memset(wave, 0, sizeof(wave));
+    FlipperFormat* ff = flipper_format_buffered_file_alloc(app->storage);
+    FuriString* tmp = furi_string_alloc();
+    bool ok = false;
+    if(flipper_format_buffered_file_open_existing(ff, furi_string_get_cstr(app->selected_path))) {
+        uint32_t col_us = win_us / WAVE_COLS;
+        if(col_us == 0) col_us = 1;
+        flipper_format_rewind(ff);
+        sub_rec_raw_wave(ff, tmp, start_us, col_us, wave);
+        ok = true;
+    }
+    flipper_format_free(ff);
+    furi_string_free(tmp);
+    if(!ok) {
+        FURI_LOG_W(TAG, "analyze: rewindow failed");
+        return;
+    }
+    app->ana_win_start_us = start_us;
+    app->ana_win_us = win_us;
+    app->ana_zoom = zoom;
+    sub_rec_set_analyze_window(app, start_us, win_us, zoom, wave);
+}
+
+// FIT and ALL are absolute; x2/x4/x8 halve the FIT span and keep the current
+// centre, so zooming in does not jump away from what is on screen.
+static void sub_rec_analyze_zoom(SubRecApp* app) {
+    uint8_t z = (uint8_t)((app->ana_zoom + 1) % REC_ZOOM_STEPS);
+    uint32_t span, start;
+    if(z == REC_ZOOM_ALL) {
+        span = app->ana_total_us ? app->ana_total_us : 1;
+        start = 0;
+    } else if(z == 0) {
+        span = app->ana_fit_us;
+        start = app->ana_fit_start_us;
+    } else {
+        span = app->ana_fit_us >> z;
+        if(span == 0) span = 1;
+        uint32_t centre = app->ana_win_start_us + app->ana_win_us / 2;
+        start = (centre > span / 2) ? (centre - span / 2) : 0;
+    }
+    sub_rec_analyze_rewindow(app, start, span, z);
+}
+
+static void sub_rec_analyze_pan(SubRecApp* app, bool right) {
+    uint32_t step = app->ana_win_us / 2;
+    if(step == 0) step = 1;
+    uint32_t start = app->ana_win_start_us;
+    if(right) start += step;
+    else start = (start > step) ? (start - step) : 0;
+    sub_rec_analyze_rewindow(app, start, app->ana_win_us, app->ana_zoom);
 }
 
 // No ethics gate: analysis is passive inspection of a file the user already has --
@@ -1015,10 +1123,31 @@ static bool sub_rec_status_input_callback(InputEvent* event, void* context) {
         return true;
     }
     if(app->state == SubRecStateAnalyzing) {
-        // Two pages, so direction is irrelevant -- both keys toggle.
-        if(event->key != InputKeyLeft && event->key != InputKeyRight) return false;
-        view_dispatcher_send_custom_event(
-            app->view_dispatcher, EVENT_MAKE(SubRecEventAnalyzePage, app->gen));
+        uint32_t id = 0;
+        if(app->ana_page == 0) {
+            if(event->key == InputKeyLeft || event->key == InputKeyRight ||
+               event->key == InputKeyDown)
+                id = SubRecEventAnalyzePage;
+        } else {
+            switch(event->key) {
+            case InputKeyUp:
+                id = SubRecEventAnalyzePage;
+                break;
+            case InputKeyLeft:
+                id = SubRecEventAnalyzePanL;
+                break;
+            case InputKeyRight:
+                id = SubRecEventAnalyzePanR;
+                break;
+            case InputKeyOk:
+                id = SubRecEventAnalyzeZoom;
+                break;
+            default:
+                break;
+            }
+        }
+        if(id == 0) return false; // Back must keep falling through to the nav callback
+        view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(id, app->gen));
         return true;
     }
     return false;
@@ -1385,6 +1514,15 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
         return true;
     case SubRecEventAnalyzePage:
         sub_rec_set_analyze_page(app, app->ana_page ? 0 : 1);
+        return true;
+    case SubRecEventAnalyzePanL:
+        sub_rec_analyze_pan(app, false);
+        return true;
+    case SubRecEventAnalyzePanR:
+        sub_rec_analyze_pan(app, true);
+        return true;
+    case SubRecEventAnalyzeZoom:
+        sub_rec_analyze_zoom(app);
         return true;
     case SubRecEventFileDelete:
         sub_rec_do_delete(app);

@@ -150,11 +150,13 @@ static void draw_scanning(Canvas* canvas, const SubRecModel* m) {
     draw_centered(canvas, 63, buf);
 }
 
+static const char* const sub_rec_zoom_labels[] = {"FIT", "x2", "x4", "x8", "ALL"};
+
 static void draw_analyzing(Canvas* canvas, const SubRecModel* m) {
     char buf[40];
 
     if(m->ana_page == 0) {
-        draw_title_bar(canvas, "Info  >waveform");
+        draw_title_bar(canvas, "Info  v wave");
         // Same "%lu.%02lu MHz" integer split every other screen in this app uses;
         // no float printf is dragged in.
         snprintf(
@@ -185,7 +187,8 @@ static void draw_analyzing(Canvas* canvas, const SubRecModel* m) {
         return;
     }
 
-    draw_title_bar(canvas, "Waveform  >info");
+    snprintf(buf, sizeof(buf), "Wave %s  ^info", sub_rec_zoom_labels[m->ana.zoom]);
+    draw_title_bar(canvas, buf); // 15 chars at "Wave FIT  ^info", same as before
     if(m->ana.wave_len == 0) {
         draw_centered(canvas, 38, "no samples");
         return;
@@ -196,13 +199,15 @@ static void draw_analyzing(Canvas* canvas, const SubRecModel* m) {
             canvas_draw_line(canvas, WAVE_X0 + c, WAVE_Y_HI, WAVE_X0 + c, WAVE_Y_LO);
         }
     }
+    // Window start + span, in ms -- the zoom label already says how deep.
     snprintf(
         buf,
         sizeof(buf),
-        "%lu spl  %lu.%02lu ms",
-        (unsigned long)m->ana.samples,
-        (unsigned long)(m->ana.total_us / 1000),
-        (unsigned long)(m->ana.total_us % 1000 / 10));
+        "%lu.%02lu +%lu.%02lu ms",
+        (unsigned long)(m->ana.win_start_us / 1000),
+        (unsigned long)(m->ana.win_start_us % 1000 / 10),
+        (unsigned long)(m->ana.win_us / 1000),
+        (unsigned long)(m->ana.win_us % 1000 / 10));
     draw_centered_fit(canvas, 63, buf, 124);
 }
 
@@ -365,4 +370,18 @@ void sub_rec_set_analyze_page(SubRecApp* app, uint8_t page) {
 
 void sub_rec_set_stats(SubRecApp* app, const SubRecStats* s) {
     with_view_model(app->view, SubRecModel * m, { m->stats = *s; }, false);
+}
+
+void sub_rec_set_analyze_window(
+    SubRecApp* app, uint32_t start_us, uint32_t win_us, uint8_t zoom, const uint8_t* wave) {
+    with_view_model(
+        app->view,
+        SubRecModel * m,
+        {
+            m->ana.win_start_us = start_us;
+            m->ana.win_us = win_us;
+            m->ana.zoom = zoom;
+            memcpy(m->ana.wave, wave, WAVE_COLS);
+        },
+        true);
 }

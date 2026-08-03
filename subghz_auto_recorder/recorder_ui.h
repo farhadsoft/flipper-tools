@@ -29,4 +29,8 @@ void sub_rec_set_analyze(SubRecApp* app, const SubRecAnalysis* a);
 // Sole writer of app->ana_page and the model's copy -- same pairing as
 // sub_rec_set_state(). 0 = info, 1 = waveform.
 void sub_rec_set_analyze_page(SubRecApp* app, uint8_t page);
+// Sole writer of the model's window trio (win_start_us/win_us/zoom) and the
+// windowed waveform buffer.
+void sub_rec_set_analyze_window(
+    SubRecApp* app, uint32_t start_us, uint32_t win_us, uint8_t zoom, const uint8_t* wave);
 void sub_rec_set_stats(SubRecApp* app, const SubRecStats* s);

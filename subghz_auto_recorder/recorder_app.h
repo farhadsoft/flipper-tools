@@ -105,6 +105,8 @@
 #define ANA_MOD_MAX   24  // "AM650", or an unrecognised Preset string, truncated
 #define ANA_PROTO_MAX 16
 #define ANA_KEY_MAX 17 // 8 key bytes as hex + NUL
+#define REC_ZOOM_ALL   4 // FIT=0, x2=1, x4=2, x8=3, ALL=4
+#define REC_ZOOM_STEPS 5
 
 // Generation-stamped events -- identical scheme to universal_card_reader
 // (reader_app.h invariant 2). Keep every SubRecCustomEvent value below 256.
@@ -153,6 +155,9 @@ typedef enum {
     SubRecEventSavedStats,
     SubRecEventProfileSave,
     SubRecEventProfilePick,
+    SubRecEventAnalyzePanL,
+    SubRecEventAnalyzePanR,
+    SubRecEventAnalyzeZoom,
     SubRecEventProfileSlot0, // rows use +slot as their submenu index; never dispatched
 } SubRecCustomEvent;
 
@@ -210,6 +215,9 @@ typedef struct {
     char key[ANA_KEY_MAX]; // Key as hex, only the bytes `bit` covers
     uint8_t wave[WAVE_COLS]; // 0/1 level per column
     char note[REC_NOTE_MAX]; // "" == no Note key
+    uint32_t win_start_us; // window shown on the waveform page
+    uint32_t win_us;
+    uint8_t zoom; // 0=FIT 1=x2 2=x4 3=x8 4=ALL
 } SubRecAnalysis;
 
 // Filled by sub_rec_collect_stats() on the GUI thread in one directory pass.
@@ -303,6 +311,16 @@ typedef struct {
     uint8_t scan_peak; // best entry in the sweep in progress
     int8_t scan_peak_dbm; // its RSSI; reset to the floor at each wrap
     uint8_t ana_page; // mirrors the model's copy; sole writer is sub_rec_set_analyze_page()
+    // Analyze window state -- app's own mirror (see freq_item's comment for
+    // why: nothing outside recorder_ui.c reads the model). total/fit are
+    // fixed per loaded file; win_start/win/zoom track the current view and
+    // are the only ones sub_rec_analyze_rewindow() touches per keypress.
+    uint32_t ana_total_us;
+    uint32_t ana_fit_start_us;
+    uint32_t ana_fit_us;
+    uint32_t ana_win_start_us;
+    uint32_t ana_win_us;
+    uint8_t ana_zoom;
 
     uint32_t saved;
     uint32_t dropped;
