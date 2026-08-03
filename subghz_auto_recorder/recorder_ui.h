@@ -29,3 +29,4 @@ void sub_rec_set_analyze(SubRecApp* app, const SubRecAnalysis* a);
 // Sole writer of app->ana_page and the model's copy -- same pairing as
 // sub_rec_set_state(). 0 = info, 1 = waveform.
 void sub_rec_set_analyze_page(SubRecApp* app, uint8_t page);
+void sub_rec_set_stats(SubRecApp* app, const SubRecStats* s);

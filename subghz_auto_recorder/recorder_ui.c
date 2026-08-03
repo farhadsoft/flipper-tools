@@ -206,6 +206,33 @@ static void draw_analyzing(Canvas* canvas, const SubRecModel* m) {
     draw_centered_fit(canvas, 63, buf, 124);
 }
 
+static void draw_stats(Canvas* canvas, const SubRecModel* m) {
+    char buf[40];
+    draw_title_bar(canvas, "Stats");
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%lu files  %lu KiB",
+        (unsigned long)m->stats.files,
+        (unsigned long)m->stats.kib);
+    draw_centered_fit(canvas, 26, buf, 124);
+    snprintf(
+        buf,
+        sizeof(buf),
+        "raw %lu  dec %lu  rc %lu",
+        (unsigned long)m->stats.raw,
+        (unsigned long)m->stats.decoded,
+        (unsigned long)m->stats.rc);
+    draw_centered_fit(canvas, 40, buf, 124);
+    snprintf(
+        buf,
+        sizeof(buf),
+        "saved %lu   drop %lu",
+        (unsigned long)m->stats.saved,
+        (unsigned long)m->stats.dropped);
+    draw_centered_fit(canvas, 54, buf, 124);
+}
+
 void sub_rec_draw_callback(Canvas* canvas, void* model) {
     const SubRecModel* m = model;
     canvas_clear(canvas);
@@ -227,6 +254,9 @@ void sub_rec_draw_callback(Canvas* canvas, void* model) {
         break;
     case SubRecStateScanning:
         draw_scanning(canvas, m);
+        break;
+    case SubRecStateStats:
+        draw_stats(canvas, m);
         break;
     case SubRecStateAnalyzing:
         draw_analyzing(canvas, m);
@@ -331,4 +361,8 @@ void sub_rec_set_analyze(SubRecApp* app, const SubRecAnalysis* a) {
 void sub_rec_set_analyze_page(SubRecApp* app, uint8_t page) {
     app->ana_page = page;
     with_view_model(app->view, SubRecModel * m, { m->ana_page = page; }, true);
+}
+
+void sub_rec_set_stats(SubRecApp* app, const SubRecStats* s) {
+    with_view_model(app->view, SubRecModel * m, { m->stats = *s; }, false);
 }

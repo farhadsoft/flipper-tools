@@ -527,6 +527,40 @@ static void sub_rec_clear_start(SubRecApp* app, uint8_t kind) {
     sub_rec_switch_view(app, SubRecViewConfirm);
 }
 
+// GUI thread. One pass, classify by name, sum FileInfo.size -- no per-file
+// storage_common_stat() call.
+static void sub_rec_collect_stats(SubRecApp* app, SubRecStats* s) {
+    memset(s, 0, sizeof(*s));
+    uint64_t bytes = 0;
+    File* dir = storage_file_alloc(app->storage);
+    if(storage_dir_open(dir, REC_DIR)) {
+        FileInfo info;
+        char name[REC_NAME_MAX];
+        while(storage_dir_read(dir, &info, name, sizeof(name))) {
+            if(!sub_rec_is_capture(&info, name)) continue;
+            s->files++;
+            bytes += info.size;
+            if(sub_rec_match_decoded(name)) s->decoded++; else s->raw++;
+            if(sub_rec_match_rc(name)) s->rc++;
+        }
+    }
+    // storage_dir_open() docs (storage.h): storage_dir_close() must be
+    // called even when the open failed -- never skip it inside the `if`.
+    storage_dir_close(dir);
+    storage_file_free(dir);
+    s->kib = (uint32_t)(bytes / 1024);
+    s->saved = app->saved;
+    s->dropped = app->dropped;
+}
+
+static void sub_rec_handle_stats(SubRecApp* app) {
+    SubRecStats s;
+    sub_rec_collect_stats(app, &s);
+    sub_rec_set_stats(app, &s);
+    sub_rec_switch_view(app, SubRecViewStatus);
+    sub_rec_set_state(app, SubRecStateStats, false);
+}
+
 /* ------------------------------ analyze -------------------------------- */
 
 // Walks every RAW_Data value from the current RW position to EOF, summing
@@ -960,6 +994,12 @@ static bool sub_rec_navigation_callback(void* context) {
             sub_rec_scan_stop(app);
             sub_rec_switch_view(app, SubRecViewMenu);
             break;
+        case SubRecStateStats:
+            // Read-only screen, no radio was started -- just go back where
+            // it was opened from.
+            sub_rec_set_state(app, SubRecStateIdle, false);
+            sub_rec_show_saved_menu(app);
+            break;
         case SubRecStateAnalyzing:
             // No radio was ever started, so nothing to stop -- just drop back to
             // the file menu the capture was picked from.
@@ -1106,6 +1146,9 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
     case SubRecEventSavedClearRc:
         sub_rec_clear_start(app, REC_CLEAR_RC);
         return true;
+    case SubRecEventSavedStats:
+        sub_rec_handle_stats(app);
+        return true;
     case SubRecEventSavedBack:
         sub_rec_switch_view(app, SubRecViewMenu);
         return true;
@@ -1171,6 +1214,7 @@ static SubRecApp* sub_rec_app_alloc(void) {
     submenu_set_header(app->saved_menu, "Saved signals");
     submenu_add_item(
         app->saved_menu, "Browse files", SubRecEventSavedBrowse, sub_rec_menu_callback, app);
+    submenu_add_item(app->saved_menu, "Stats", SubRecEventSavedStats, sub_rec_menu_callback, app);
     submenu_add_item(
         app->saved_menu, "Clear all", SubRecEventSavedClearAll, sub_rec_menu_callback, app);
     submenu_add_item(

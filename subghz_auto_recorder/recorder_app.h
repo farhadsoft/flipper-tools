@@ -107,6 +107,7 @@ typedef enum {
     SubRecStateSending, // async TX in progress
     SubRecStateScanning, // sweeping the table, plain RX, no worker
     SubRecStateAnalyzing, // inspecting a saved capture; no radio, no writes
+    SubRecStateStats, // folder + session summary; no radio, no writes
 } SubRecState;
 // There is deliberately no SubRecStateNotice: a notice is an overlay flag
 // (app->notice_active), not a state. Making it a state would clobber the
@@ -137,6 +138,7 @@ typedef enum {
     SubRecEventSavedClearRaw,
     SubRecEventSavedClearDecoded,
     SubRecEventSavedClearRc,
+    SubRecEventSavedStats,
 } SubRecCustomEvent;
 
 typedef enum {
@@ -194,6 +196,17 @@ typedef struct {
     char note[REC_NOTE_MAX]; // "" == no Note key
 } SubRecAnalysis;
 
+// Filled by sub_rec_collect_stats() on the GUI thread in one directory pass.
+typedef struct {
+    uint32_t files; // .sub files directly in REC_DIR
+    uint32_t raw; // captures (not _D)
+    uint32_t decoded; // _D sidecars
+    uint32_t rc; // names containing _RC
+    uint32_t kib; // total size of those files, KiB, rounded down
+    uint32_t saved; // session counters, copied when the screen opens
+    uint32_t dropped;
+} SubRecStats;
+
 typedef struct {
     SubRecState state;
     bool cooldown;
@@ -213,6 +226,7 @@ typedef struct {
     uint8_t scan_peak; // index of the strongest entry seen; also the OK-lock target
     SubRecAnalysis ana;
     uint8_t ana_page; // 0 = info, 1 = waveform
+    SubRecStats stats;
 } SubRecModel;
 
 typedef struct {
