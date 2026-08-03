@@ -14,6 +14,9 @@
 #define LF_PHASE_MS    1600
 #define ANIM_PERIOD_MS 80
 #define NOTICE_MS      1800
+// Bounds TextBox's O(n) re-layout on huge dumps (Classic 4K is ~15 KB uncapped).
+// Shared with rfid_multi_reader.c, which reserves info_text to this size.
+#define CARD_INFO_MAX 8192
 
 // Generation stamping: worker threads and the timer keep running briefly after
 // the GUI thread tore their phase down, so their events can still be queued.
@@ -98,8 +101,8 @@ typedef struct {
 
     RfidMode mode;
     RfidState state; // GUI-thread source of truth; the model gets a copy
-    RfidTimerRole timer_role; // cross-thread plain field, see above
-    uint32_t gen;
+    volatile RfidTimerRole timer_role; // cross-thread, see above; volatile because TimersSrv reads it
+    volatile uint32_t gen;
 } RfidApp;
 
 // Core services implemented in rfid_multi_reader.c.

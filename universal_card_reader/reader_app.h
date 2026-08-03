@@ -145,8 +145,8 @@ typedef struct {
     // (both funnel through the same FreeRTOS timer command queue/task), so
     // this mirrors the existing gen/lf_phase pattern of plain cross-thread
     // fields instead of the model's mutex.
-    bool notice_active; // ReaderStateNotice is currently showing
-    uint32_t gen; // bumped on every phase change; only touched by the GUI thread
+    volatile bool notice_active; // ReaderStateNotice is currently showing
+    volatile uint32_t gen; // bumped on the GUI thread, read by the timer callback on TimersSrv
 } ReaderApp;
 
 // Core services implemented in universal_card_reader.c.

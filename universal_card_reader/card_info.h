@@ -12,6 +12,10 @@
 #include <nfc/nfc_device.h>
 #include "emv.h"
 
+// Bounds TextBox's O(n) re-layout on huge dumps (Classic 4K is ~15 KB uncapped).
+// Shared with universal_card_reader.c, which reserves info_text to this size.
+#define CARD_INFO_MAX 8192
+
 // Formats the full NFC report for `device` (already filled via nfc_device_set_data)
 // into `out` (reset by caller). `display_protocol` = scanner's most-derived id
 // (may be a Momentum-only id >= 12; used only for names/chain). `emv` may be all-zero.

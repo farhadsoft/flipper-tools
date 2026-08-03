@@ -114,20 +114,17 @@ static const NfcProtocol hf_chain_order[] = {
 
 /* ----------------------------- report helpers ---------------------------- */
 
-// Bounds TextBox's O(n) re-layout on huge dumps (Classic 4K is ~15 KB uncapped).
-#define CARD_INFO_MAX 8192
-
-// Set once the output hit CARD_INFO_MAX; rendering is GUI-thread-only, so a
-// file-scope flag is safe and keeps every helper below size-agnostic.
-static bool out_truncated;
-
 // furi_string_vcat_printf is not in the linkable API, so format through a
 // stack buffer instead.
 static void out_addf(FuriString* out, const char* fmt, ...) {
-    if(out_truncated) return;
+    // The marker is the state: once "[truncated]" is the tail of `out`, every
+    // later call is a no-op. Derived from the output, so no file-scope flag and
+    // no per-render reset. `out` is always empty at the start of a render
+    // (reader_report_begin()/rfid_report_begin() call furi_string_reset()).
     if(furi_string_size(out) >= CARD_INFO_MAX) {
-        furi_string_cat_str(out, "\n[truncated]");
-        out_truncated = true;
+        if(!furi_string_end_with_str(out, "[truncated]")) {
+            furi_string_cat_str(out, "\n[truncated]");
+        }
         return;
     }
     char buf[128];
@@ -627,7 +624,6 @@ static void hf_describe_mf_classic(FuriString* out, const NfcDevice* device) {
 // layers are never present on the device.
 static void hf_describe(RfidBackend* self, FuriString* out) {
     HfImpl* impl = self->impl;
-    out_truncated = false;
 
     out_addf(out, "Band: 13.56 MHz HF\n");
     out_addf(out, "Type: %s\n", nfc_device_get_protocol_name(impl->display_protocol));

@@ -17,10 +17,10 @@ static void draw_centered(Canvas* canvas, int cy, const char* str) {
     canvas_draw_str(canvas, (SCREEN_W - w) / 2, cy, str);
 }
 
-// Like draw_centered(), but truncates with "..." until the string fits inside
+// Like draw_centered(), but truncates with ".." until the string fits inside
 // `max` pixels, so a long file name never runs off-screen.
 static void draw_centered_fit(Canvas* canvas, int cy, const char* str, int max) {
-    char buf[56];
+    char buf[REC_TEXT_LINE_MAX];
     snprintf(buf, sizeof(buf), "%s", str);
     size_t len = strlen(buf);
     while(len > 3 && canvas_string_width(canvas, buf) > max) {
@@ -120,15 +120,8 @@ void sub_rec_draw_callback(Canvas* canvas, void* model) {
     }
 }
 
-void sub_rec_set_rssi(SubRecApp* app, float rssi, bool above, bool update) {
-    with_view_model(
-        app->view,
-        SubRecModel * m,
-        {
-            m->rssi = rssi;
-            m->above = above;
-        },
-        update);
+void sub_rec_set_rssi(SubRecApp* app, float rssi, bool update) {
+    with_view_model(app->view, SubRecModel * m, { m->rssi = rssi; }, update);
 }
 
 void sub_rec_set_samples(SubRecApp* app, size_t samples) {

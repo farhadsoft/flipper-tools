@@ -486,7 +486,7 @@ static ReaderApp* reader_app_alloc(void) {
     // text_box_set_text() stores the raw pointer, so this string must stay
     // alive and unmodified while the info view is shown.
     app->info_text = furi_string_alloc();
-    furi_string_reserve(app->info_text, 8192);
+    furi_string_reserve(app->info_text, CARD_INFO_MAX);
     furi_string_set_str(app->info_text, "No card loaded.\n\nOK on the scan screen\nopens saved cards.\n");
     text_box_set_font(app->text_box, TextBoxFontText);
     text_box_set_text(app->text_box, furi_string_get_cstr(app->info_text));

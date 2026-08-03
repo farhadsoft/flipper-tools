@@ -335,7 +335,7 @@ static RfidApp* rfid_app_alloc(void) {
     // text_box_set_text() stores the raw pointer, so this string must stay
     // alive and unmodified while the info view is shown.
     app->info_text = furi_string_alloc();
-    furi_string_reserve(app->info_text, 8192);
+    furi_string_reserve(app->info_text, CARD_INFO_MAX);
 
     app->menu = submenu_alloc();
     view_dispatcher_add_view(app->view_dispatcher, RfidViewMenu, submenu_get_view(app->menu));

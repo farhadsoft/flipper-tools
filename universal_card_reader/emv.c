@@ -1181,15 +1181,15 @@ static void emv_load_aids(FlipperFormat* ff, EmvData* data) {
     for(uint8_t i = 0; i < data->aid_count; i++) {
         char key[16];
         snprintf(key, sizeof(key), "AID %u", (unsigned)i);
-        uint8_t buf[EMV_AID_MAX_LEN];
-        if(!emv_load_hex(ff, key, buf, EMV_AID_MAX_LEN)) continue;
-        // get_value_count restores the cursor itself, so it is safe to call
-        // after a successful read; it re-seeks to the key from the start and
-        // returns the value count.
+        // emv_save_aids() writes each AID at its real length, so ask for that
+        // length first: flipper_format_read_hex() fails outright if the value
+        // line is shorter than the count it is given. get_value_count()
+        // restores the cursor itself; emv_load_hex() rewinds on failure.
         uint32_t count = 0;
-        if(flipper_format_get_value_count(ff, key, &count)) {
-            data->aid_len[i] = (uint8_t)(count < EMV_AID_MAX_LEN ? count : EMV_AID_MAX_LEN);
-            memcpy(data->aid[i], buf, data->aid_len[i]);
+        if(!flipper_format_get_value_count(ff, key, &count)) continue;
+        if(count == 0 || count > EMV_AID_MAX_LEN) continue;
+        if(emv_load_hex(ff, key, data->aid[i], (uint16_t)count)) {
+            data->aid_len[i] = (uint8_t)count;
         }
     }
 }

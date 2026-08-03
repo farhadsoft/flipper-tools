@@ -12,22 +12,19 @@
 #include <nfc/protocols/mf_ultralight/mf_ultralight.h>
 #include <nfc/protocols/mf_classic/mf_classic.h>
 
-// Bounds TextBox's O(n) re-layout on huge dumps (Classic 4K is ~15 KB uncapped).
-#define CARD_INFO_MAX 8192
-
 /* ----------------------------- helpers ------------------------------ */
-
-// Set once the output hit CARD_INFO_MAX; rendering is GUI-thread-only, so a
-// file-scope flag is safe and keeps every helper below size-agnostic.
-static bool out_truncated;
 
 // furi_string_vcat_printf is not in the linkable API, so format through a
 // stack buffer instead.
 static void out_addf(FuriString* out, const char* fmt, ...) {
-    if(out_truncated) return;
+    // The marker is the state: once "[truncated]" is the tail of `out`, every
+    // later call is a no-op. Derived from the output, so no file-scope flag and
+    // no per-render reset. `out` is always empty at the start of a render
+    // (reader_report_begin()/rfid_report_begin() call furi_string_reset()).
     if(furi_string_size(out) >= CARD_INFO_MAX) {
-        furi_string_cat_str(out, "\n[truncated]");
-        out_truncated = true;
+        if(!furi_string_end_with_str(out, "[truncated]")) {
+            furi_string_cat_str(out, "\n[truncated]");
+        }
         return;
     }
     char buf[128];
@@ -218,7 +215,12 @@ static bool ndef_parse_record(const uint8_t* msg, size_t msg_len, size_t* pos, N
         if(*pos >= msg_len) return false;
         id_len = msg[(*pos)++];
     }
-    if(*pos + rec->type_len + id_len + rec->payload_len > msg_len) return false;
+    // Subtractive, in that order: payload_len is a 32-bit value taken straight
+    // off the tag, so *pos + type_len + id_len + payload_len wraps and lets a
+    // 0xFFFFFFFF payload through. msg_len - *pos cannot wrap (*pos <= msg_len).
+    size_t avail = msg_len - *pos;
+    if((size_t)rec->type_len + id_len > avail) return false;
+    if(rec->payload_len > avail - rec->type_len - id_len) return false;
 
     rec->type = msg + *pos;
     *pos += (size_t)rec->type_len + id_len;
@@ -562,8 +564,6 @@ void card_info_format_nfc(
     const NfcDevice* device,
     NfcProtocol display_protocol,
     const EmvData* emv) {
-    out_truncated = false;
-
     out_addf(out, "Band: 13.56 MHz\n");
     out_addf(out, "Type: %s\n", nfc_device_get_protocol_name(display_protocol));
 
@@ -606,7 +606,6 @@ void card_info_format_nfc(
 }
 
 void card_info_format_lf(FuriString* out, const char* protocol_name, const uint8_t* id, size_t id_len) {
-    out_truncated = false;
     out_addf(out, "Band: 125 kHz\n");
     out_addf(out, "Type: %s\n", protocol_name);
     out_addf(out, "ID: ");
@@ -618,7 +617,6 @@ void card_info_format_lf(FuriString* out, const char* protocol_name, const uint8
 // it, so only the EMV block is rendered. emv_load() sets ppse_ok, so
 // card_info_emv() never reaches its device-dependent branch.
 void card_info_format_emv(FuriString* out, const EmvData* emv) {
-    out_truncated = false;
     out_addf(out, "Band: 13.56 MHz\n");
     out_addf(out, "Type: EMV (from file)\n");
     card_info_emv(out, NULL, emv);

@@ -64,6 +64,9 @@ void sub_rec_radio_alloc(SubRecApp* app) {
     subghz_receiver_set_rx_callback(app->receiver, sub_rec_decoded_callback, app);
     app->raw = (SubGhzProtocolDecoderRAW*)subghz_receiver_search_decoder_base_by_name(
         app->receiver, SUBGHZ_PROTOCOL_RAW_NAME);
+    // A fork that renames or drops either entry turns every later call into a
+    // NULL deref; furi_check names the failure instead of HardFaulting.
+    furi_check(app->raw);
 
     app->worker = subghz_worker_alloc();
     // Context is the APP, not the receiver: both worker callbacks share one
@@ -76,6 +79,7 @@ void sub_rec_radio_alloc(SubRecApp* app) {
     // subghz_devices_get_by_name(), which furi_checks the registry.
     subghz_devices_init();
     app->device = subghz_devices_get_by_name(SUBGHZ_DEVICE_CC1101_INT_NAME);
+    furi_check(app->device);
     // Internal CC1101 only -- no external-module/OTG handling.
     // subghz_devices_begin()/_end() are not called: cc1101_int_interconnect.c
     // has .begin = NULL and .end = furi_hal_subghz_shutdown, and the stock
@@ -212,6 +216,11 @@ void sub_rec_capture_begin(SubRecApp* app) {
     if(!subghz_protocol_raw_save_to_file_init(app->raw, dev_name, &app->preset.base)) {
         FURI_LOG_E(TAG, "save_to_file_init failed: %s", dev_name);
         subghz_worker_start(app->worker);
+        // Back off exactly like a CAPTURE_MAX_MS cap: without this the tick
+        // handler retries on the first above-threshold sample after the notice
+        // clears, so a persistent cause (SD full/absent) loops notice -> failed
+        // open -> notice for as long as the carrier is up.
+        sub_rec_set_state(app, SubRecStateArmed, true);
         sub_rec_show_notice(app, "Save failed", stem, "", SubRecViewStatus, 0);
         return;
     }

@@ -24,6 +24,13 @@
 #define REC_DIR     EXT_PATH("subghz/auto_rec")
 #define REC_DIR_REL "auto_rec" // relative to SUBGHZ_RAW_FOLDER; see recorder_radio.c
 #define REC_STEM_MAX 48
+// Longest path this app builds: REC_DIR "/" <stem> "_RC.sub". EXT_PATH() is a
+// string-literal concat, so both sizeof()s are exact and already count a NUL.
+#define REC_PATH_MAX (sizeof(REC_DIR) + REC_STEM_MAX + sizeof("_RC.sub"))
+// Longest text a status/notice line can hold. Every scratch buffer that feeds
+// one is sized from this instead of an arbitrary number -- SubRecModel
+// truncates anything longer anyway.
+#define REC_TEXT_LINE_MAX 32
 
 #define RSSI_POLL_MS      25
 #define RSSI_REDRAW_EVERY 5 // repaint every 5th poll (~8 Hz); see recorder_ui.c
@@ -90,16 +97,15 @@ typedef struct {
     bool cooldown;
     bool notice_active;
     float rssi;
-    bool above;
     float trigger;
     size_t samples;
     uint32_t saved;
     uint32_t dropped;
     char freq_line[24];
-    char last_file[32];
+    char last_file[REC_TEXT_LINE_MAX];
     char notice_title[24];
-    char notice_l1[32];
-    char notice_l2[32];
+    char notice_l1[REC_TEXT_LINE_MAX];
+    char notice_l2[REC_TEXT_LINE_MAX];
 } SubRecModel;
 
 typedef struct {
@@ -119,7 +125,7 @@ typedef struct {
     FuriTimer* rssi_timer; // periodic
     FuriTimer* tx_timer; // periodic
     FuriTimer* notice_timer; // one-shot
-    uint32_t gen;
+    volatile uint32_t gen;
     SubRecView current_view;
     SubRecState state;
     Storage* storage;
@@ -156,7 +162,7 @@ typedef struct {
     bool last_above;
     SubRecState last_state;
     uint32_t tick_count; // redraw decimation
-    bool rc_warned; // per-replay
+    bool rc_warned; // per selected file; cleared on (re)pick and on delete
 
     uint32_t capture_start_tick;
     uint32_t last_above_tick;

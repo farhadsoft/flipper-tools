@@ -172,7 +172,7 @@ static void sub_rec_handle_rssi_tick(SubRecApp* app) {
     bool redraw = force || ((app->tick_count % RSSI_REDRAW_EVERY) == 0);
     app->last_above = above;
     app->last_state = app->state;
-    sub_rec_set_rssi(app, rssi, above, redraw && !app->notice_active);
+    sub_rec_set_rssi(app, rssi, redraw && !app->notice_active);
 
     // A notice overlays the status view; never start a capture behind it.
     if(app->notice_active) return;
@@ -287,7 +287,7 @@ static void sub_rec_do_browse(SubRecApp* app) {
 static void sub_rec_do_delete(SubRecApp* app) {
     const char* path = furi_string_get_cstr(app->selected_path);
     const char* base = strrchr(path, '/');
-    char name[40];
+    char name[REC_TEXT_LINE_MAX];
     snprintf(name, sizeof(name), "%s", base ? base + 1 : path);
 
     // false means a real failure -- storage_simply_remove() also returns true
@@ -326,7 +326,7 @@ static void sub_rec_rename_result(void* context) {
     // drop it.
     bool still_rc = (len >= 3) && (strcmp(app->rename_buf + len - 3, "_RC") == 0);
 
-    char new_path[96];
+    char new_path[REC_PATH_MAX];
     if(was_rc && !still_rc) {
         snprintf(new_path, sizeof(new_path), "%s/%s_RC.sub", REC_DIR, app->rename_buf);
     } else {

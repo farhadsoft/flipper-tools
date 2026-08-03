@@ -6,7 +6,7 @@ void sub_rec_draw_callback(Canvas* canvas, void* model);
 
 // recorder_ui.c is the ONLY file that calls with_view_model(); every other
 // module goes through these setters.
-void sub_rec_set_rssi(SubRecApp* app, float rssi, bool above, bool update);
+void sub_rec_set_rssi(SubRecApp* app, float rssi, bool update);
 void sub_rec_set_samples(SubRecApp* app, size_t samples);
 // Sole writer of app->state (and app->cooldown): assigns both fields and
 // mirrors them into the model in one call. Nothing else may assign
