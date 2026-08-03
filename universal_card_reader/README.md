@@ -97,12 +97,19 @@ nor deleted.
 
 **Load** opens from the actions menu (after Save/Emulate/Rescan) or
 directly from the scan screen with the **OK** button: the firmware's own
-file-picker dialog shows only this folder. The selected file is shown on
-the result screen exactly like a freshly read card; files that carry
-transport data (`.nfc`/`.rfid`/`.emv` with transport) can be launched
-with **Emulate**. Older `.emv` files (saved before this change, containing
-only EMV fields) have no transport data behind them, so they are blocked
-from emulation — the result screen makes this clear.
+file-picker dialog shows only this folder. Picking a file opens a small
+per-file menu — **Open / Rename / Delete / Back** — instead of loading it
+immediately.
+
+**Open** shows the file exactly like a freshly read card; files that
+carry transport data (`.nfc`/`.rfid`/`.emv` with transport) can be
+launched with **Emulate**. Older `.emv` files (saved before this change,
+containing only EMV fields) have no transport data behind them, so they
+are blocked from emulation — the result screen makes this clear.
+
+**Rename** edits the file's name; the extension is kept, since it picks
+which loader **Open** uses. **Delete** removes the file and reports
+honestly if the remove failed instead of claiming success.
 
 ## Limitations
 
@@ -165,7 +172,9 @@ as a 10×10 1-bit PNG with `make_icon.py`.
 4. On the result screen, the **Back** button opens the actions menu:
    **Save**, **Emulate**, **Rescan**, **Load**, **Exit**.
 5. To open a previously saved card, select **Load** (or press **OK**
-   directly from the scan screen) and pick the file from the list.
+   directly from the scan screen), pick a file from the list, then choose
+   **Open** on the per-file menu (**Rename** / **Delete** / **Back** are
+   also available there).
 6. On the scan screen, **Back** exits the app.
 
 ## File structure

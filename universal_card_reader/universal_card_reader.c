@@ -100,7 +100,9 @@ void reader_switch_view(ReaderApp* app, ReaderView view) {
 // and auto-returns to the report after NOTICE_MS. Used for save results and
 // blocked-action explanations; callers stop their own hardware before calling
 // this, so it never touches a radio itself.
-void reader_show_notice(ReaderApp* app, const char* title, const char* l1, const char* l2) {
+void reader_show_notice(
+    ReaderApp* app, const char* title, const char* l1, const char* l2, ReaderView back_to) {
+    app->notice_return = back_to;
     reader_stop_all(app);
     app->gen++;
     app->notice_active = true;
@@ -159,6 +161,22 @@ static bool reader_navigation_callback(void* context) {
         return true;
     }
 
+    // The file-actions Submenu does not consume Back, same as the actions menu.
+    // Routed through the dispatcher because reader_load_abort() may restart the
+    // NFC phase, and radio starts belong in reader_custom_event_callback().
+    if(app->current_view == ReaderViewFileMenu) {
+        view_dispatcher_send_custom_event(
+            app->view_dispatcher, EVENT_MAKE(ReaderEventFileBack, app->gen));
+        return true;
+    }
+
+    // TextInput consumes long/repeat Back as backspace but not a short press
+    // (verified in the firmware's text_input.c), so a short Back lands here.
+    if(app->current_view == ReaderViewRename) {
+        reader_switch_view(app, ReaderViewFileMenu);
+        return true;
+    }
+
     // Leaving: release the radio now and retire every event still queued from
     // the phase we are killing, then let the dispatcher stop. run() returns and
     // reader_app_free() does the rest.
@@ -179,11 +197,11 @@ static void reader_action_callback(void* context, uint32_t index) {
 
 static void reader_do_save(ReaderApp* app) {
     if(app->card == ReaderCardNone) {
-        reader_show_notice(app, "No card", "read or load one", "");
+        reader_show_notice(app, "No card", "read or load one", "", ReaderViewInfo);
         return;
     }
     if(app->card == ReaderCardEmvFile) {
-        reader_show_notice(app, "From file", "already saved", "");
+        reader_show_notice(app, "From file", "already saved", "", ReaderViewInfo);
         return;
     }
 
@@ -219,7 +237,7 @@ static void reader_do_save(ReaderApp* app) {
     const char* base = strrchr(full, '/');
     base = base ? base + 1 : full;
     FURI_LOG_I(TAG, "save %s: %s", ok ? "ok" : "FAILED", full);
-    reader_show_notice(app, ok ? "Saved" : "Save failed", READER_SAVE_DIR_UI, base);
+    reader_show_notice(app, ok ? "Saved" : "Save failed", READER_SAVE_DIR_UI, base, ReaderViewInfo);
     furi_string_free(path);
 }
 
@@ -280,6 +298,38 @@ static bool reader_load_rfid_file(ReaderApp* app, const char* full) {
     return ok;
 }
 
+// Where Load lands when nothing was opened: back to scanning if Load was entered
+// with OK from the scan screen, otherwise to the report the user left. Shared by
+// the browser-cancel path and the file menu's Back.
+static void reader_load_abort(ReaderApp* app) {
+    if(app->load_from_scan) {
+        reader_start_nfc_phase(app);
+    } else {
+        reader_switch_view(app, ReaderViewInfo);
+    }
+}
+
+// The extension picks the loader, which is why Rename preserves it.
+static void reader_open_selected(ReaderApp* app) {
+    const char* full = furi_string_get_cstr(app->selected_path);
+    bool ok = false;
+
+    if(furi_string_end_with_str(app->selected_path, ".nfc")) {
+        ok = reader_load_nfc_file(app, full);
+    } else if(furi_string_end_with_str(app->selected_path, ".emv")) {
+        ok = reader_load_emv_file(app, full);
+    } else if(furi_string_end_with_str(app->selected_path, ".rfid")) {
+        ok = reader_load_rfid_file(app, full);
+    }
+
+    FURI_LOG_I(TAG, "load %s: %s", ok ? "ok" : "FAILED", full);
+    if(!ok) {
+        const char* base = strrchr(full, '/');
+        reader_show_notice(
+            app, "Load failed", base ? base + 1 : full, "", ReaderViewFileMenu);
+    }
+}
+
 // GUI thread only. dialog_file_browser_show() blocks this thread until the
 // user picks or cancels, so every radio must be down and — critically — the
 // animation timer must be stopped first: view_dispatcher_send_custom_event()
@@ -287,7 +337,7 @@ static bool reader_load_rfid_file(ReaderApp* app, const char* full) {
 // fills it in ~1.3 s and then blocks the TimersSrv thread for the whole
 // dialog. See invariant 6 in CLAUDE.md.
 static void reader_do_load(ReaderApp* app) {
-    bool from_scan = (app->current_view == ReaderViewScan);
+    app->load_from_scan = (app->current_view == ReaderViewScan);
 
     reader_stop_all(app);
     app->gen++;
@@ -306,44 +356,138 @@ static void reader_do_load(ReaderApp* app) {
 
     if(!picked) {
         furi_string_free(path);
-        if(from_scan) {
-            reader_start_nfc_phase(app);
-        } else {
-            reader_switch_view(app, ReaderViewInfo);
-        }
+        reader_load_abort(app);
         return;
     }
 
-    const char* full = furi_string_get_cstr(path);
-    bool ok = false;
-
-    if(furi_string_end_with_str(path, ".nfc")) {
-        ok = reader_load_nfc_file(app, full);
-    } else if(furi_string_end_with_str(path, ".emv")) {
-        ok = reader_load_emv_file(app, full);
-    } else if(furi_string_end_with_str(path, ".rfid")) {
-        ok = reader_load_rfid_file(app, full);
-    }
-
-    FURI_LOG_I(TAG, "load %s: %s", ok ? "ok" : "FAILED", full);
-    if(!ok) {
-        const char* base = strrchr(full, '/');
-        reader_show_notice(app, "Load failed", base ? base + 1 : full, "");
-    }
+    furi_string_set(app->selected_path, path);
     furi_string_free(path);
+
+    const char* full = furi_string_get_cstr(app->selected_path);
+    const char* base = strrchr(full, '/');
+    submenu_set_header(app->file_menu, base ? base + 1 : full); // copies the string
+    submenu_set_selected_item(app->file_menu, 0); // never land on Delete
+    reader_switch_view(app, ReaderViewFileMenu);
 }
 
+static void reader_do_delete(ReaderApp* app) {
+    const char* path = furi_string_get_cstr(app->selected_path);
+    const char* base = strrchr(path, '/');
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    bool ok = storage_simply_remove(storage, path);
+    furi_record_close(RECORD_STORAGE);
+
+    if(!ok) {
+        // false is a real failure: storage_simply_remove() returns true when the
+        // item is already gone (storage.h). Reporting "Deleted" on a failed
+        // remove is a lie the user acts on.
+        FURI_LOG_E(TAG, "delete failed: %s", path);
+        reader_show_notice(
+            app, "Delete failed", base ? base + 1 : path, "", ReaderViewFileMenu);
+        return;
+    }
+
+    FURI_LOG_I(TAG, "deleted %s", path);
+    // reader_set_notice() snprintf-copies the name, so the notice survives the
+    // reset; the file menu would show a stale header, so land on the actions menu.
+    reader_show_notice(app, "Deleted", base ? base + 1 : path, "", ReaderViewActions);
+    furi_string_reset(app->selected_path); // nothing may act on a file that is gone
+}
+
+// Runs on the GUI thread (TextInput input path) and starts no radio, so it acts
+// directly instead of posting an event — same licence reader_navigation_callback()
+// takes.
+static void reader_rename_result(void* context) {
+    ReaderApp* app = context;
+
+    // The keyboard can emit spaces (shifted '_') ; reuse Save's stem rule so
+    // renamed files look like generated ones. In-place is safe: same-index copy.
+    reader_sanitize(app->rename_buf, sizeof(app->rename_buf), app->rename_buf);
+    if(app->rename_buf[0] == '\0') {
+        reader_show_notice(app, "Rename failed", "empty name", "", ReaderViewFileMenu);
+        return;
+    }
+
+    const char* old_path = furi_string_get_cstr(app->selected_path);
+    const char* old_base = strrchr(old_path, '/');
+    old_base = old_base ? old_base + 1 : old_path;
+    const char* dot = strrchr(old_base, '.');
+    const char* ext = dot ? dot : ""; // ".nfc" / ".emv" / ".rfid", or none
+    size_t stem_len = strlen(app->rename_buf);
+    size_t ext_len = strlen(ext);
+    // Typing "card.nfc" must not produce "card.nfc.nfc".
+    bool typed_ext = ext_len && stem_len >= ext_len &&
+                     strcmp(app->rename_buf + stem_len - ext_len, ext) == 0;
+
+    // Same directory as the picked file (the browser can descend into a subdir
+    // a user created over USB), same extension, new stem.
+    FuriString* new_path = furi_string_alloc();
+    furi_string_set_n(new_path, app->selected_path, 0, (size_t)(old_base - old_path));
+    furi_string_cat_str(new_path, app->rename_buf);
+    if(!typed_ext) furi_string_cat_str(new_path, ext);
+
+    const char* fail = NULL;
+    if(furi_string_cmp(new_path, app->selected_path) != 0) {
+        Storage* storage = furi_record_open(RECORD_STORAGE);
+        if(storage_file_exists(storage, furi_string_get_cstr(new_path))) {
+            // storage_common_rename() overwrites the destination silently
+            // (storage.h) — that would destroy another saved card.
+            fail = "name already used";
+        } else {
+            FS_Error err = storage_common_rename(
+                storage, old_path, furi_string_get_cstr(new_path));
+            if(err != FSE_OK) fail = storage_error_get_desc(err);
+        }
+        furi_record_close(RECORD_STORAGE);
+    }
+
+    if(fail) {
+        FURI_LOG_E(
+            TAG, "rename failed: %s -> %s (%s)", old_path,
+            furi_string_get_cstr(new_path), fail);
+        furi_string_free(new_path);
+        reader_show_notice(app, "Rename failed", fail, "", ReaderViewFileMenu);
+        return;
+    }
+
+    // old_path / old_base / ext all point into selected_path and die here.
+    furi_string_set(app->selected_path, new_path);
+    furi_string_free(new_path);
+
+    const char* full = furi_string_get_cstr(app->selected_path);
+    const char* base = strrchr(full, '/');
+    base = base ? base + 1 : full;
+    FURI_LOG_I(TAG, "renamed to %s", full);
+    submenu_set_header(app->file_menu, base);
+    reader_show_notice(app, "Renamed", base, "", ReaderViewFileMenu);
+}
+
+static void reader_do_rename_start(ReaderApp* app) {
+    const char* path = furi_string_get_cstr(app->selected_path);
+    const char* base = strrchr(path, '/');
+
+    snprintf(app->rename_buf, sizeof(app->rename_buf), "%s", base ? base + 1 : path);
+    char* dot = strrchr(app->rename_buf, '.');
+    if(dot) *dot = '\0'; // edit the stem only; the extension picks the loader
+
+    text_input_set_header_text(app->rename_input, "New name");
+    text_input_set_result_callback(
+        app->rename_input, reader_rename_result, app, app->rename_buf,
+        sizeof(app->rename_buf), false);
+    reader_switch_view(app, ReaderViewRename);
+}
 
 static void reader_do_emulate(ReaderApp* app) {
     if(app->card == ReaderCardNone) {
-        reader_show_notice(app, "No card", "read or load one", "");
+        reader_show_notice(app, "No card", "read or load one", "", ReaderViewInfo);
         return;
     }
     if(app->card == ReaderCardEmvFile) {
         // .emv v2 files (and v3 files whose transport block failed to parse)
         // carry no UID/ATS, so the listener would have nothing to present.
         if(!app->emv.has_transport) {
-            reader_show_notice(app, "Blocked", "no transport data", "in .emv file");
+            reader_show_notice(app, "Blocked", "no transport data", "in .emv file", ReaderViewInfo);
             return;
         }
         reader_start_nfc_emulation(app);
@@ -363,7 +507,8 @@ static void reader_do_emulate(ReaderApp* app) {
     }
     if(!reader_protocol_emulatable(app->poll_protocol)) {
         reader_show_notice(
-            app, "Blocked", "No emulation for", nfc_device_get_protocol_name(app->poll_protocol));
+            app, "Blocked", "No emulation for", nfc_device_get_protocol_name(app->poll_protocol),
+            ReaderViewInfo);
         return;
     }
     reader_start_nfc_emulation(app);
@@ -414,7 +559,11 @@ static bool reader_custom_event_callback(void* context, uint32_t event) {
     case ReaderEventActionRescan:  reader_start_nfc_phase(app);             return true;
     case ReaderEventActionLoad:    reader_do_load(app);                     return true;
     case ReaderEventActionExit:    reader_handle_exit(app);                 return true;
-    case ReaderEventNoticeDone:    reader_switch_view(app, ReaderViewInfo); return true;
+    case ReaderEventNoticeDone:    reader_switch_view(app, app->notice_return); return true;
+    case ReaderEventFileOpen:      reader_open_selected(app);               return true;
+    case ReaderEventFileRename:    reader_do_rename_start(app);             return true;
+    case ReaderEventFileDelete:    reader_do_delete(app);                   return true;
+    case ReaderEventFileBack:      reader_load_abort(app);                  return true;
     default:                       return false;
     }
 }
@@ -439,7 +588,7 @@ static bool reader_input_callback(InputEvent* event, void* context) {
     if(state == ReaderStateNotice) {
         if(event->key == InputKeyBack || event->key == InputKeyOk) {
             furi_timer_stop(app->phase_timer); // cancel the pending auto-dismiss
-            reader_switch_view(app, ReaderViewInfo);
+            reader_switch_view(app, app->notice_return);
             return true;
         }
         return true; // swallow everything else while the notice is up
@@ -502,6 +651,21 @@ static ReaderApp* reader_app_alloc(void) {
     submenu_add_item(app->actions, "Load", ReaderEventActionLoad, reader_action_callback, app);
     submenu_add_item(app->actions, "Exit", ReaderEventActionExit, reader_action_callback, app);
 
+    app->file_menu = submenu_alloc();
+    view_dispatcher_add_view(
+        app->view_dispatcher, ReaderViewFileMenu, submenu_get_view(app->file_menu));
+    submenu_add_item(app->file_menu, "Open", ReaderEventFileOpen, reader_action_callback, app);
+    submenu_add_item(
+        app->file_menu, "Rename", ReaderEventFileRename, reader_action_callback, app);
+    submenu_add_item(
+        app->file_menu, "Delete", ReaderEventFileDelete, reader_action_callback, app);
+    submenu_add_item(app->file_menu, "Back", ReaderEventFileBack, reader_action_callback, app);
+
+    app->rename_input = text_input_alloc();
+    view_dispatcher_add_view(
+        app->view_dispatcher, ReaderViewRename, text_input_get_view(app->rename_input));
+    app->selected_path = furi_string_alloc();
+
     app->phase_timer =
         furi_timer_alloc(reader_phase_timer_callback, FuriTimerTypeOnce, app);
     app->anim_timer =
@@ -545,6 +709,11 @@ static void reader_app_free(ReaderApp* app) {
     furi_string_free(app->info_text);
     view_dispatcher_remove_view(app->view_dispatcher, ReaderViewActions);
     submenu_free(app->actions);
+    view_dispatcher_remove_view(app->view_dispatcher, ReaderViewFileMenu);
+    submenu_free(app->file_menu);
+    view_dispatcher_remove_view(app->view_dispatcher, ReaderViewRename);
+    text_input_free(app->rename_input);
+    furi_string_free(app->selected_path);
     view_dispatcher_free(app->view_dispatcher);
     furi_record_close(RECORD_GUI);
     free(app);

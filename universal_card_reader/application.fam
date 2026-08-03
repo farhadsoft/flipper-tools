@@ -13,6 +13,6 @@ App(
     fap_category="Tools",
     fap_description="Reads any NFC (13.56MHz) or LF RFID (125kHz) card.",
     fap_author="farhadsoft",
-    fap_version="1.4",
+    fap_version="1.5",
     fap_icon="icon.png",
 )

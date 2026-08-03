@@ -6,6 +6,7 @@
 #include <gui/view_dispatcher.h>
 #include <gui/modules/text_box.h>
 #include <gui/modules/submenu.h>
+#include <gui/modules/text_input.h>
 #include <nfc/nfc.h>
 #include <nfc/nfc_scanner.h>
 #include <nfc/nfc_poller.h>
@@ -20,6 +21,12 @@
 #define TAG "UniCardReader"
 
 #define ID_MAX_LEN     16
+
+// Rename edits the stem only. The longest stem this app generates is an LF one
+// (sanitised protocol name + '_' + up to 2*ID_MAX_LEN hex, ~44 chars), so 64
+// seeds any existing name without truncation and leaves the user room.
+#define READER_STEM_MAX 64
+
 #define NFC_PHASE_MS   1200
 #define LF_PHASE_MS    1600
 #define ANIM_PERIOD_MS 80
@@ -74,6 +81,10 @@ typedef enum {
     ReaderEventActionLoad,
     ReaderEventActionExit,
     ReaderEventNoticeDone, // NOTICE_MS elapsed
+    ReaderEventFileOpen,
+    ReaderEventFileRename,
+    ReaderEventFileDelete,
+    ReaderEventFileBack,
 } ReaderCustomEvent;
 
 // Views registered with the dispatcher.
@@ -81,6 +92,8 @@ typedef enum {
     ReaderViewScan = 0,
     ReaderViewInfo = 1,
     ReaderViewActions = 2,
+    ReaderViewFileMenu = 3, // Submenu: per-file actions on the picked file
+    ReaderViewRename = 4, // TextInput: new stem for the picked file
 } ReaderView;
 
 typedef struct {
@@ -108,6 +121,14 @@ typedef struct {
     View* view;
     TextBox* text_box;
     Submenu* actions;
+    Submenu* file_menu; // per-file actions for selected_path
+    TextInput* rename_input;
+    FuriString* selected_path; // file picked in the Load browser; empty after Delete
+    char rename_buf[READER_STEM_MAX]; // TextInput's buffer: stem only, no extension
+    ReaderView notice_return; // where reader_show_notice() lands on dismiss
+    // Set by reader_do_load() from current_view, read by reader_load_abort().
+    // Only ever read after a load browse, so a stale value cannot be observed.
+    bool load_from_scan;
     FuriString* info_text; // backing store for the TextBox; must outlive the text pointer
     FuriTimer* phase_timer;
     FuriTimer* anim_timer;
@@ -152,5 +173,5 @@ typedef struct {
 // Core services implemented in universal_card_reader.c.
 void reader_stop_all(ReaderApp* app);
 void reader_switch_view(ReaderApp* app, ReaderView view);
-void reader_show_notice(ReaderApp* app, const char* title, const char* l1, const char* l2);
+void reader_show_notice(ReaderApp* app, const char* title, const char* l1, const char* l2, ReaderView back_to);
 void reader_cat_hex(FuriString* out, const uint8_t* data, size_t len);

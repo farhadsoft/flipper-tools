@@ -221,6 +221,20 @@ verbatim. It prints the resolved path to stderr before opening the port.
   has actually opened, a reliable non-visual signal the dialog is live
   before selecting anything (useful generally: there is no way to read the
   screen over the CLI).
+- **`dialog_file_browser_show()`'s file-pick (`ok`) cannot be driven over the
+  CLI** — confirmed exhaustively 2026-08-03: bare `ok short`, the documented
+  `ok press` / `ok short` / `ok release` triple, `ok long`, and `right short`
+  all leave `dialogs BrowserWorker` running with `Stack Min` unchanged (no
+  pick registers), while the identical sequences work fine for Submenu items
+  and for `back` (cancels the dialog cleanly either way). Script navigation
+  up to opening the browser, then a physical button press is required to
+  actually pick a file. Rapid-fire bare-`short` bursts against this dialog
+  produced two crash-reboots and one `dialog_file_browser_show()` hang that
+  `loader close` could not clear (see above) — `power reboot` recovered
+  both. The documented protocol is three separate commands, `input send
+  <key> press` / `<key> short` / `<key> release`
+  (docs.flipper.net/zero/development/cli); bare `short` happens to work for
+  Submenu navigation and usually for `back`, but is not the real contract.
 
 Status logs are `FURI_LOG_I` (detection, read with UID/ID hex, read timeout);
 phase changes and stale-event drops are `FURI_LOG_D`, so capture at `debug` when
@@ -479,6 +493,39 @@ artifact of the raw serial capture, not a real worker; `TimersSrv`'s own
 `Stack Min` is a longstanding constant unrelated to any app.) Three
 open/close cycles: `Heap` after close was 136648/54232 (free/minimum) on
 cycle 1, then exactly 136624/54232 on both cycles 2 and 3 — stable, no leak.
+
+**Verified 2026-08-03 — per-file Open/Rename/Delete/Back menu added to
+Load.** Picking a file in the Load browser now opens a per-file `Submenu`
+(`ReaderViewFileMenu`) instead of rendering immediately; **Open** is the
+prior direct-render path, **Rename** edits the stem through a `TextInput`
+(extension preserved — it picks the loader), **Delete** removes the file
+and reports a real failure honestly (`storage_simply_remove()` returns
+`true` when the item is already gone, so a checked `false` is the only
+signal). `reader_show_notice()` gained a `back_to` parameter so a
+Rename/Delete result lands on the file menu (or the actions menu after a
+successful delete) instead of always on the report. `fap_version` 1.4 -> 1.5.
+
+Build clean, APPCHK pass (Target 7, API 87.1, Momentum mntm-dev, COM4).
+Confirmed on device across one uninterrupted session (uptime climbed
+0h1m -> 0h56m+ with no unexplained reset): app alloc/free, the new
+`ReaderViewFileMenu`/`ReaderViewRename` navigation-callback branches, the
+`notice_return` mechanism, and `reader_load_abort()` (exercised via the
+browser's own cancel path, both scan- and Actions-menu entry) are all
+stable. **`reader_open_selected()`, the file-menu rows themselves,
+`reader_do_rename_start()`/`reader_rename_result()`, and
+`reader_do_delete()` were not exercised this session** — see the CLI
+limitation above (Testing this app): `dialog_file_browser_show()`'s `ok`
+does not register via `input send` on this firmware no matter the input
+protocol used, so no file could be picked from the browser to reach them.
+Isolating that limitation cost two crash-reboots and one
+`dialog_file_browser_show()` hang (recovered via `power reboot`, see
+above); none occurred past the browser boundary — both are inside
+pre-existing, unmodified code, not this change. The two pre-existing saved
+files (`Mifare_Plus_...nfc`, `EMV_...emv`) were round-tripped through a
+backup directory during isolation and confirmed byte-identical back in
+place (`storage list` sizes unchanged) before this session ended. Needs a
+physical-button pass through steps 2-5 of this feature's own verification
+plan before the new menu itself can be called device-verified.
 
 ---
 
