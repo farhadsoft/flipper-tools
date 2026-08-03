@@ -1198,6 +1198,118 @@ per the CLI limitation documented above (Testing this app) — cannot be
 driven over the CLI; only a physical button press can pick a file. Static
 review (below) covers what CLI/build verification cannot.
 
+**Decode / decoded-save / generalized-replay (Phase 2) — added 2026-08-03.**
+`sub_rec_decoded_callback()` now stashes the firing decoder (`app->decoded`,
+mirrors `app->rolling`'s existing lifecycle exactly: written on the
+SubGhzWorker thread, cleared in `sub_rec_capture_begin()` before the worker
+restarts, consumed once in `sub_rec_capture_finish()`). A kept capture that
+decoded writes a second file, `<stem>_D.sub` (`sub_rec_save_decoded()`,
+`recorder_radio.c`) via the exported `subghz_protocol_decoder_base_serialize()`
+-- additive only, the RAW file is never touched, so a false decode on noise
+(fixed-code protocols carry no checksum) can never damage the capture. The
+Listening screen's line 42 shows the decoded protocol label in place of
+"armed" (`sub_rec_set_proto_line()`, in `recorder_ui.c` -- the sole
+`with_view_model` file, as required); the Analyze Info page gains a
+`Bit: <N>  Key: <hex>` line for any file carrying those fields, decoded by
+this app or not. Replay (`sub_rec_replay()`) now reads the file's `Protocol`
+field instead of hardcoding `SUBGHZ_PROTOCOL_RAW_NAME`: RAW keeps its
+existing `subghz_protocol_raw_gen_fff_data()` path, anything else is copied
+whole into an in-memory `FlipperFormat` via `stream_copy_full()` -- never the
+file handle, since Momentum's princeton encoder `deserialize` calls
+`flipper_format_update_hex()`, which would rewrite the user's saved `.sub`
+mid-replay -- before `subghz_transmitter_alloc_init()`/`_deserialize()`.
+`REC_PATH_MAX` bumped for the `_RC_D` worst case.
+
+Build: `ufbt -c && ufbt`, both increments (A = decode/save/display, B =
+replay generalization), clean from scratch, zero warnings, `APPCHK` Target 7
+/ API 87.1.
+
+**`fff_tx` stream-position question, resolved by source, not assumed.**
+`stream_copy_full()` seeks both streams to 0 before copying, but
+`stream_write()` advances the destination's cursor as it writes, so
+`app->fff_tx` is left positioned at EOF after the copy, and
+`sub_rec_replay()` calls `subghz_transmitter_deserialize()` on it with no
+intervening rewind. Read the actual firmware source (both
+`flipperdevices/flipperzero-firmware@dev` and `Next-Flip/Momentum-Firmware@dev`
+-- official and the fork on this device) to settle it rather than guessing:
+`subghz_block_generic_deserialize()` (`lib/subghz/blocks/generic.c`,
+identical in both repos) calls `flipper_format_rewind(flipper_format)` as
+its **first statement**, before reading `Bit`/`Key` -- and every fixed-code
+protocol's encoder `deserialize` (checked: princeton, came) funnels through
+it. Stock's own `subghz_key_load()` relies on the identical fact: it never
+rewinds `fff_data` between its own `stream_copy_full()` and
+`subghz_protocol_decoder_base_deserialize()` either. No code change needed;
+documented at the call site in `recorder_radio.c` so a future reader does
+not re-derive it.
+
+**On-device this session (COM4, `mntm-dev` `8ed809fb`, API 87.1, DE --
+`device_info` re-confirmed identical to the block above, no drift):**
+- Listen (Armed), fresh launch: exactly one `SubGhzWorker`, cycling
+  Blocked/Ready normally; app-thread `Stack Min` 11392/12284; heap
+  `minimum` 56888 -- matches this file's existing baseline exactly. The new
+  `app->decoded`/`proto_line` fields do not perturb ordinary Listen-mode
+  behaviour.
+- **Un-decodable control (verification item 4), clean pass.** Trigger pushed
+  to the most sensitive slot (-85 dBm) via CLI settings navigation, then 40 s
+  of ambient listening: **30 new files**, 17 `capture saved` + 9
+  `capture dropped` log lines in the streamed window. **Zero** `decoded:`
+  log lines and **zero** `_D.sub`/`_RC.sub` files among the 30 -- noise never
+  produces a false decode sidecar, and the RAW-only capture path is unbroken
+  by this phase's changes. `uptime` climbed monotonically throughout, no
+  crash.
+- `flipper-c-review`: no defects. Every new `*_alloc()`/`*_free()` pair
+  checked on every exit path (grep-confirmed, `recorder_radio.c`);
+  single-writer discipline holds for `app->decoded` (exactly 2 writers,
+  mirrors `app->rolling`) and `proto_line` (one `with_view_model` site, in
+  `recorder_ui.c`); no new `furi_check`-guarded firmware call; no fork-ABI
+  surface beyond what STEP 0 already certified. One `note`: Nice FloR-S's
+  72-bit case (`data_count_bit == 72`, Momentum's "Nice One" extra `Data`
+  field) will not show `Bit`/`Key` on the Analyze page -- the `bit <= 64`
+  guard in `sub_rec_analyze_load()` correctly and safely skips it, since the
+  firmware's `Key` field is fixed at 8 bytes/64 bits regardless of
+  `data_count_bit`; not a defect, matches the plan's bound exactly.
+- `flipper-perf-review`: static half clean (no new large stack buffers, no
+  new unbounded write path, the new `with_view_model` call site fires at the
+  same non-periodic rate as the `sub_rec_set_counts()` it sits beside). The
+  only on-device figures gathered this session are the two bullets above
+  (RAW-only capture load); `sub_rec_save_decoded()`, the Analyze `Bit`/`Key`
+  parse, and the generalized Replay path were never exercised on-device this
+  session (see below) -- their stack/heap/timing cost is unmeasured, not
+  assumed clean.
+
+**Not verified on device this session (no fixed-code remote available):**
+the actual decode -> `_D.sub` write -> protocol label -> Analyze `Bit`/`Key`
+chain end to end (verification items 1, 2, 3, 6), a rolling-code file's
+`_RC_D` naming (item 5), and all of increment B's replay verification (items
+8-12: decoded replay success, `storage md5` proving the saved file survives
+replay unmodified, RAW replay regression, the four abort-path regressions,
+and the rolling-code replay gate) -- every one needs either a real RF burst
+from a fixed-code transmitter or a physical button press on
+`dialog_file_browser_show()`, neither of which a CLI session can produce
+(see "Testing this app" above). The Phase 1 sensitivity gate (dBm delta
+against a held remote) is carried over again, same reason. Land this exactly
+as the plan's own contingency describes: implementation complete, static
+review clean, RAW-capture path proven unbroken by both increments' builds --
+but the decode/replay features themselves are unverified pending physical
+access. Run the plan's Verification section items 1-3, 5, 6, 8-13 with a
+real fixed-code remote before relying on this feature in the field.
+
+**Record correction (not a re-open): the previous "OR-mode ... confirmed
+clean" carry-over note was checking the wrong code.** The receiver-filter
+`(flag & filter) != 0` OR-test in `sub_rec_radio_alloc()` is and remains
+correct -- unrelated to this note. The actual open item is
+`sub_rec_raw_wave()`'s downsampler contingency (Analyze, Phase 3): if the
+waveform ever needs true presence/coverage rendering instead of
+midpoint-sampling, switching `wave[col] = level` to `wave[col] |= level` is
+**not** the one-line fix a prior pass's note claimed -- the existing loop
+already assigns each column exactly once, so `|=` and `=` are identical
+there; a real presence mode needs a span-fill loop over each pulse's column
+range (`col_start = t / col_us` .. `col_end = (t + d - 1) / col_us`), not an
+operator swap. Still un-invoked -- the waveform contingency has never been
+triggered, since Analyze's Waveform page itself remains unverified on
+device, per above -- recorded here so the next reader does not inherit a
+false "closed" status.
+
 ---
 
 # Review — mandatory final step

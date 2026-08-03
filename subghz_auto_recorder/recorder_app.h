@@ -24,9 +24,10 @@
 #define REC_DIR     EXT_PATH("subghz/auto_rec")
 #define REC_DIR_REL "auto_rec" // relative to SUBGHZ_RAW_FOLDER; see recorder_radio.c
 #define REC_STEM_MAX 48
-// Longest path this app builds: REC_DIR "/" <stem> "_RC.sub". EXT_PATH() is a
-// string-literal concat, so both sizeof()s are exact and already count a NUL.
-#define REC_PATH_MAX (sizeof(REC_DIR) + REC_STEM_MAX + sizeof("_RC.sub"))
+// Longest path this app builds: REC_DIR "/" <stem> "_RC_D.sub" (the decoded
+// sidecar of a rolling-code capture). EXT_PATH() is a string-literal concat, so
+// both sizeof()s are exact and already count a NUL.
+#define REC_PATH_MAX (sizeof(REC_DIR) + REC_STEM_MAX + sizeof("_RC_D.sub"))
 // Longest text a status/notice line can hold. Every scratch buffer that feeds
 // one is sized from this instead of an arbitrary number -- SubRecModel
 // truncates anything longer anyway.
@@ -86,6 +87,7 @@
 #define WAVE_COLS     120 // waveform columns; x = 4..123
 #define ANA_MOD_MAX   24  // "AM650", or an unrecognised Preset string, truncated
 #define ANA_PROTO_MAX 16
+#define ANA_KEY_MAX 17 // 8 key bytes as hex + NUL
 
 // Generation-stamped events -- identical scheme to universal_card_reader
 // (reader_app.h invariant 2). Keep every SubRecCustomEvent value below 256.
@@ -177,6 +179,8 @@ typedef struct {
     uint16_t wave_len; // columns filled; 0 == nothing to draw
     char mod[ANA_MOD_MAX]; // short label, else the raw Preset string
     char proto[ANA_PROTO_MAX]; // Protocol field; "RAW" for every capture today
+    uint32_t bit; // decoded bit count; 0 == not a decoded file, nothing to draw
+    char key[ANA_KEY_MAX]; // Key as hex, only the bytes `bit` covers
     uint8_t wave[WAVE_COLS]; // 0/1 level per column
 } SubRecAnalysis;
 
@@ -191,6 +195,7 @@ typedef struct {
     uint32_t dropped;
     char freq_line[24];
     char last_file[REC_TEXT_LINE_MAX];
+    char proto_line[REC_TEXT_LINE_MAX]; // last capture's decoded protocol; "" = none
     char notice_title[24];
     char notice_l1[REC_TEXT_LINE_MAX];
     char notice_l2[REC_TEXT_LINE_MAX];
@@ -255,6 +260,15 @@ typedef struct {
     // sufficient: single word, single writer, no ordering dependency on any
     // other field.
     volatile bool rolling;
+    // Written on the SubGhzWorker thread (sub_rec_decoded_callback), read on the
+    // GUI thread in sub_rec_capture_finish() -- but only AFTER its
+    // subghz_worker_stop(), which furi_thread_joins the worker, so the join is
+    // the synchronisation and volatile only stops the compiler caching it.
+    // The decoder instance itself is owned by app->receiver and outlives every
+    // capture (subghz_receiver_alloc_init/-_free are the only alloc/free), so the
+    // pointer never dangles. Last decoder to fire wins when several match one
+    // burst -- same arbitrary-but-harmless rule app->rolling already uses.
+    SubGhzProtocolDecoderBase* volatile decoded;
 
     bool cooldown;
     bool last_above;

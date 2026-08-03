@@ -90,6 +90,8 @@ static void draw_listening(Canvas* canvas, const SubRecModel* m) {
         draw_centered(canvas, 42, buf);
     } else if(m->cooldown) {
         draw_centered(canvas, 42, "carrier");
+    } else if(m->proto_line[0]) {
+        draw_centered_fit(canvas, 42, m->proto_line, 124);
     } else {
         draw_centered(canvas, 42, "armed");
     }
@@ -154,7 +156,7 @@ static void draw_analyzing(Canvas* canvas, const SubRecModel* m) {
     if(m->ana_page == 0) {
         draw_title_bar(canvas, "Info  >waveform");
         // Same "%lu.%02lu MHz" integer split every other screen in this app uses;
-        // no float printf is dragged in. Line 63 is deliberately left free.
+        // no float printf is dragged in.
         snprintf(
             buf,
             sizeof(buf),
@@ -169,6 +171,10 @@ static void draw_analyzing(Canvas* canvas, const SubRecModel* m) {
         draw_centered_fit(canvas, 44, buf, 124);
         snprintf(buf, sizeof(buf), "Size: %lu B", (unsigned long)m->ana.bytes);
         draw_centered_fit(canvas, 54, buf, 124);
+        if(m->ana.bit) {
+            snprintf(buf, sizeof(buf), "Bit: %lu  Key: %s", (unsigned long)m->ana.bit, m->ana.key);
+            draw_centered_fit(canvas, 63, buf, 124);
+        }
         return;
     }
 
@@ -267,6 +273,14 @@ void sub_rec_set_counts(SubRecApp* app, uint32_t saved, uint32_t dropped, const 
             m->dropped = dropped;
             snprintf(m->last_file, sizeof(m->last_file), "%s", last_file ? last_file : "");
         },
+        true);
+}
+
+void sub_rec_set_proto_line(SubRecApp* app, const char* proto) {
+    with_view_model(
+        app->view,
+        SubRecModel * m,
+        { snprintf(m->proto_line, sizeof(m->proto_line), "%s", proto); },
         true);
 }
 

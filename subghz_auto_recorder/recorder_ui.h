@@ -15,6 +15,7 @@ void sub_rec_set_samples(SubRecApp* app, size_t samples);
 void sub_rec_set_state(SubRecApp* app, SubRecState s, bool cooldown);
 void sub_rec_set_notice(SubRecApp* app, const char* title, const char* l1, const char* l2, bool active);
 void sub_rec_set_counts(SubRecApp* app, uint32_t saved, uint32_t dropped, const char* last_file);
+void sub_rec_set_proto_line(SubRecApp* app, const char* proto);
 // Sole writer of the model's `trigger` (the RSSI-bar tick position).
 void sub_rec_set_freq_line(SubRecApp* app, const char* line, float trigger);
 void sub_rec_set_scan(SubRecApp* app, uint8_t idx, int8_t dbm, uint8_t peak, bool update);

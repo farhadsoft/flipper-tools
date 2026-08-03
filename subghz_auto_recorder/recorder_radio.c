@@ -6,6 +6,8 @@
 
 #include <lib/subghz/devices/cc1101_int/cc1101_int_interconnect.h>
 #include <lib/subghz/subghz_protocol_registry.h>
+#include <lib/flipper_format/flipper_format_i.h> // flipper_format_get_raw_stream
+#include <lib/toolbox/stream/stream.h>           // stream_copy_full
 
 /* ------------------------- worker/receiver callbacks ------------------ */
 
@@ -39,6 +41,7 @@ static void
     if(base->protocol->type == SubGhzProtocolTypeDynamic) {
         app->rolling = true;
     }
+    app->decoded = base;
 }
 
 /* ---------------------------- session lifecycle ------------------------ */
@@ -134,10 +137,82 @@ void sub_rec_listen_start(SubRecApp* app) {
     char line[24];
     sub_rec_format_freq_line(app, line, sizeof(line));
     sub_rec_set_freq_line(app, line, sub_rec_triggers[app->trigger_idx]);
+    sub_rec_set_proto_line(app, "");
 
     furi_timer_start(app->rssi_timer, furi_ms_to_ticks(RSSI_POLL_MS));
     sub_rec_set_state(app, SubRecStateArmed, false);
     app->last_above_tick = furi_get_tick();
+}
+
+// GUI thread only, and only from sub_rec_capture_finish() AFTER its
+// subghz_worker_stop() -- that call furi_thread_joins the worker
+// (lib/subghz/subghz_worker.c), so no feed() is in flight and the decoder that
+// fired during the burst is quiescent, still holding its completed frame: a
+// decoder's reset() only rewinds parser_step (verified in princeton.c/came.c),
+// nothing between the callback and here clears generic.data. That is why no
+// snapshot has to be taken in the worker callback.
+//
+// Writes a SECOND file, <stem>_D.sub, next to the RAW capture -- never into the
+// RAW file's own path. subghz_block_generic_serialize() opens with stream_clean(),
+// so an in-place serialize that failed halfway would already have truncated the
+// capture, and fixed-code protocols carry no checksum, so a false decode on noise
+// is expected and the RAW capture has to survive one.
+//
+// Unbuffered flipper_format_file_alloc(), not the buffered variant: nothing here
+// re-reads the file, and the RAW path's own writer is the only buffered user.
+//
+// `label` receives the on-screen protocol text, "" when nothing was written.
+static void sub_rec_save_decoded(SubRecApp* app, char* label, size_t label_size) {
+    SubGhzProtocolDecoderBase* base = app->decoded;
+
+    // Derived from the FINAL capture_path, so a rolling-code capture yields
+    // <stem>_RC_D.sub and sub_rec_replay()'s strstr(base, "_RC") gate still fires
+    // on it. Same strip-".sub"-then-append idiom as the _RC rename below.
+    FuriString* dpath = furi_string_alloc();
+    furi_string_set_n(dpath, app->capture_path, 0, furi_string_size(app->capture_path) - 4);
+    furi_string_cat_str(dpath, "_D.sub");
+    const char* path = furi_string_get_cstr(dpath);
+
+    FlipperFormat* ff = flipper_format_file_alloc(app->storage);
+    SubGhzProtocolStatus st = SubGhzProtocolStatusError;
+    if(!flipper_format_file_open_always(ff, path)) {
+        FURI_LOG_W(TAG, "decoded: open failed: %s", path);
+    } else {
+        st = subghz_protocol_decoder_base_serialize(base, ff, &app->preset.base);
+    }
+    flipper_format_free(ff); // closes the file before the remove below
+
+    if(st != SubGhzProtocolStatusOk) {
+        FURI_LOG_W(TAG, "decoded: serialize failed (%d): %s", (int)st, path);
+        // storage_simply_remove() returns true for an already-absent file, so an
+        // unchecked call would hide a real failure -- same reason the drop path
+        // below logs it.
+        if(!storage_simply_remove(app->storage, path)) {
+            FURI_LOG_W(TAG, "decoded: remove failed: %s", path);
+        }
+        label[0] = '\0';
+        furi_string_free(dpath);
+        return;
+    }
+
+    // The firmware's own one-line label ("Princeton 24bit", "CAME 12bit"): every
+    // decoder's get_string() starts with "<name> <bits>bit\r\n", so truncating at
+    // the first CR gives exactly what the stock Read screen shows, with no reach
+    // into a protocol-specific decoder struct for the bit count.
+    // ->protocol->name is the first member of struct SubGhzProtocol and is
+    // fork-stable (Momentum appends `filter` after decoder) -- the fallback.
+    FuriString* s = furi_string_alloc();
+    if(subghz_protocol_decoder_base_get_string(base, s)) {
+        size_t cr = furi_string_search_char(s, '\r', 0);
+        if(cr != FURI_STRING_FAILURE) furi_string_left(s, cr);
+        snprintf(label, label_size, "%s", furi_string_get_cstr(s));
+    } else {
+        snprintf(label, label_size, "%s", base->protocol->name);
+    }
+    furi_string_free(s);
+
+    FURI_LOG_I(TAG, "decoded: %s -> %s", label, path);
+    furi_string_free(dpath);
 }
 
 // Shared by sub_rec_capture_end() and sub_rec_listen_stop(). Stop-before-
@@ -150,6 +225,7 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
     subghz_protocol_raw_save_to_file_stop(app->raw);
 
     const char* final_name = "";
+    char proto_label[REC_TEXT_LINE_MAX] = "";
     bool kept = spl >= MIN_RAW_SAMPLES;
     if(!kept) {
         const char* drop_path = furi_string_get_cstr(app->capture_path);
@@ -178,6 +254,9 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
             }
             furi_string_free(renamed);
         }
+        if(app->decoded) {
+            sub_rec_save_decoded(app, proto_label, sizeof(proto_label));
+        }
         app->saved++;
         const char* full = furi_string_get_cstr(app->capture_path);
         const char* base = strrchr(full, '/');
@@ -189,6 +268,7 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
     }
     sub_rec_set_state(app, SubRecStateArmed, capped);
     sub_rec_set_counts(app, app->saved, app->dropped, final_name);
+    sub_rec_set_proto_line(app, proto_label);
     FURI_LOG_I(TAG, "capture %s: %u samples", kept ? "saved" : "dropped", (unsigned)spl);
 }
 
@@ -229,6 +309,7 @@ void sub_rec_capture_begin(SubRecApp* app) {
     // thread, so clearing this afterwards could erase a detection made from
     // the burst's first edges.
     app->rolling = false;
+    app->decoded = NULL;
     subghz_worker_start(app->worker);
 
     sub_rec_set_state(app, SubRecStateRecording, false);
@@ -439,13 +520,17 @@ void sub_rec_replay(SubRecApp* app) {
     FlipperFormat* ff = flipper_format_file_alloc(app->storage);
     uint32_t freq = 0;
     FuriString* preset_str = furi_string_alloc();
+    FuriString* proto_str = furi_string_alloc();
     bool read_ok = flipper_format_file_open_existing(ff, path) &&
                    flipper_format_read_uint32(ff, "Frequency", &freq, 1) &&
-                   flipper_format_read_string(ff, "Preset", preset_str);
+                   flipper_format_read_string(ff, "Preset", preset_str) &&
+                   flipper_format_rewind(ff) &&
+                   flipper_format_read_string(ff, "Protocol", proto_str);
     flipper_format_free(ff);
     if(!read_ok) {
         FURI_LOG_W(TAG, "replay: unreadable file: %s", path);
         furi_string_free(preset_str);
+        furi_string_free(proto_str);
         sub_rec_show_notice(app, "Unreadable file", "", "", SubRecViewFileMenu, 0);
         return;
     }
@@ -464,6 +549,7 @@ void sub_rec_replay(SubRecApp* app) {
         snprintf(l1, sizeof(l1), "%s", furi_string_get_cstr(preset_str));
         FURI_LOG_W(TAG, "replay: unsupported preset: %s", l1);
         furi_string_free(preset_str);
+        furi_string_free(proto_str);
         sub_rec_show_notice(app, "Unsupported preset", l1, "", SubRecViewFileMenu, 0);
         return;
     }
@@ -473,22 +559,58 @@ void sub_rec_replay(SubRecApp* app) {
     // an invalid frequency.
     if(!subghz_devices_is_frequency_valid(app->device, freq)) {
         FURI_LOG_W(TAG, "replay: bad frequency: %lu", (unsigned long)freq);
+        furi_string_free(proto_str);
         sub_rec_show_notice(app, "Bad frequency", "", "", SubRecViewFileMenu, 0);
         return;
     }
 
+    const char* proto = furi_string_get_cstr(proto_str);
     app->fff_tx = flipper_format_string_alloc();
-    subghz_protocol_raw_gen_fff_data(app->fff_tx, path, subghz_devices_get_name(app->device));
+    if(strcmp(proto, SUBGHZ_PROTOCOL_RAW_NAME) == 0) {
+        subghz_protocol_raw_gen_fff_data(app->fff_tx, path, subghz_devices_get_name(app->device));
+    } else {
+        // Never hand the encoder the file handle: Momentum's princeton encoder
+        // deserialize calls flipper_format_update_hex(ff, "Key", ...), which would
+        // rewrite the user's saved .sub mid-replay. Stock subghz_key_load() copies
+        // the whole file into a string format for exactly this reason;
+        // stream_copy_full() rewinds both streams and copies stream_size(from).
+        FlipperFormat* src = flipper_format_file_alloc(app->storage);
+        bool copied = flipper_format_file_open_existing(src, path) &&
+                      stream_copy_full(
+                          flipper_format_get_raw_stream(src),
+                          flipper_format_get_raw_stream(app->fff_tx)) > 0;
+        flipper_format_free(src);
+        if(!copied) {
+            FURI_LOG_W(TAG, "replay: copy failed: %s", path);
+            sub_rec_tx_abort(app); // frees fff_tx; transmitter is still NULL
+            sub_rec_show_notice(app, "Unreadable file", "", "", SubRecViewFileMenu, 0);
+            furi_string_free(proto_str);
+            return;
+        }
+    }
 
-    app->transmitter = subghz_transmitter_alloc_init(app->env, SUBGHZ_PROTOCOL_RAW_NAME);
+    app->transmitter = subghz_transmitter_alloc_init(app->env, proto);
+    furi_string_free(proto_str);
     if(!app->transmitter) {
         sub_rec_tx_abort(app);
         sub_rec_show_notice(app, "TX failed", "encoder alloc", "", SubRecViewFileMenu, 0);
         return;
     }
+    // No flipper_format_rewind(app->fff_tx) here despite stream_copy_full()
+    // leaving its destination stream positioned at EOF (both streams are seeked
+    // to 0 first, but stream_copy()'s stream_write() calls advance stream_to's
+    // cursor as they write -- lib/toolbox/stream/stream.c). Every fixed-code
+    // protocol's encoder deserialize funnels through
+    // subghz_block_generic_deserialize() (lib/subghz/blocks/generic.c, identical
+    // in official and Momentum @8ed809fb), whose FIRST statement is
+    // flipper_format_rewind(flipper_format), before it reads Bit/Key. Stock
+    // subghz_key_load() relies on this exact fact: it never rewinds fff_data
+    // between its own stream_copy_full() and
+    // subghz_protocol_decoder_base_deserialize(). Verified against both repos'
+    // source this session, not assumed.
     if(subghz_transmitter_deserialize(app->transmitter, app->fff_tx) != SubGhzProtocolStatusOk) {
         sub_rec_tx_abort(app);
-        sub_rec_show_notice(app, "TX failed", "bad RAW data", "", SubRecViewFileMenu, 0);
+        sub_rec_show_notice(app, "TX failed", "bad payload", "", SubRecViewFileMenu, 0);
         return;
     }
 

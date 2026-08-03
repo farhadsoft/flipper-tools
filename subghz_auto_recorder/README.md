@@ -1,8 +1,8 @@
 # SubGHz Auto Recorder
 
-Flipper Zero FAP — `application.fam` description: **Sweeps the ISM bands for activity, auto-records detected signals to .sub, replays them.**
+Flipper Zero FAP — `application.fam` description: **Sweeps the ISM bands for activity, auto-records and decodes detected signals to .sub, replays them.**
 
-- **Version:** 1.2 (`fap_version` in `application.fam`)
+- **Version:** 1.3 (`fap_version` in `application.fam`)
 - **Category:** Sub-GHz
 - **Stack size:** 12 KB
 - **Author:** farhadsoft
@@ -15,6 +15,10 @@ trigger threshold it opens a RAW `.sub` file, records until the carrier
 drops (or a 10 s hard cap), and returns to listening automatically —
 no further input needed. Saved files are browsable from the app and can
 be replayed (TX), renamed, or deleted.
+
+When a burst also decodes as a known protocol, the app writes a second
+file (`<stem>_D.sub`, never in place of the RAW capture) and shows the
+protocol name on the Listening screen in place of `armed`.
 
 All `subghz_devices_*` / `SubGhzWorker` start/stop calls happen on the GUI
 thread; the worker thread and the three timers only ever post via
@@ -47,15 +51,18 @@ thread; the worker thread and the three timers only ever post via
    **Delete all** removes every `.sub` file directly in
    `/ext/subghz/auto_rec/` (subdirectories and non-`.sub` files are left
    alone) and reports how many were deleted.
-7. **Replay** re-transmits the file on its own recorded frequency and
-   preset. A file whose name contains `_RC` (rolling code detected during
-   capture) shows a warning first; replaying it anyway will very likely
-   not open a rolling-code receiver -- see Limitations.
+7. **Replay** re-transmits the file on its own recorded frequency, preset,
+   and protocol -- a decoded file (`_D.sub`) replays as that protocol, a
+   RAW file replays as RAW. A file whose name contains `_RC` (rolling code
+   detected during capture) shows a warning first; replaying it anyway will
+   very likely not open a rolling-code receiver -- see Limitations.
 8. **Analyze** is read-only: no radio call, no file write. It shows an
-   **Info** page (frequency, modulation, protocol, sample count, file size)
-   and a **Waveform** page (the burst's pulse train, downsampled to 120
-   columns). **Left**/**Right** toggles between the two pages; **Back**
-   returns to the file menu.
+   **Info** page (frequency, modulation, protocol, sample count, file size,
+   and a `Bit`/`Key` line for any file that carries them -- decoded by this
+   app or not) and a **Waveform** page (the burst's pulse train, downsampled
+   to 120 columns; empty for a decoded file, which has no `RAW_Data`).
+   **Left**/**Right** toggles between the two pages; **Back** returns to the
+   file menu.
 
 ## Storage
 
@@ -68,6 +75,10 @@ are `AR_<freq/100kHz>_<HHMMSS>.sub` (e.g. `AR_4339_143022.sub` for
 protocol was decoded during the capture. Captures with fewer than 40 raw
 edges are treated as noise and discarded automatically (the `dropped`
 counter on screen).
+
+When a burst also decodes as a known protocol, a second file,
+`<same stem>_D.sub`, is written next to the RAW capture -- never in place
+of it, so a false decode on noise never costs you the raw recording.
 
 ## Limitations
 

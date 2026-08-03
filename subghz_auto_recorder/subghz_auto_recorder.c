@@ -571,6 +571,26 @@ static bool sub_rec_analyze_load(SubRecApp* app) {
             snprintf(a.proto, sizeof(a.proto), "?");
         }
 
+        // Decoded files carry Bit + an 8-byte big-endian Key
+        // (subghz_block_generic_serialize); RAW captures carry neither, so both
+        // are optional and a.bit == 0 means "do not draw the line".
+        uint32_t bit = 0;
+        uint8_t key[8];
+        flipper_format_rewind(ff);
+        if(flipper_format_read_uint32(ff, "Bit", &bit, 1) && bit >= 1 && bit <= 64) {
+            flipper_format_rewind(ff);
+            if(flipper_format_read_hex(ff, "Key", key, sizeof(key))) {
+                size_t nbytes = (bit + 7) / 8;
+                // Each snprintf writes 2 hex chars + a NUL the next one overwrites;
+                // the final NUL lands at key[nbytes*2] <= 16. No return-value
+                // pointer arithmetic, no long-long printf.
+                for(size_t i = 0; i < nbytes; i++) {
+                    snprintf(a.key + i * 2, 3, "%02X", key[sizeof(key) - nbytes + i]);
+                }
+                a.bit = bit;
+            }
+        }
+
         flipper_format_rewind(ff);
         a.samples = sub_rec_raw_totals(ff, tmp, &a.total_us);
 
