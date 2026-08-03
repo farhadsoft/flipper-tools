@@ -920,53 +920,6 @@ static void sub_rec_trigger_changed(VariableItem* item) {
     sub_rec_set_freq_line(app, line, sub_rec_triggers[idx]);
 }
 
-// One callback for the whole list; index is the row's list position
-// (0 = Frequency), not its value-index. Only the Frequency row, and only
-// when its current value is the "Custom" slot, routes anywhere.
-static void sub_rec_settings_enter_callback(void* context, uint32_t index) {
-    SubRecApp* app = context;
-    if(index != 0) return;
-    if(variable_item_get_current_value_index(app->freq_item) != (uint8_t)COUNT_OF(sub_rec_freqs))
-        return;
-
-    uint32_t current = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
-    number_input_set_header_text(app->number, "Frequency, kHz");
-    number_input_set_result_callback(
-        app->number, sub_rec_freq_number_result, app, (int32_t)(current / 1000), 300000, 928000);
-    sub_rec_switch_view(app, SubRecViewNumber);
-}
-
-static void sub_rec_build_settings(SubRecApp* app) {
-    VariableItem* item;
-    char buf[16];
-
-    item = variable_item_list_add(
-        app->settings, "Frequency", (uint8_t)(COUNT_OF(sub_rec_freqs) + 1), sub_rec_freq_changed, app);
-    uint32_t f = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
-    uint8_t fidx = app->custom_freq ? (uint8_t)COUNT_OF(sub_rec_freqs) : app->freq_idx;
-    variable_item_set_current_value_index(item, fidx);
-    snprintf(
-        buf,
-        sizeof(buf),
-        "%lu.%02lu MHz",
-        (unsigned long)(f / 1000000),
-        (unsigned long)(f / 10000 % 100));
-    variable_item_set_current_value_text(item, buf);
-    app->freq_item = item;
-
-    item = variable_item_list_add(
-        app->settings, "Modulation", (uint8_t)COUNT_OF(sub_rec_mods), sub_rec_mod_changed, app);
-    variable_item_set_current_value_index(item, app->mod_idx);
-    variable_item_set_current_value_text(item, sub_rec_mods[app->mod_idx].label);
-
-    item = variable_item_list_add(
-        app->settings, "Trigger", (uint8_t)COUNT_OF(sub_rec_triggers), sub_rec_trigger_changed, app);
-    variable_item_set_current_value_index(item, app->trigger_idx);
-    variable_item_set_current_value_text(item, sub_rec_trigger_labels[app->trigger_idx]);
-
-    variable_item_list_set_enter_callback(app->settings, sub_rec_settings_enter_callback, app);
-}
-
 /* --------------------------- dispatcher wiring -------------------------- */
 
 // Back that no view consumed. Runs on the GUI thread (input path), so
@@ -1026,6 +979,11 @@ static bool sub_rec_navigation_callback(void* context) {
         return true;
     }
 
+    if(app->current_view == SubRecViewProfiles) {
+        sub_rec_switch_view(app, SubRecViewSettings); // entered from Settings
+        return true;
+    }
+
     if(app->current_view == SubRecViewSettings || app->current_view == SubRecViewNumber ||
        app->current_view == SubRecViewFileMenu || app->current_view == SubRecViewText ||
        app->current_view == SubRecViewSaved) {
@@ -1074,6 +1032,302 @@ static void sub_rec_menu_callback(void* context, uint32_t index) {
     view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(index, app->gen));
 }
 
+// Placed here, ahead of the profiles/settings functions below, and NOT next
+// to sub_rec_app_alloc() where they're called: this file uses no forward
+// declarations, sub_rec_profile_delete()/sub_rec_profile_save_result() call
+// sub_rec_config_save(), and sub_rec_custom_event_callback() (below) calls
+// into the profiles group -- so config save/load must precede both.
+// GUI thread, once, from sub_rec_app_alloc() AFTER sub_rec_radio_alloc()
+// (needs app->device for the frequency check) and BEFORE
+// sub_rec_build_settings() (which seeds the rows from these fields).
+// Every field is independent: a missing or out-of-range value keeps the
+// compiled-in default instead of failing the whole load.
+static void sub_rec_config_load(SubRecApp* app) {
+    FlipperFormat* ff = flipper_format_file_alloc(app->storage);
+    FuriString* type = furi_string_alloc();
+    uint32_t ver = 0, v = 0;
+    if(flipper_format_file_open_existing(ff, REC_CONF_PATH) &&
+       flipper_format_read_header(ff, type, &ver) &&
+       furi_string_cmp_str(type, REC_CONF_TYPE) == 0 && ver == REC_CONF_VERSION) {
+        flipper_format_rewind(ff);
+        if(flipper_format_read_uint32(ff, "Frequency", &v, 1) &&
+           subghz_devices_is_frequency_valid(app->device, v)) {
+            uint8_t idx = (uint8_t)COUNT_OF(sub_rec_freqs);
+            for(size_t i = 0; i < COUNT_OF(sub_rec_freqs); i++) {
+                if(sub_rec_freqs[i] == v) {
+                    idx = (uint8_t)i;
+                    break;
+                }
+            }
+            if(idx < COUNT_OF(sub_rec_freqs)) app->freq_idx = idx;
+            else app->custom_freq = v;
+        }
+        flipper_format_rewind(ff);
+        if(flipper_format_read_uint32(ff, "Modulation", &v, 1) && v < COUNT_OF(sub_rec_mods))
+            app->mod_idx = (uint8_t)v;
+        flipper_format_rewind(ff);
+        if(flipper_format_read_uint32(ff, "Trigger", &v, 1) && v < COUNT_OF(sub_rec_triggers))
+            app->trigger_idx = (uint8_t)v;
+
+        // Repeated key, one row per saved profile: "name freq mod trigger".
+        // Reading uses the same successive-flipper_format_read_string() idiom
+        // sub_rec_raw_totals() relies on for repeated RAW_Data lines.
+        flipper_format_rewind(ff);
+        FuriString* row = furi_string_alloc();
+        while(app->profile_n < REC_PROFILE_MAX &&
+              flipper_format_read_string(ff, "Profile", row)) {
+            const char* s = furi_string_get_cstr(row);
+            const char* sp = strchr(s, ' ');
+            if(!sp || sp == s) {
+                FURI_LOG_W(TAG, "config: bad profile row (no name), skipped");
+                continue;
+            }
+            size_t nlen = (size_t)(sp - s);
+            if(nlen >= REC_PROFILE_NAME_MAX) nlen = REC_PROFILE_NAME_MAX - 1;
+            int32_t val[3];
+            char* p = (char*)sp;
+            bool prof_ok = true;
+            for(int i = 0; i < 3 && prof_ok; i++)
+                prof_ok = (strint_to_int32(p, &p, &val[i], 10) == StrintParseNoError);
+            if(!prof_ok || val[0] <= 0) {
+                FURI_LOG_W(TAG, "config: bad profile row \"%s\", skipped", s);
+                continue;
+            }
+            SubRecProfile* pr = &app->profiles[app->profile_n];
+            memcpy(pr->name, s, nlen);
+            pr->name[nlen] = '\0';
+            pr->freq = (uint32_t)val[0];
+            pr->mod_idx = (val[1] >= 0 && val[1] < (int32_t)COUNT_OF(sub_rec_mods)) ?
+                              (uint8_t)val[1] :
+                              0;
+            pr->trigger_idx = (val[2] >= 0 && val[2] < (int32_t)COUNT_OF(sub_rec_triggers)) ?
+                                   (uint8_t)val[2] :
+                                   SUB_REC_TRIGGER_DEFAULT_IDX;
+            app->profile_n++;
+        }
+        furi_string_free(row);
+    } else {
+        FURI_LOG_I(TAG, "config: none or wrong version, using defaults");
+    }
+    flipper_format_free(ff);
+    furi_string_free(type);
+}
+
+// GUI thread. Rewrites the whole file -- it is a few hundred bytes, so there
+// is no in-place update path to keep correct.
+static void sub_rec_config_save(SubRecApp* app) {
+    storage_simply_mkdir(app->storage, REC_CONF_ROOT);
+    storage_simply_mkdir(app->storage, REC_CONF_DIR);
+    FlipperFormat* ff = flipper_format_file_alloc(app->storage);
+    bool ok = false;
+    if(flipper_format_file_open_always(ff, REC_CONF_PATH)) {
+        uint32_t freq = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
+        uint32_t mod = app->mod_idx, trig = app->trigger_idx;
+        ok = flipper_format_write_header_cstr(ff, REC_CONF_TYPE, REC_CONF_VERSION) &&
+             flipper_format_write_uint32(ff, "Frequency", &freq, 1) &&
+             flipper_format_write_uint32(ff, "Modulation", &mod, 1) &&
+             flipper_format_write_uint32(ff, "Trigger", &trig, 1);
+
+        char line[REC_PROFILE_NAME_MAX + 24];
+        for(uint8_t i = 0; ok && i < app->profile_n; i++) {
+            snprintf(
+                line,
+                sizeof(line),
+                "%s %lu %u %u",
+                app->profiles[i].name,
+                (unsigned long)app->profiles[i].freq,
+                app->profiles[i].mod_idx,
+                app->profiles[i].trigger_idx);
+            ok = flipper_format_write_string_cstr(ff, "Profile", line);
+        }
+    }
+    flipper_format_free(ff);
+    if(!ok) FURI_LOG_E(TAG, "config: save failed: %s", REC_CONF_PATH);
+}
+
+/* ------------------------------- profiles ------------------------------ */
+
+// The only SubmenuItemCallbackEx in the app. Stashes the slot and press kind
+// (both written and read on the GUI thread) and posts one event, keeping the
+// app's "menu callbacks only post" rule.
+static void sub_rec_profile_row_callback(void* context, InputType type, uint32_t index) {
+    SubRecApp* app = context;
+    if(type != InputTypeShort && type != InputTypeLong) return;
+    app->profile_sel = (uint8_t)(index - SubRecEventProfileSlot0);
+    app->profile_del = (type == InputTypeLong);
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, EVENT_MAKE(SubRecEventProfilePick, app->gen));
+}
+
+// GUI thread. Rows: one per saved profile (OK loads, hold deletes), then
+// "Save current...", then "Back". Rebuilt each entry -- submenu_reset() plus
+// re-add is the only way to change the row set.
+static void sub_rec_show_profiles(SubRecApp* app) {
+    submenu_reset(app->profiles_menu);
+    submenu_set_header(app->profiles_menu, "OK=load hold=del");
+    for(uint8_t i = 0; i < app->profile_n; i++) {
+        submenu_add_item_ex(
+            app->profiles_menu,
+            app->profiles[i].name,
+            SubRecEventProfileSlot0 + i,
+            sub_rec_profile_row_callback,
+            app);
+    }
+    submenu_add_item(
+        app->profiles_menu, "Save current...", SubRecEventProfileSave, sub_rec_menu_callback, app);
+    // Reuses the Back row's existing handler: sub_rec_custom_event_callback()'s
+    // SubRecEventMenuSettings case already does sub_rec_switch_view(app,
+    // SubRecViewSettings) -- the same destination the Back *button* reaches
+    // through the nav-callback branch below, so the row and the button agree.
+    submenu_add_item(
+        app->profiles_menu, "Back", SubRecEventMenuSettings, sub_rec_menu_callback, app);
+    submenu_set_selected_item(
+        app->profiles_menu, app->profile_n ? SubRecEventProfileSlot0 : SubRecEventProfileSave);
+    sub_rec_switch_view(app, SubRecViewProfiles);
+}
+
+static void sub_rec_profile_apply(SubRecApp* app, uint8_t slot) {
+    const SubRecProfile* pr = &app->profiles[slot];
+    if(!subghz_devices_is_frequency_valid(app->device, pr->freq)) {
+        sub_rec_show_notice(app, "Bad frequency", pr->name, "", SubRecViewProfiles, 0);
+        return;
+    }
+    sub_rec_set_frequency(app, pr->freq); // from B1
+    app->mod_idx = pr->mod_idx;
+    app->trigger_idx = pr->trigger_idx;
+    // Re-sync both rows by hand and move the RSSI-bar tick, exactly as
+    // sub_rec_trigger_changed() does -- set_current_value_index() never fires
+    // the change callback.
+    variable_item_set_current_value_index(app->mod_item, app->mod_idx);
+    variable_item_set_current_value_text(app->mod_item, sub_rec_mods[app->mod_idx].label);
+    variable_item_set_current_value_index(app->trigger_item, app->trigger_idx);
+    variable_item_set_current_value_text(
+        app->trigger_item, sub_rec_trigger_labels[app->trigger_idx]);
+    char line[24];
+    sub_rec_format_freq_line(app, line, sizeof(line));
+    sub_rec_set_freq_line(app, line, sub_rec_triggers[app->trigger_idx]);
+    sub_rec_show_notice(app, "Loaded", pr->name, line, SubRecViewSettings, 0);
+}
+
+// No confirmation: a profile is three settings, recreated in three presses --
+// unlike a capture, nothing irreversible is lost. Contrast the capture wipes,
+// which keep their Cancel-defaulted confirm.
+static void sub_rec_profile_delete(SubRecApp* app, uint8_t slot) {
+    char name[REC_PROFILE_NAME_MAX];
+    snprintf(name, sizeof(name), "%s", app->profiles[slot].name);
+    for(uint8_t i = slot; i + 1 < app->profile_n; i++) app->profiles[i] = app->profiles[i + 1];
+    app->profile_n--;
+    sub_rec_config_save(app); // persist now: a crash must not resurrect it
+    sub_rec_show_notice(app, "Deleted", name, "", SubRecViewProfiles, 0);
+}
+
+static void sub_rec_handle_profile_pick(SubRecApp* app) {
+    if(app->profile_sel >= app->profile_n) return; // list shrank under a stale press
+    if(app->profile_del) sub_rec_profile_delete(app, app->profile_sel);
+    else sub_rec_profile_apply(app, app->profile_sel);
+}
+
+static void sub_rec_profile_save_result(void* context) {
+    SubRecApp* app = context;
+    if(app->profile_name_buf[0] == '\0') {
+        sub_rec_show_notice(app, "Save failed", "empty name", "", SubRecViewProfiles, 0);
+        return;
+    }
+    // A space is the field delimiter in the config line, so fold spaces to '_'
+    // instead of adding a validator the TextInput would have to enforce.
+    for(char* c = app->profile_name_buf; *c; c++)
+        if(*c == ' ') *c = '_';
+    SubRecProfile* pr = &app->profiles[app->profile_n];
+    snprintf(pr->name, sizeof(pr->name), "%s", app->profile_name_buf);
+    pr->freq = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
+    pr->mod_idx = app->mod_idx;
+    pr->trigger_idx = app->trigger_idx;
+    app->profile_n++;
+    sub_rec_config_save(app);
+    sub_rec_show_notice(app, "Saved", pr->name, "", SubRecViewProfiles, 0);
+}
+
+static void sub_rec_profile_save_start(SubRecApp* app) {
+    if(app->profile_n >= REC_PROFILE_MAX) {
+        sub_rec_show_notice(app, "Profiles full", "delete one first", "", SubRecViewProfiles, 0);
+        return;
+    }
+    app->profile_name_buf[0] = '\0';
+    text_input_set_header_text(app->text, "Profile name");
+    text_input_set_result_callback(
+        app->text,
+        sub_rec_profile_save_result,
+        app,
+        app->profile_name_buf,
+        sizeof(app->profile_name_buf),
+        true);
+    sub_rec_switch_view(app, SubRecViewText);
+}
+
+// One callback for the whole list; index is the row's list position
+// (0 = Frequency), not its value-index. Only the Frequency row, and only
+// when its current value is the "Custom" slot, routes anywhere.
+static void sub_rec_settings_enter_callback(void* context, uint32_t index) {
+    SubRecApp* app = context;
+    if(index == 0) {
+        if(variable_item_get_current_value_index(app->freq_item) !=
+           (uint8_t)COUNT_OF(sub_rec_freqs))
+            return;
+
+        uint32_t current = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
+        number_input_set_header_text(app->number, "Frequency, kHz");
+        number_input_set_result_callback(
+            app->number,
+            sub_rec_freq_number_result,
+            app,
+            (int32_t)(current / 1000),
+            300000,
+            928000);
+        sub_rec_switch_view(app, SubRecViewNumber);
+        return;
+    }
+    if(index == REC_SETTINGS_ROW_PROFILES) sub_rec_show_profiles(app);
+}
+
+static void sub_rec_build_settings(SubRecApp* app) {
+    VariableItem* item;
+    char buf[16];
+
+    item = variable_item_list_add(
+        app->settings, "Frequency", (uint8_t)(COUNT_OF(sub_rec_freqs) + 1), sub_rec_freq_changed, app);
+    uint32_t f = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
+    uint8_t fidx = app->custom_freq ? (uint8_t)COUNT_OF(sub_rec_freqs) : app->freq_idx;
+    variable_item_set_current_value_index(item, fidx);
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%lu.%02lu MHz",
+        (unsigned long)(f / 1000000),
+        (unsigned long)(f / 10000 % 100));
+    variable_item_set_current_value_text(item, buf);
+    app->freq_item = item;
+
+    item = variable_item_list_add(
+        app->settings, "Modulation", (uint8_t)COUNT_OF(sub_rec_mods), sub_rec_mod_changed, app);
+    variable_item_set_current_value_index(item, app->mod_idx);
+    variable_item_set_current_value_text(item, sub_rec_mods[app->mod_idx].label);
+    app->mod_item = item;
+
+    item = variable_item_list_add(
+        app->settings, "Trigger", (uint8_t)COUNT_OF(sub_rec_triggers), sub_rec_trigger_changed, app);
+    variable_item_set_current_value_index(item, app->trigger_idx);
+    variable_item_set_current_value_text(item, sub_rec_trigger_labels[app->trigger_idx]);
+    app->trigger_item = item;
+
+    // values_count 1, not 0: variable_item_list_process_right() compares
+    // against (values_count - 1) as uint8_t, so 0 would underflow to 255.
+    // With 1 the value cannot move and the row acts as a plain enter-row.
+    item = variable_item_list_add(app->settings, "Profiles", 1, NULL, app);
+    variable_item_set_current_value_text(item, ">");
+
+    variable_item_list_set_enter_callback(app->settings, sub_rec_settings_enter_callback, app);
+}
+
 static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
     SubRecApp* app = context;
 
@@ -1110,6 +1364,12 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
         return true;
     case SubRecEventMenuSettings:
         sub_rec_switch_view(app, SubRecViewSettings);
+        return true;
+    case SubRecEventProfileSave:
+        sub_rec_profile_save_start(app);
+        return true;
+    case SubRecEventProfilePick:
+        sub_rec_handle_profile_pick(app);
         return true;
     case SubRecEventMenuSaved:
         sub_rec_show_saved_menu(app);
@@ -1168,63 +1428,6 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
     default:
         return false;
     }
-}
-
-// GUI thread, once, from sub_rec_app_alloc() AFTER sub_rec_radio_alloc()
-// (needs app->device for the frequency check) and BEFORE
-// sub_rec_build_settings() (which seeds the rows from these fields).
-// Every field is independent: a missing or out-of-range value keeps the
-// compiled-in default instead of failing the whole load.
-static void sub_rec_config_load(SubRecApp* app) {
-    FlipperFormat* ff = flipper_format_file_alloc(app->storage);
-    FuriString* type = furi_string_alloc();
-    uint32_t ver = 0, v = 0;
-    if(flipper_format_file_open_existing(ff, REC_CONF_PATH) &&
-       flipper_format_read_header(ff, type, &ver) &&
-       furi_string_cmp_str(type, REC_CONF_TYPE) == 0 && ver == REC_CONF_VERSION) {
-        flipper_format_rewind(ff);
-        if(flipper_format_read_uint32(ff, "Frequency", &v, 1) &&
-           subghz_devices_is_frequency_valid(app->device, v)) {
-            uint8_t idx = (uint8_t)COUNT_OF(sub_rec_freqs);
-            for(size_t i = 0; i < COUNT_OF(sub_rec_freqs); i++) {
-                if(sub_rec_freqs[i] == v) {
-                    idx = (uint8_t)i;
-                    break;
-                }
-            }
-            if(idx < COUNT_OF(sub_rec_freqs)) app->freq_idx = idx;
-            else app->custom_freq = v;
-        }
-        flipper_format_rewind(ff);
-        if(flipper_format_read_uint32(ff, "Modulation", &v, 1) && v < COUNT_OF(sub_rec_mods))
-            app->mod_idx = (uint8_t)v;
-        flipper_format_rewind(ff);
-        if(flipper_format_read_uint32(ff, "Trigger", &v, 1) && v < COUNT_OF(sub_rec_triggers))
-            app->trigger_idx = (uint8_t)v;
-    } else {
-        FURI_LOG_I(TAG, "config: none or wrong version, using defaults");
-    }
-    flipper_format_free(ff);
-    furi_string_free(type);
-}
-
-// GUI thread. Rewrites the whole file -- it is a few hundred bytes, so there
-// is no in-place update path to keep correct.
-static void sub_rec_config_save(SubRecApp* app) {
-    storage_simply_mkdir(app->storage, REC_CONF_ROOT);
-    storage_simply_mkdir(app->storage, REC_CONF_DIR);
-    FlipperFormat* ff = flipper_format_file_alloc(app->storage);
-    bool ok = false;
-    if(flipper_format_file_open_always(ff, REC_CONF_PATH)) {
-        uint32_t freq = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
-        uint32_t mod = app->mod_idx, trig = app->trigger_idx;
-        ok = flipper_format_write_header_cstr(ff, REC_CONF_TYPE, REC_CONF_VERSION) &&
-             flipper_format_write_uint32(ff, "Frequency", &freq, 1) &&
-             flipper_format_write_uint32(ff, "Modulation", &mod, 1) &&
-             flipper_format_write_uint32(ff, "Trigger", &trig, 1);
-    }
-    flipper_format_free(ff);
-    if(!ok) FURI_LOG_E(TAG, "config: save failed: %s", REC_CONF_PATH);
 }
 
 /* ------------------------------- app life ------------------------------ */
@@ -1302,6 +1505,13 @@ static SubRecApp* sub_rec_app_alloc(void) {
     submenu_add_item(
         app->confirm_menu, "Delete", SubRecEventConfirmYes, sub_rec_menu_callback, app);
 
+    // Rows are added per entry by sub_rec_show_profiles(), not here -- the
+    // row set changes every time (profile count, "Save current..." always
+    // last).
+    app->profiles_menu = submenu_alloc();
+    view_dispatcher_add_view(
+        app->view_dispatcher, SubRecViewProfiles, submenu_get_view(app->profiles_menu));
+
     app->settings = variable_item_list_alloc();
     view_dispatcher_add_view(
         app->view_dispatcher, SubRecViewSettings, variable_item_list_get_view(app->settings));
@@ -1369,6 +1579,8 @@ static void sub_rec_app_free(SubRecApp* app) {
     submenu_free(app->saved_menu);
     view_dispatcher_remove_view(app->view_dispatcher, SubRecViewConfirm);
     submenu_free(app->confirm_menu);
+    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewProfiles);
+    submenu_free(app->profiles_menu);
     view_dispatcher_remove_view(app->view_dispatcher, SubRecViewSettings);
     variable_item_list_free(app->settings);
     view_dispatcher_remove_view(app->view_dispatcher, SubRecViewNumber);

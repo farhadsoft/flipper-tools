@@ -44,6 +44,11 @@
 // the feature plan). Independent of REC_TEXT_LINE_MAX: a label is content,
 // not a status/notice line.
 #define REC_NOTE_MAX 32
+#define REC_PROFILE_MAX      8
+#define REC_PROFILE_NAME_MAX 16 // spaces are the parse delimiter; see sub_rec_profile_save_result()
+// sub_rec_build_settings() row order: Frequency=0, Modulation=1, Trigger=2,
+// Profiles=3. Bump when a row is inserted before Profiles (D1/D2 do).
+#define REC_SETTINGS_ROW_PROFILES 3
 // storage_dir_read() truncates into a too-small buffer, and a truncated name
 // builds a path that does not exist -- storage_simply_remove() returns true
 // for an already-absent item (storage.h), so a truncated name would be
@@ -146,6 +151,9 @@ typedef enum {
     SubRecEventSavedClearDecoded,
     SubRecEventSavedClearRc,
     SubRecEventSavedStats,
+    SubRecEventProfileSave,
+    SubRecEventProfilePick,
+    SubRecEventProfileSlot0, // rows use +slot as their submenu index; never dispatched
 } SubRecCustomEvent;
 
 typedef enum {
@@ -157,6 +165,7 @@ typedef enum {
     SubRecViewText, // TextInput: rename
     SubRecViewSaved, // Submenu: Saved-signals actions (browse / clear all)
     SubRecViewConfirm, // Submenu: destructive-action confirmation
+    SubRecViewProfiles, // Submenu: saved profiles
 } SubRecView;
 
 // Momentum's SubGhzRadioPreset appends float latitude/longitude past the
@@ -236,6 +245,16 @@ typedef struct {
     SubRecStats stats;
 } SubRecModel;
 
+// A named freq+mod+trigger bundle -- see B2 in the feature plan. Also the
+// delivery of "favourite frequencies": loading a profile is a superset of
+// jumping to a saved frequency, so no separate favourites list exists.
+typedef struct {
+    char name[REC_PROFILE_NAME_MAX];
+    uint32_t freq; // Hz
+    uint8_t mod_idx; // index into sub_rec_mods[]
+    uint8_t trigger_idx; // index into sub_rec_triggers[]
+} SubRecProfile;
+
 typedef struct {
     Gui* gui;
     ViewDispatcher* view_dispatcher;
@@ -244,12 +263,18 @@ typedef struct {
     Submenu* file_menu; // per-file actions
     Submenu* saved_menu; // saved-signals actions
     Submenu* confirm_menu; // Clear all confirmation
+    Submenu* profiles_menu; // saved profiles
     VariableItemList* settings;
     // The Frequency row, captured so the settings enter callback (which only
     // receives a list-position index, not a value-index) can check whether
     // the row is currently showing the "Custom" slot. Owned by the app
     // struct rather than a file-static so all app state lives in one place.
     VariableItem* freq_item;
+    // Captured the same way freq_item is, so sub_rec_profile_apply() can
+    // re-sync both rows by hand (set_current_value_index() never fires the
+    // change callback).
+    VariableItem* mod_item;
+    VariableItem* trigger_item;
     NumberInput* number;
     TextInput* text;
     FuriTimer* rssi_timer; // periodic
@@ -285,6 +310,7 @@ typedef struct {
     FuriString* selected_path;
     char rename_buf[REC_STEM_MAX];
     char note_buf[REC_NOTE_MAX]; // selected file's Note; the TextInput edits this in place
+    char profile_name_buf[REC_PROFILE_NAME_MAX]; // TextInput target for Save current...
 
     bool ethics_shown;
     // Written on the SubGhzWorker thread (sub_rec_decoded_callback), read on
@@ -308,6 +334,10 @@ typedef struct {
     uint32_t tick_count; // redraw decimation
     bool rc_warned; // per selected file; cleared on (re)pick and on delete
     uint8_t clear_kind; // index into sub_rec_clear_kinds[], set when the confirm opens
+    SubRecProfile profiles[REC_PROFILE_MAX];
+    uint8_t profile_n;
+    uint8_t profile_sel; // slot the row callback stashed; consumed by sub_rec_handle_profile_pick()
+    bool profile_del; // true = long press (delete); false = short press (load)
 
     uint32_t capture_start_tick;
     uint32_t last_above_tick;
