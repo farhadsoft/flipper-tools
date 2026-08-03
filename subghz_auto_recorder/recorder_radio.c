@@ -142,6 +142,8 @@ void sub_rec_listen_start(SubRecApp* app) {
     furi_timer_start(app->rssi_timer, furi_ms_to_ticks(RSSI_POLL_MS));
     sub_rec_set_state(app, SubRecStateArmed, false);
     app->last_above_tick = furi_get_tick();
+    app->listen_start_tick = furi_get_tick();
+    app->limit_base = app->saved; // caps count THIS session, not the app's lifetime
 }
 
 // GUI thread only, and only from sub_rec_capture_finish() AFTER its

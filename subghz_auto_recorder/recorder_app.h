@@ -47,8 +47,9 @@
 #define REC_PROFILE_MAX      8
 #define REC_PROFILE_NAME_MAX 16 // spaces are the parse delimiter; see sub_rec_profile_save_result()
 // sub_rec_build_settings() row order: Frequency=0, Modulation=1, Trigger=2,
-// Profiles=3. Bump when a row is inserted before Profiles (D1/D2 do).
-#define REC_SETTINGS_ROW_PROFILES 3
+// Profiles=5 (D1 inserts Max captures/Max minutes before it; D2 bumps again
+// for Dedup).
+#define REC_SETTINGS_ROW_PROFILES 5
 // storage_dir_read() truncates into a too-small buffer, and a truncated name
 // builds a path that does not exist -- storage_simply_remove() returns true
 // for an already-absent item (storage.h), so a truncated name would be
@@ -356,6 +357,13 @@ typedef struct {
     uint8_t profile_n;
     uint8_t profile_sel; // slot the row callback stashed; consumed by sub_rec_handle_profile_pick()
     bool profile_del; // true = long press (delete); false = short press (load)
+
+    // Auto-record session limits (D1). Values, not indices, persist in
+    // config -- see sub_rec_max_caps[]/sub_rec_max_mins[].
+    uint8_t max_cap_idx;
+    uint8_t max_min_idx;
+    uint32_t listen_start_tick;
+    uint32_t limit_base; // app->saved at listen start; caps count THIS session
 
     uint32_t capture_start_tick;
     uint32_t last_above_tick;

@@ -47,6 +47,14 @@ static const char* const sub_rec_trigger_labels[] = {
     "-60 dBm",
 };
 
+// Values, not indices, go in the config, so a future table edit cannot
+// silently remap a saved setting.
+static const uint32_t sub_rec_max_caps[] = {0, 1, 3, 5, 10, 20, 50};
+static const char* const sub_rec_max_cap_labels[] = {"Off", "1", "3", "5", "10", "20", "50"};
+static const uint32_t sub_rec_max_mins[] = {0, 1, 5, 10, 30, 60};
+static const char* const sub_rec_max_min_labels[] =
+    {"Off", "1 min", "5 min", "10 min", "30 min", "60 min"};
+
 void sub_rec_format_freq_line(SubRecApp* app, char* out, size_t out_size) {
     uint32_t f = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
     snprintf(
@@ -157,6 +165,29 @@ static void sub_rec_notice_timer_callback(void* context) {
 
 /* --------------------------- event handlers --------------------------- */
 
+// GUI thread, from the RSSI tick only, and only while Armed: a limit must
+// never truncate a capture in flight, so the count check runs on the tick
+// AFTER sub_rec_capture_end() has closed the file and re-armed.
+static void sub_rec_check_limits(SubRecApp* app) {
+    if(app->state != SubRecStateArmed) return;
+    uint32_t cap = sub_rec_max_caps[app->max_cap_idx];
+    uint32_t mins = sub_rec_max_mins[app->max_min_idx];
+    const char* why = NULL;
+    if(cap && (app->saved - app->limit_base) >= cap) {
+        why = "capture limit";
+    } else if(mins &&
+              (furi_get_tick() - app->listen_start_tick) >=
+                  furi_ms_to_ticks(mins * 60UL * 1000UL)) {
+        why = "time limit";
+    }
+    if(!why) return;
+    char l1[REC_TEXT_LINE_MAX];
+    snprintf(l1, sizeof(l1), "%lu saved", (unsigned long)(app->saved - app->limit_base));
+    sub_rec_listen_stop(app); // radio down first, then the message
+    FURI_LOG_I(TAG, "limit: %s, %s", why, l1);
+    sub_rec_show_notice(app, "Limit reached", l1, why, SubRecViewMenu, 0);
+}
+
 // Triggered from SubRecEventRssiTick on the GUI thread. Detection runs every
 // tick; the repaint does not -- 40 Hz of with_view_model(..., true) would
 // keep the GUI thread, which must also service capture open/close,
@@ -184,6 +215,13 @@ static void sub_rec_handle_rssi_tick(SubRecApp* app) {
     if(app->notice_active) return;
 
     if(app->state == SubRecStateArmed) {
+        sub_rec_check_limits(app);
+        // Limit fired: sub_rec_check_limits() already stopped the radio and
+        // moved app->state to Idle. Falling through to the cooldown/above
+        // logic below with a stale `above` would call sub_rec_capture_begin()
+        // on a torn-down radio -- exactly the truncated-capture-on-limit bug
+        // this feature exists to prevent.
+        if(app->state != SubRecStateArmed) return;
         if(app->cooldown) {
             // The previous capture was ended by CAPTURE_MAX_MS while the
             // carrier was still up. Re-arm only on a real sub-threshold
@@ -1028,6 +1066,20 @@ static void sub_rec_trigger_changed(VariableItem* item) {
     sub_rec_set_freq_line(app, line, sub_rec_triggers[idx]);
 }
 
+static void sub_rec_max_cap_changed(VariableItem* item) {
+    SubRecApp* app = variable_item_get_context(item);
+    size_t idx = variable_item_get_current_value_index(item);
+    app->max_cap_idx = (uint8_t)idx;
+    variable_item_set_current_value_text(item, sub_rec_max_cap_labels[idx]);
+}
+
+static void sub_rec_max_min_changed(VariableItem* item) {
+    SubRecApp* app = variable_item_get_context(item);
+    size_t idx = variable_item_get_current_value_index(item);
+    app->max_min_idx = (uint8_t)idx;
+    variable_item_set_current_value_text(item, sub_rec_max_min_labels[idx]);
+}
+
 /* --------------------------- dispatcher wiring -------------------------- */
 
 // Back that no view consumed. Runs on the GUI thread (input path), so
@@ -1197,6 +1249,22 @@ static void sub_rec_config_load(SubRecApp* app) {
         flipper_format_rewind(ff);
         if(flipper_format_read_uint32(ff, "Trigger", &v, 1) && v < COUNT_OF(sub_rec_triggers))
             app->trigger_idx = (uint8_t)v;
+        flipper_format_rewind(ff);
+        if(flipper_format_read_uint32(ff, "MaxCaptures", &v, 1)) {
+            for(size_t i = 0; i < COUNT_OF(sub_rec_max_caps); i++)
+                if(sub_rec_max_caps[i] == v) {
+                    app->max_cap_idx = (uint8_t)i;
+                    break;
+                }
+        }
+        flipper_format_rewind(ff);
+        if(flipper_format_read_uint32(ff, "MaxMinutes", &v, 1)) {
+            for(size_t i = 0; i < COUNT_OF(sub_rec_max_mins); i++)
+                if(sub_rec_max_mins[i] == v) {
+                    app->max_min_idx = (uint8_t)i;
+                    break;
+                }
+        }
 
         // Repeated key, one row per saved profile: "name freq mod trigger".
         // Reading uses the same successive-flipper_format_read_string() idiom
@@ -1252,10 +1320,14 @@ static void sub_rec_config_save(SubRecApp* app) {
     if(flipper_format_file_open_always(ff, REC_CONF_PATH)) {
         uint32_t freq = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
         uint32_t mod = app->mod_idx, trig = app->trigger_idx;
+        uint32_t maxcap = sub_rec_max_caps[app->max_cap_idx];
+        uint32_t maxmin = sub_rec_max_mins[app->max_min_idx];
         ok = flipper_format_write_header_cstr(ff, REC_CONF_TYPE, REC_CONF_VERSION) &&
              flipper_format_write_uint32(ff, "Frequency", &freq, 1) &&
              flipper_format_write_uint32(ff, "Modulation", &mod, 1) &&
-             flipper_format_write_uint32(ff, "Trigger", &trig, 1);
+             flipper_format_write_uint32(ff, "Trigger", &trig, 1) &&
+             flipper_format_write_uint32(ff, "MaxCaptures", &maxcap, 1) &&
+             flipper_format_write_uint32(ff, "MaxMinutes", &maxmin, 1);
 
         char line[REC_PROFILE_NAME_MAX + 24];
         for(uint8_t i = 0; ok && i < app->profile_n; i++) {
@@ -1447,6 +1519,24 @@ static void sub_rec_build_settings(SubRecApp* app) {
     variable_item_set_current_value_index(item, app->trigger_idx);
     variable_item_set_current_value_text(item, sub_rec_trigger_labels[app->trigger_idx]);
     app->trigger_item = item;
+
+    item = variable_item_list_add(
+        app->settings,
+        "Max captures",
+        (uint8_t)COUNT_OF(sub_rec_max_caps),
+        sub_rec_max_cap_changed,
+        app);
+    variable_item_set_current_value_index(item, app->max_cap_idx);
+    variable_item_set_current_value_text(item, sub_rec_max_cap_labels[app->max_cap_idx]);
+
+    item = variable_item_list_add(
+        app->settings,
+        "Max minutes",
+        (uint8_t)COUNT_OF(sub_rec_max_mins),
+        sub_rec_max_min_changed,
+        app);
+    variable_item_set_current_value_index(item, app->max_min_idx);
+    variable_item_set_current_value_text(item, sub_rec_max_min_labels[app->max_min_idx]);
 
     // values_count 1, not 0: variable_item_list_process_right() compares
     // against (values_count - 1) as uint8_t, so 0 would underflow to 255.
