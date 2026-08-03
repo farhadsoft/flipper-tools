@@ -1,0 +1,158 @@
+{
+  "D:\\GitHub\\flipper-tools\\cap.py": {
+    "mtime": 1785659078.5981872,
+    "hash": "8a9fc4c55c2c8f64ee4dd3e3cb1506fa"
+  },
+  "D:\\GitHub\\flipper-tools\\rfid_multi_reader\\backend_hf.c": {
+    "mtime": 1785740404.253651,
+    "hash": "4831d2e871c1de2147a164ee1b3f145f"
+  },
+  "D:\\GitHub\\flipper-tools\\rfid_multi_reader\\backend_hf.h": {
+    "mtime": 1785665296.531409,
+    "hash": "fe45d8d361b5e29c33adef0d5ef8c41b"
+  },
+  "D:\\GitHub\\flipper-tools\\rfid_multi_reader\\backend_lf.c": {
+    "mtime": 1785666107.8796353,
+    "hash": "3c45401808eed51a57d111baed86f8e6"
+  },
+  "D:\\GitHub\\flipper-tools\\rfid_multi_reader\\backend_lf.h": {
+    "mtime": 1785666079.9106414,
+    "hash": "e7520187a3c7787edca6d13fbc9c653b"
+  },
+  "D:\\GitHub\\flipper-tools\\rfid_multi_reader\\make_icon.py": {
+    "mtime": 1785664338.346372,
+    "hash": "bf43bbe97c883a038c21c1bf5a511b15"
+  },
+  "D:\\GitHub\\flipper-tools\\rfid_multi_reader\\rfid_app.h": {
+    "mtime": 1785740404.2919018,
+    "hash": "bdd8064b62693aecbb2398de2347b4bc"
+  },
+  "D:\\GitHub\\flipper-tools\\rfid_multi_reader\\rfid_backend.h": {
+    "mtime": 1785678002.6421194,
+    "hash": "573606166ed8e1151ee281e641874bc4"
+  },
+  "D:\\GitHub\\flipper-tools\\rfid_multi_reader\\rfid_multi_reader.c": {
+    "mtime": 1785740404.324289,
+    "hash": "8c8495477333d8129e59e7e9df183791"
+  },
+  "D:\\GitHub\\flipper-tools\\rfid_multi_reader\\ui.c": {
+    "mtime": 1785679022.283185,
+    "hash": "c338fce27ef8e96513286b91c5a8b673"
+  },
+  "D:\\GitHub\\flipper-tools\\rfid_multi_reader\\ui.h": {
+    "mtime": 1785664071.125219,
+    "hash": "02bf31d0cba45ef3d058517e7b421025"
+  },
+  "D:\\GitHub\\flipper-tools\\subghz_auto_recorder\\make_icon.py": {
+    "mtime": 1785693686.9455943,
+    "hash": "bc42371f733babf3fa27955183e6051a"
+  },
+  "D:\\GitHub\\flipper-tools\\subghz_auto_recorder\\recorder_app.h": {
+    "mtime": 1785740258.353513,
+    "hash": "96f12602e9db420fa0e01c443078d37e"
+  },
+  "D:\\GitHub\\flipper-tools\\subghz_auto_recorder\\recorder_radio.c": {
+    "mtime": 1785740207.2032585,
+    "hash": "c609d7e41d1634fddc29dbc0a53b7638"
+  },
+  "D:\\GitHub\\flipper-tools\\subghz_auto_recorder\\recorder_radio.h": {
+    "mtime": 1785693908.220129,
+    "hash": "3f11c66930f7a024b69da0115a949417"
+  },
+  "D:\\GitHub\\flipper-tools\\subghz_auto_recorder\\recorder_ui.c": {
+    "mtime": 1785740283.8907466,
+    "hash": "ff678db496771ff52858a19d758f8d15"
+  },
+  "D:\\GitHub\\flipper-tools\\subghz_auto_recorder\\recorder_ui.h": {
+    "mtime": 1785740183.931041,
+    "hash": "f2fd58b30a65fa562f0ecdef83c4331f"
+  },
+  "D:\\GitHub\\flipper-tools\\subghz_auto_recorder\\subghz_auto_recorder.c": {
+    "mtime": 1785740275.3025959,
+    "hash": "0cf11867a42d2f783715e061cbfc7be8"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\card_info.c": {
+    "mtime": 1785740404.119845,
+    "hash": "ecf218be469e1aba2d509aa5baafe94c"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\card_info.h": {
+    "mtime": 1785740404.1727283,
+    "hash": "9234e316bd307eb9aed16f2797facfb8"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\emv.c": {
+    "mtime": 1785739953.38057,
+    "hash": "cd4a9371ae12480c83c7b369e3b1fed3"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\emv.h": {
+    "mtime": 1785673738.6025834,
+    "hash": "90834ede051052ba01a4df897f1d4309"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\make_icon.py": {
+    "mtime": 1785611580.3606222,
+    "hash": "9d12b6d3c74aa23dfe3bb4439d53269d"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\reader_app.h": {
+    "mtime": 1785740128.957184,
+    "hash": "0825ea154da6a6e06b1bd31fc898683b"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\reader_lf.c": {
+    "mtime": 1785652503.6367261,
+    "hash": "7542759e37ca1fda6ad9f817ba6e5c35"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\reader_lf.h": {
+    "mtime": 1785652490.0343475,
+    "hash": "720689336ce04e5297dccc69ca938104"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\reader_nfc.c": {
+    "mtime": 1785675364.594573,
+    "hash": "573924b6a8c1438257a6468e6bf3a59e"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\reader_nfc.h": {
+    "mtime": 1785669899.4926102,
+    "hash": "eaab38e2f52ec7ec89718bf56fd84f97"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\reader_ui.c": {
+    "mtime": 1785678991.5695646,
+    "hash": "ea48771b68fb4b701773b04a82e2b085"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\reader_ui.h": {
+    "mtime": 1785652128.879659,
+    "hash": "33930374874be364b22282a72b90c77d"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\universal_card_reader.c": {
+    "mtime": 1785740404.2067027,
+    "hash": "ba8bc7a606d7317e82bf096a0167f58c"
+  },
+  "D:\\GitHub\\flipper-tools\\CLAUDE.md": {
+    "mtime": 1785739551.61623,
+    "hash": "47c160a3a943ed98fce386e66c22bf1f"
+  },
+  "D:\\GitHub\\flipper-tools\\README.md": {
+    "mtime": 1785697912.2792077,
+    "hash": "379134db4998c908b44a0c28181f6077"
+  },
+  "D:\\GitHub\\flipper-tools\\doc\\emv-read-diagnosis.md": {
+    "mtime": 1785619484.2749171,
+    "hash": "fd73234462c02a1d6e58422b6be4a546"
+  },
+  "D:\\GitHub\\flipper-tools\\subghz_auto_recorder\\README.md": {
+    "mtime": 1785695124.728537,
+    "hash": "36ec340bd024febf13a9829d4457619e"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\README.md": {
+    "mtime": 1785678736.9434545,
+    "hash": "51a55b8ad89ab3cb7b038826b599dd9a"
+  },
+  "D:\\GitHub\\flipper-tools\\rfid_multi_reader\\icon.png": {
+    "mtime": 1785664342.925336,
+    "hash": "4e27dfd990fabc101b5869d5be586cd3"
+  },
+  "D:\\GitHub\\flipper-tools\\subghz_auto_recorder\\icon.png": {
+    "mtime": 1785693692.824828,
+    "hash": "bcf7d6780da186b70150b96612b465b2"
+  },
+  "D:\\GitHub\\flipper-tools\\universal_card_reader\\icon.png": {
+    "mtime": 1785611587.4693248,
+    "hash": "41d4e5259a085a858461a5040fa78a41"
+  }
+}

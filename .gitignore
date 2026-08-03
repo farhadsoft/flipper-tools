@@ -11,3 +11,4 @@ logs/
 # OS cruft
 .DS_Store
 Thumbs.db
+graphify-out/cache/*
