@@ -143,6 +143,7 @@ typedef struct {
     NfcProtocol display_protocol; // most-derived protocol, used for the name/chain
     NfcProtocol poll_protocol; // protocol the poller actually runs (ids 0..11 only)
     EmvData emv; // filled by emv_read() when poll_protocol is ISO14443-4A
+    bool emv_reactivate; // 4A poller: halt+reactivate once before emv_read
     uint8_t mfc_pass; // MfClassic key pass: 0 = key A, 1 = key B
     uint8_t mfc_sector; // MfClassic next sector to offer a key for
 

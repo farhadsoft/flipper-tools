@@ -485,9 +485,12 @@ static void emv_parse_log_record(
 // so the caller decides what to do with it. `body`/`body_len` alias `rx`'s
 // buffer, valid only until `rx` is reused.
 //
-// Card->reader I-block chaining is not supported by send_block; a chained
-// response surfaces as Iso14443_4aErrorProtocol. Treated the same as any
-// other transport error: "this step returned nothing", not a chain abort.
+// Mirrors Momentum's send_block_pwt_ext (used by the firmware EMV poller but
+// not linkable from a FAP): resend the block on a decode/PCB mismatch, which
+// send_block reports as Iso14443_4aErrorProtocol. Timeouts get a few tries
+// too — after the scanner's child-protocol detection runs SELECT APDUs and
+// frees its poller without halting, the card can be slow to answer a freshly
+// activated poller.
 static bool emv_transceive(
     Iso14443_4aPoller* poller,
     BitBuffer* tx,
@@ -497,11 +500,24 @@ static bool emv_transceive(
     const uint8_t** body,
     size_t* body_len,
     uint16_t* sw) {
-    bit_buffer_reset(tx);
-    bit_buffer_copy_bytes(tx, apdu, apdu_len);
+    Iso14443_4aError err = Iso14443_4aErrorNone;
+    int timeouts = 0;
+    for(int attempt = 1; attempt <= 20; attempt++) {
+        bit_buffer_reset(tx);
+        bit_buffer_copy_bytes(tx, apdu, apdu_len);
 
-    Iso14443_4aError err = iso14443_4a_poller_send_block(poller, tx, rx);
+        err = iso14443_4a_poller_send_block(poller, tx, rx);
+        if(err == Iso14443_4aErrorNone) break;
+
+        // Mirror send_block_pwt_ext's 20-attempt resend on a decode/PCB
+        // mismatch (reported by send_block as Protocol): cheap, fails fast.
+        // Timeout (card silent) gets 3 tries, then we stop beating on it.
+        if(err == Iso14443_4aErrorTimeout && ++timeouts >= 3) break;
+        if(err != Iso14443_4aErrorProtocol && err != Iso14443_4aErrorTimeout) break;
+    }
+
     if(err != Iso14443_4aErrorNone) {
+        FURI_LOG_I(TAG, "APDU %02X%02X err=%d", apdu[0], apdu[1], (int)err);
         *sw = 0;
         return false;
     }
