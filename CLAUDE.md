@@ -946,6 +946,41 @@ behaviours specific to this app's testing, worth recording for next time:
   the cursor onto row 0 (Browse files / Cancel) on every entry, so blind CLI
   navigation starting from either is deterministic even though the main
   menu's is not.
+- **CLI `input send` can outpace a `ViewDispatcher` view switch, so
+  rapid-fire scripted OKs race the confirm dialog.** Observed 2026-08-04
+  validating D2's Clear-all flow: a triggering OK on a Saved clear row
+  (which calls `sub_rec_clear_start()` -> `sub_rec_switch_view(
+  SubRecViewConfirm)` with the cursor forced onto Cancel=0) followed too
+  soon by a confirming OK landed on the *still-focused* Saved Submenu
+  before the switch completed, re-firing the clear row and re-entering
+  the confirm on its forced Cancel cursor -- so the confirm read "Cancel"
+  every time instead of "Delete". This is a **CLI-input-rate artifact,
+  not a hardware-reachable bug**: a human cannot press faster than a
+  sub-frame view switch, so there is nothing to fix in app code; the fix
+  is test-side. The custom-event gen filter does not cover this -- the
+  raced OK is raw input delivered to whichever View holds focus at
+  delivery time, not a queued custom event.
+  **F4a STEP-0 (2026-08-04, code review -- no change warranted):**
+  every confirm row (Cancel/Yes) and every parent Saved row
+  (Clear-all/Delete-RAW/Delete-decoded/Delete-_RC) is registered on the
+  shared `sub_rec_menu_callback`, which posts `EVENT_MAKE(id, app->gen)`
+  (`recorder_app.h:117`), so **no** row is un-stamped and **none**
+  reaches a handler by direct call -- Gate 1 does not fire. The reopen
+  is mechanism **(B)**, a parent Saved row re-firing while Saved still
+  holds focus, not (A) a confirm-row re-fire; and `app->gen` is
+  unchanged across the Saved -> confirm transition, so a queued parent
+  event carries the current gen and passes the filter -- gen-stamping
+  alone cannot close (B). But (B) is unreachable by physical input, so
+  the bar for an app-side `gen` bump at confirm-open (the 2b option) is
+  not met -- **Gate 2a: no app change**; this note is the mitigation.
+  (The forced-Cancel cursor at `sub_rec_clear_start` line 578 is what
+  makes a raced reopen land on Cancel, not on Delete.)
+  **Practice when driving menus/confirms over CLI:** send one input per
+  *settled* view state -- after a row select that switches views, confirm
+  the switch landed (the forced cursor / a `top` state check) before
+  sending the next input. No blind sub-frame timer was needed this
+  session; the reliable discriminator was settling the view, not a delay
+  value. Reserve this for automation; it is not an app bug to fix.
 
 **Verified 2026-08-02, on device, build clean, zero warnings, APPCHK Target
 7 / API 87.1:**
@@ -1483,16 +1518,52 @@ to synthesize one.
    are not a substitute for the specific Analyze measurement the plan
    asks for.
 
-**Consolidated open item for the next physical-access session:** every
-item above marked unverified needs the same thing — real button presses
-on the device, either to pick a file in `dialog_file_browser_show()`
-(A1's Label screen and Info-page label render, C1's entire Analyze page
-including gate 2's Back-depth and gate 4's Stack Min, D1/D2's shared
-dependency on Analyze being reachable at all) or to drive an
-on-screen-keyboard widget blind (B1's custom-frequency `NumberInput`,
-B2's "Save current..." `TextInput`), plus a real fixed-code remote for
-D2's actual duplicate-suppression trigger. None of this blocks the
-CLI-drivable 90% of the surface, which is fully verified above.
+**Consolidated run for the next physical-access session — one sitting on
+COM4 with a keyed 433.92 fixed-code remote.** This supersedes the scattered
+"unverified / carried over" notes above: it folds the pre-existing
+Phase 1/2/3 open items together with this session's eight-feature
+unverified items into a single ordered checklist. Every step needs a
+physical file pick, a blind on-screen-keyboard pass, or a real remote --
+none is CLI-driven; none may be promoted to "verified" in this file
+until actually observed. The CLI `input send` view-switch race above
+(2026-08-04) is the reason to pace scripted presses, not add app code.
+
+1. **Phase 1 sensitivity delta** (pre-existing, carried over): hold a
+   keyed 433.92 remote ~20 cm away -- the keyed dBm must clearly clear
+   ambient. The *delta* is the proof, not "peak = 433.92".
+2. **Phase 3 Analyze on-device + whole-suite gate 4 + gate-2-Analyze
+   half**: pick the largest fixture, open Analyze, compare Info fields to
+   `storage read`; waveform renders (not flat/full/blank); no
+   `SubGhzWorker`, no writes while Analyzing; both pages -> Back -> file
+   menu (no app exit); Stack Min >= 4096 free after ~10 zoom/pan presses.
+3. **C1 waveform zoom/pan** (F1/R4): FIT fills a short burst; OK cycles
+   x2->x4->x8->ALL->FIT; Left/Right pan clamps at both ends (footer start
+   never below 0.00 or above total-span); Up->Info, Back->file menu; a
+   `_D` (decoded, no RAW_Data) file shows "no samples" without crashing.
+4. **A1 label write + replay-tolerance** (F1/R2/R3): label a file,
+   `storage read` shows `Note:` as the last line and a larger size;
+   Replay shows `SubGhzFEWorker` present for the *full* recorded
+   duration (not truncated -- the whole point of the last-line
+   placement); clear-label shrinks the file back; Analyze Info shows the
+   note.
+5. **Phase 2 decode chain + D2 dedup** (F3): real fixed-code remote ->
+   `_D.sub` with `Protocol`/`Key`/`Bit`; replay of the decoded file opens
+   the user's own receiver; `md5` of the file unchanged before/after
+   replay; with Dedup **On**, 5 presses -> 2 files total and `dup`
+   climbs to 4; a rolling remote -> 5 `_RC` files and `dup 0` (dedup
+   gate is a correct no-op for rolling codes).
+6. **A3 Stats first-frame glance** (F2): enter Stats from a non-idle
+   screen, confirm the first frame shows the correct
+   `files / raw dec rc / saved drop dup` values (not a stale prior
+   screen) -- one second, no file pick. This only confirms the R1
+   set_state ordering; if the fix already pushes the model on the
+   Stats entry, the glance is just the confirmation.
+7. **Custom-frequency `NumberInput`** and any other blind-keyboard path:
+   B1's custom (non-table) frequency showing "Custom" after save/reload;
+   B2's "Save current..." `TextInput` naming a new profile slot. Each
+   needs a physical pass on the widget itself (the code path is
+   structurally identical to the already-verified table-entry ternary,
+   but the widget has never been driven).
 
 ---
 
