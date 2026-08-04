@@ -784,15 +784,16 @@ stock Sub-GHz app's Saved browser.
 
 ## Architecture
 
-Eight views on one `ViewDispatcher`: a custom animated status View
+Nine views on one `ViewDispatcher`: a custom animated status View
 (`SubRecViewStatus` — listening/sending/notice, the only `with_view_model`
-call site), four Submenus (`SubRecViewMenu` main menu,
+call site), five Submenus (`SubRecViewMenu` main menu,
 `SubRecViewFileMenu` per-file actions, `SubRecViewSaved` saved-signals
-actions — Browse files / Clear all / Back, `SubRecViewConfirm` the
-Clear-all confirmation), a `VariableItemList` (`SubRecViewSettings`), a
+actions — Browse files / Stats / Clear all + filtered variants / Back,
+`SubRecViewConfirm` the destructive-action confirmation, `SubRecViewProfiles`
+saved capture profiles — B2), a `VariableItemList` (`SubRecViewSettings`), a
 `NumberInput` (`SubRecViewNumber`, custom frequency in kHz) and a
-`TextInput` (`SubRecViewText`, rename). No per-view
-`view_set_previous_callback` anywhere — every Back goes through
+`TextInput` (`SubRecViewText`, rename/label/profile-name entry). No
+per-view `view_set_previous_callback` anywhere — every Back goes through
 `sub_rec_navigation_callback()`, exactly like the other two apps.
 
 Capture is driven entirely from a 25 ms `SubRecEventRssiTick`: the timer
@@ -809,16 +810,26 @@ new View, and the sweep is clocked by the same 25 ms rssi_timer —
 sub_rec_handle_rssi_tick() branches to sub_rec_scan_step() first and
 returns, so the listen path's RSSI/capture logic never runs while scanning.
 
+Stats (A3) is the same reuse again: one more SubRecState
+(SubRecStateStats) drawn on SubRecViewStatus, reached from the
+Saved-signals submenu, no radio, no writes, one directory pass
+(`sub_rec_collect_stats()`) into the view model.
+
 Analyze reuses the same pattern again: one more SubRecState
 (SubRecStateAnalyzing) drawn on SubRecViewStatus, reached from the per-file
 menu, with no radio and no timer of its own -- it parses a saved `.sub`'s
 header and RAW payload straight from storage on the GUI thread and hands the
-result to the view model in one `sub_rec_set_analyze()` call. Analyze's
-waveform fits the entire capture into 120 columns; auto-trimming
-leading/trailing silence (or a left/right pan) is the natural next step and
-is deliberately not in the first version.
+result to the view model in one `sub_rec_set_analyze()` call. C1 added
+zoom/pan on top of the same parse: the initial load computes a FIT window
+(the signal's high-sample span + 5% padding, falling back to the whole
+capture when there is no high sample), so a short burst inside long gaps
+fills the screen instead of collapsing to a couple of columns; OK cycles
+FIT -> x2 -> x4 -> x8 -> ALL, Left/Right pans by half the current window
+(clamped to [0, total]), and every zoom/pan keypress re-parses only the
+RAW_Data pass (`sub_rec_analyze_rewindow()` — totals are already cached
+from the initial load).
 
-Six load-bearing invariants (violating any of them either crashes the
+Seven load-bearing invariants (violating any of them either crashes the
 device or wedges the CC1101 driver):
 
 1. **`FuriHalSubGhzPreset` ids 4..8 are not fork-stable.** Only ids 0..3
@@ -857,6 +868,16 @@ device or wedges the CC1101 driver):
    `furi_hal_subghz.state` at `SubGhzStateIdle` — only `start_async_rx`/`_tx`
    move it off Idle — so `sub_rec_scan_stop()` calls `subghz_devices_idle()`
    only, and `subghz_devices_stop_async_rx()` would `furi_check`.
+7. **A function that can stop the radio mid-tick must re-check `app->state`
+   before falling through to logic that assumes it is still armed.** D1's
+   `sub_rec_check_limits()` calls `sub_rec_listen_stop()` (moves
+   `app->state` to `Idle`, clears `cooldown`) and is itself called from
+   inside `sub_rec_handle_rssi_tick()`'s Armed branch — without
+   `if(app->state != SubRecStateArmed) return;` immediately after it, the
+   same tick falls through to the untouched cooldown/above logic with a
+   stale `above` flag and calls `sub_rec_capture_begin()` on a torn-down
+   radio. Any future code inserted into the Armed branch after a
+   state-changing call must carry the same guard.
 
 Rolling-code detection: `sub_rec_decoded_callback()` (SubGhzWorker thread)
 sets `volatile bool app->rolling` when a decoded protocol's type is
@@ -1309,6 +1330,169 @@ operator swap. Still un-invoked -- the waveform contingency has never been
 triggered, since Analyze's Waveform page itself remains unverified on
 device, per above -- recorded here so the next reader does not inherit a
 false "closed" status.
+
+## Eight-feature session, 2026-08-04 (A1→A2→A3→B1→B2→C1→D1→D2)
+
+Capture labels, filtered batch deletes, a stats screen, a persistent
+settings file, named capture profiles (doubling as favourite frequencies),
+Analyze waveform zoom/pan, an auto-record capture/time limit, and
+session-scoped duplicate detection — eight commits, in that order, each
+built clean and verified before the next started. Full per-commit detail
+(exact functions touched, every verification command and its output) is
+in `git log` (`344519b`..`b03ef67`); this is the durable summary. Device
+for all eight: Momentum `mntm-dev` `8ed809fb`, API 87.1, `DE`-provisioned,
+COM4.
+
+**A1 — capture labels (`344519b`).** Free-text "Label" row in the file
+menu, stored as `Note: <text>` appended as the *last* line of the `.sub`
+(after every `RAW_Data:` line — the only placement that survives both
+key-scanning readers and the sequential RAW replay worker). Verified: the
+load-bearing file-format claim itself, on-device, via the firmware's own
+`subghz CLI tx_from_file` bypassing the app UI — a baseline capture and
+the same capture with a trailing Note both transmitted 4.97–4.98 s; a
+negative control with the Note between `Protocol:` and `RAW_Data:` (the
+actual risk window) truncated to 0.93 s, proving the timing method
+detects truncation and the chosen placement doesn't trigger it. Idle
+Stack Min 11444/12284 (baseline, Label screen not open), no stray
+worker threads, clean launch/exit. **Unverified** (needs a physical
+`dialog_file_browser_show()` pick — this app's documented, repo-wide CLI
+limitation): the Label TextInput screen itself and the Analyze Info page
+actually rendering a saved label through the app's own UI.
+
+**A2 — filtered batch deletes (`56184a8`).** Generalises the pre-existing
+Clear-all with a `bool (*match)(const char*)` predicate; Saved signals
+gained Delete RAW / Delete decoded / Delete _RC rows alongside Clear all.
+Fully CLI-driven (Saved/Confirm submenus force-select row 0 on every
+entry). Verified with a 6-entry fixture set (`x.sub`/`x_D.sub`/
+`y_RC.sub`/`y_RC_D.sub`/`keep.txt`/`keep_dir`): all five rows (Cancel,
+Delete RAW, Delete decoded, Delete _RC, Clear all) matched the plan's
+verification table exactly, including the non-recursive/`.sub`-only
+scope proof. Stack Min 11012/12284 after a full Clear-all cycle.
+
+**A3 — stats screen (`2d5a339`).** Read-only "Stats" row in Saved
+signals; one more `SubRecState` drawn on the existing `SubRecViewStatus`
+(same reuse as Scan/Analyze), no new view. Screen text itself has no CLI
+read-back (repo-wide limitation), so verified by ground-truth arithmetic
+instead: 4 planted fixtures (2 raw, 2 decoded, 2 containing `_RC`,
+9652 B) against `sub_rec_collect_stats()`'s expected 9 KiB, and by
+Back-depth (Stats → Back → Saved → Back → menu → Back → exit, exactly 3
+presses). Stack Min 11276/12284, identical between a 4-file and an empty
+`auto_rec/` — confirms no divide-by-zero on the empty path. **The exact
+on-screen digits are not confirmed by direct observation**, only by this
+arithmetic and code review.
+
+**B1 — persistent settings file (`407a714`).** Frequency/Modulation/
+Trigger survive a relaunch via `/ext/apps_data/subghz_auto_recorder/
+settings.conf`; every field loads independently (a bad file/version/
+out-of-range value keeps that one field's compiled default). Verified:
+load-before-save ordering (relaunch + immediate exit with zero Settings
+interaction reproduced the file byte-for-byte — only possible if load
+ran before the unconditional save-on-exit), missing-file defaults,
+round-trip on a non-default table frequency (925 MHz), and Auto-record
+arming successfully on a loaded non-default preset. Stack Min
+11424–11428/12284. **Unverified**: a genuine custom (`NumberInput`,
+non-table) frequency showing "Custom" after save/reload — needs a
+physical pass on the un-observable `NumberInput` widget; the code path
+is structurally identical to the already-verified table-entry ternary.
+
+**B2 — capture profiles (`c6cb67a`, delivers #2 favourites too).** Named
+freq+mod+trigger bundles in a new `SubRecViewProfiles` submenu at the
+bottom of Settings; OK loads, long-press deletes, "Save current..."
+writes a new slot. Doubles as favourite frequencies — no separate list.
+Verified end to end except the "Save current..." `TextInput` itself
+(same on-screen-keyboard limitation as B1's `NumberInput`): hand-crafted
+config load-before-save proof, profile Apply changing Frequency/
+Modulation/Trigger and successfully arming (Stack Min 11420/12284),
+persistence across relaunch, the Back-path depth (Profiles → Settings →
+menu, 2 presses, not an early exit), long-press delete over the CLI
+(`input send ok long` — confirmed `SubmenuItemCallbackEx` distinguishes
+it from short press), and the `REC_PROFILE_MAX` (8) full-table guard
+firing before `TextInput` ever opens. Required a definition-order
+restructuring (config load/save and the whole profile group relocated
+ahead of `sub_rec_custom_event_callback()`) — no functional risk, pure
+reordering, confirmed by a byte-identical rebuild diff on everything
+else.
+
+**C1 — Analyze waveform zoom/pan (`8e471c4`).** FIT window (signal span
++ 5% padding) computed at load so a short burst in long gaps fills the
+screen; OK cycles FIT→x2→x4→x8→ALL, Left/Right pans by half the current
+window (clamped to `[0, total]`). **Analyze itself could not be
+exercised this session** — reachable only via the same physical-pick
+limitation as A1. Verified instead by (1) manual arithmetic trace of
+every new code path against concrete numbers (FIT window math, the full
+zoom cycle back to itself, pan's clamp at both ends, the no-RAW-data
+decoded-file case staying at "no samples" through any zoom/pan), and (2)
+on-device regression: idle Stack Min 11412/12284 (unchanged from the
+pre-C1 11408–11444 range), Settings→Profiles→Back→Back→Back still exits
+at exactly the right depth. The plan's own physical-button Verify(C1)
+block (waveform actually filling the screen, the on-screen zoom label,
+real Left/Right/Up/Down) remains outstanding.
+
+**D1 — auto-record capture/time limits (`522a183`).** Two Settings rows,
+Max captures (Off/1/3/5/10/20/50) and Max minutes (Off/1/5/10/30/60);
+config stores the *value*, not the table index. `limit_base` (`app->saved`
+at arm time) makes the caps session-scoped, not lifetime. **Caught and
+fixed a stale-tick bug during implementation** (now invariant 7 above):
+`sub_rec_check_limits()` stops the radio, and without a
+`state == SubRecStateArmed` re-check immediately after, the same RSSI
+tick would fall through to capture-begin on a torn-down radio. Fully
+CLI-driven end to end with Trigger at −85 dBm (this repo's documented
+ambient-capture baseline, no transmitter needed): count cap fired at
+exactly 3 captures and stopped the worker; re-arm produced no immediate
+re-trigger (proving `limit_base` re-baselines) then capped again at
+exactly 3 more; time cap fired between 65–70 s against a 60 s threshold;
+both-off baseline ran 65 s+ with the worker never stopping (66 ambient
+captures). Stack Min 11.2–11.4K/12284 throughout.
+
+**D2 — duplicate detection (`b03ef67`, delivers #4).** Session-scoped
+dedup, off by default: FNV-1a hash of the firmware's own decoder
+`get_string()` output against a 32-entry ring; a repeat removes the
+just-written `.sub` (checked `storage_simply_remove()`), counts it, and
+skips the rolling-code rename / `_D` sidecar. Undecoded RAW captures are
+untouched by the gate. **Caught and fixed during review**: the arm-time
+`app->dup` reset wasn't pushed into the view model, so a stale
+"dup N" from the previous session could linger on screen — added
+`sub_rec_set_dup()`. CLI-verified: config round-trip (`Dedup: true`
+persists, doesn't disturb Trigger/MaxCaptures/MaxMinutes), real ambient
+RAW captures continue saving at the same cadence with Dedup on (the gate
+is a correct no-op for undecoded noise — 13+ real captures in 30 s, no
+stall), Stack Min unchanged (11.2–11.4K/12284). **Unverified**: the
+actual duplicate-suppression trigger (two identical *decoded* bursts) —
+no owned fixed-code remote, and a single CC1101 radio cannot self-TX+RX
+to synthesize one.
+
+**Whole-suite gate, run after D2, all on the rebuilt `b03ef67` tree:**
+1. **Cold exit both ways** — Back on the main menu without entering
+   Listen, and Listen → Back → Back: both left `uptime` answering
+   afterward, climbing monotonically across every relaunch, no crash.
+2. **Nav-depth regression, the two CLI-reachable new screens** —
+   Profiles → Back → Settings → Back → menu (proved via `uptime`
+   refusing after 1 and 2 Backs, then answering after a 3rd — exactly
+   2 levels, never an early exit) and Stats → Back → Saved → Back →
+   menu (same proof, same result). **Analyze both pages → Back → file
+   menu is unverified** — Analyze is only reachable via the file-browser
+   physical-pick limitation documented above.
+3. **Idle thread hygiene** — `top` on the main menu before ever arming:
+   no `SubGhzWorker`, no `SubGhzFEWorker`, only the app's own GUI
+   thread. Confirmed on a fresh launch.
+4. **Stack Min on the heaviest new screen** — the plan calls for this on
+   Analyze after ~10 zoom/pan presses; **unverified**, same physical-pick
+   limitation. The closest CLI-reachable figures (Profiles armed:
+   11420/12284, D2 armed with Dedup on: 11412/12284) show no regression
+   trend against the session's established 11.2–11.4K/12284 range, but
+   are not a substitute for the specific Analyze measurement the plan
+   asks for.
+
+**Consolidated open item for the next physical-access session:** every
+item above marked unverified needs the same thing — real button presses
+on the device, either to pick a file in `dialog_file_browser_show()`
+(A1's Label screen and Info-page label render, C1's entire Analyze page
+including gate 2's Back-depth and gate 4's Stack Min, D1/D2's shared
+dependency on Analyze being reachable at all) or to drive an
+on-screen-keyboard widget blind (B1's custom-frequency `NumberInput`,
+B2's "Save current..." `TextInput`), plus a real fixed-code remote for
+D2's actual duplicate-suppression trigger. None of this blocks the
+CLI-drivable 90% of the surface, which is fully verified above.
 
 ---
 
