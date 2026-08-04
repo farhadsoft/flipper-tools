@@ -46,10 +46,11 @@
 #define REC_NOTE_MAX 32
 #define REC_PROFILE_MAX      8
 #define REC_PROFILE_NAME_MAX 16 // spaces are the parse delimiter; see sub_rec_profile_save_result()
+#define REC_DUP_MAX 32 // dedup ring depth; ~1 uint32 comparison per entry per capture
 // sub_rec_build_settings() row order: Frequency=0, Modulation=1, Trigger=2,
-// Profiles=5 (D1 inserts Max captures/Max minutes before it; D2 bumps again
-// for Dedup).
-#define REC_SETTINGS_ROW_PROFILES 5
+// Max captures=3, Max minutes=4, Dedup=5, Profiles=6 (D1/D2 inserted rows
+// before it).
+#define REC_SETTINGS_ROW_PROFILES 6
 // storage_dir_read() truncates into a too-small buffer, and a truncated name
 // builds a path that does not exist -- storage_simply_remove() returns true
 // for an already-absent item (storage.h), so a truncated name would be
@@ -230,6 +231,7 @@ typedef struct {
     uint32_t kib; // total size of those files, KiB, rounded down
     uint32_t saved; // session counters, copied when the screen opens
     uint32_t dropped;
+    uint32_t dup;
 } SubRecStats;
 
 typedef struct {
@@ -251,6 +253,7 @@ typedef struct {
     uint8_t scan_peak; // index of the strongest entry seen; also the OK-lock target
     SubRecAnalysis ana;
     uint8_t ana_page; // 0 = info, 1 = waveform
+    uint32_t dup; // session duplicate count; 0 = hide the counter (see draw_listening/draw_stats)
     SubRecStats stats;
 } SubRecModel;
 
@@ -364,6 +367,12 @@ typedef struct {
     uint8_t max_min_idx;
     uint32_t listen_start_tick;
     uint32_t limit_base; // app->saved at listen start; caps count THIS session
+
+    // Session-scoped decode-string dedup ring (D2), off by default.
+    bool dedup;
+    uint32_t dup;
+    uint32_t dup_hash[REC_DUP_MAX];
+    uint32_t dup_n;
 
     uint32_t capture_start_tick;
     uint32_t last_above_tick;

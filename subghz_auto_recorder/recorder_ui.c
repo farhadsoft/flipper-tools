@@ -96,9 +96,23 @@ static void draw_listening(Canvas* canvas, const SubRecModel* m) {
         draw_centered(canvas, 42, "armed");
     }
 
-    snprintf(
-        buf, sizeof(buf), "saved %lu   drop %lu", (unsigned long)m->saved, (unsigned long)m->dropped);
-    draw_centered(canvas, 53, buf);
+    if(m->dup) {
+        snprintf(
+            buf,
+            sizeof(buf),
+            "saved %lu drop %lu dup %lu",
+            (unsigned long)m->saved,
+            (unsigned long)m->dropped,
+            (unsigned long)m->dup);
+    } else {
+        snprintf(
+            buf,
+            sizeof(buf),
+            "saved %lu   drop %lu",
+            (unsigned long)m->saved,
+            (unsigned long)m->dropped);
+    }
+    draw_centered_fit(canvas, 53, buf, 124);
 
     draw_centered_fit(canvas, 63, m->last_file, 120);
 }
@@ -229,12 +243,22 @@ static void draw_stats(Canvas* canvas, const SubRecModel* m) {
         (unsigned long)m->stats.decoded,
         (unsigned long)m->stats.rc);
     draw_centered_fit(canvas, 40, buf, 124);
-    snprintf(
-        buf,
-        sizeof(buf),
-        "saved %lu   drop %lu",
-        (unsigned long)m->stats.saved,
-        (unsigned long)m->stats.dropped);
+    if(m->stats.dup) {
+        snprintf(
+            buf,
+            sizeof(buf),
+            "saved %lu drop %lu dup %lu",
+            (unsigned long)m->stats.saved,
+            (unsigned long)m->stats.dropped,
+            (unsigned long)m->stats.dup);
+    } else {
+        snprintf(
+            buf,
+            sizeof(buf),
+            "saved %lu   drop %lu",
+            (unsigned long)m->stats.saved,
+            (unsigned long)m->stats.dropped);
+    }
     draw_centered_fit(canvas, 54, buf, 124);
 }
 
@@ -306,16 +330,23 @@ void sub_rec_set_notice(SubRecApp* app, const char* title, const char* l1, const
         true);
 }
 
-void sub_rec_set_counts(SubRecApp* app, uint32_t saved, uint32_t dropped, const char* last_file) {
+void sub_rec_set_counts(
+    SubRecApp* app, uint32_t saved, uint32_t dropped, uint32_t dup, const char* last_file) {
     with_view_model(
         app->view,
         SubRecModel * m,
         {
             m->saved = saved;
             m->dropped = dropped;
+            m->dup = dup;
             snprintf(m->last_file, sizeof(m->last_file), "%s", last_file ? last_file : "");
         },
         true);
+}
+
+void sub_rec_set_dup(SubRecApp* app, uint32_t dup) {
+    with_view_model(
+        app->view, SubRecModel * m, { m->dup = dup; }, true);
 }
 
 void sub_rec_set_proto_line(SubRecApp* app, const char* proto) {

@@ -603,6 +603,7 @@ static void sub_rec_collect_stats(SubRecApp* app, SubRecStats* s) {
     s->kib = (uint32_t)(bytes / 1024);
     s->saved = app->saved;
     s->dropped = app->dropped;
+    s->dup = app->dup;
 }
 
 static void sub_rec_handle_stats(SubRecApp* app) {
@@ -1080,6 +1081,15 @@ static void sub_rec_max_min_changed(VariableItem* item) {
     variable_item_set_current_value_text(item, sub_rec_max_min_labels[idx]);
 }
 
+static const char* const sub_rec_onoff[] = {"Off", "On"};
+
+static void sub_rec_dedup_changed(VariableItem* item) {
+    SubRecApp* app = variable_item_get_context(item);
+    size_t idx = variable_item_get_current_value_index(item);
+    app->dedup = (idx != 0);
+    variable_item_set_current_value_text(item, sub_rec_onoff[idx]);
+}
+
 /* --------------------------- dispatcher wiring -------------------------- */
 
 // Back that no view consumed. Runs on the GUI thread (input path), so
@@ -1265,6 +1275,9 @@ static void sub_rec_config_load(SubRecApp* app) {
                     break;
                 }
         }
+        flipper_format_rewind(ff);
+        bool dedup = false;
+        if(flipper_format_read_bool(ff, "Dedup", &dedup, 1)) app->dedup = dedup;
 
         // Repeated key, one row per saved profile: "name freq mod trigger".
         // Reading uses the same successive-flipper_format_read_string() idiom
@@ -1328,6 +1341,8 @@ static void sub_rec_config_save(SubRecApp* app) {
              flipper_format_write_uint32(ff, "Trigger", &trig, 1) &&
              flipper_format_write_uint32(ff, "MaxCaptures", &maxcap, 1) &&
              flipper_format_write_uint32(ff, "MaxMinutes", &maxmin, 1);
+        bool dedup = app->dedup;
+        ok = ok && flipper_format_write_bool(ff, "Dedup", &dedup, 1);
 
         char line[REC_PROFILE_NAME_MAX + 24];
         for(uint8_t i = 0; ok && i < app->profile_n; i++) {
@@ -1537,6 +1552,11 @@ static void sub_rec_build_settings(SubRecApp* app) {
         app);
     variable_item_set_current_value_index(item, app->max_min_idx);
     variable_item_set_current_value_text(item, sub_rec_max_min_labels[app->max_min_idx]);
+
+    item = variable_item_list_add(
+        app->settings, "Dedup", (uint8_t)COUNT_OF(sub_rec_onoff), sub_rec_dedup_changed, app);
+    variable_item_set_current_value_index(item, app->dedup ? 1 : 0);
+    variable_item_set_current_value_text(item, sub_rec_onoff[app->dedup ? 1 : 0]);
 
     // values_count 1, not 0: variable_item_list_process_right() compares
     // against (values_count - 1) as uint8_t, so 0 would underflow to 255.

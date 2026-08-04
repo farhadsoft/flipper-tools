@@ -14,7 +14,11 @@ void sub_rec_set_samples(SubRecApp* app, size_t samples);
 // May be called with an unchanged `s` purely to change `cooldown`.
 void sub_rec_set_state(SubRecApp* app, SubRecState s, bool cooldown);
 void sub_rec_set_notice(SubRecApp* app, const char* title, const char* l1, const char* l2, bool active);
-void sub_rec_set_counts(SubRecApp* app, uint32_t saved, uint32_t dropped, const char* last_file);
+void sub_rec_set_counts(SubRecApp* app, uint32_t saved, uint32_t dropped, uint32_t dup, const char* last_file);
+// Single-field setter for the session dup reset in sub_rec_listen_start() --
+// unlike sub_rec_set_counts(), this must not disturb last_file, which stays
+// meaningful (the last capture saved) across an arm/disarm cycle.
+void sub_rec_set_dup(SubRecApp* app, uint32_t dup);
 void sub_rec_set_proto_line(SubRecApp* app, const char* proto);
 // Sole writer of the model's `trigger` (the RSSI-bar tick position).
 void sub_rec_set_freq_line(SubRecApp* app, const char* line, float trigger);

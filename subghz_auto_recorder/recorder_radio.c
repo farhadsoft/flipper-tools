@@ -144,6 +144,44 @@ void sub_rec_listen_start(SubRecApp* app) {
     app->last_above_tick = furi_get_tick();
     app->listen_start_tick = furi_get_tick();
     app->limit_base = app->saved; // caps count THIS session, not the app's lifetime
+    app->dup = 0;
+    app->dup_n = 0; // dup_hash[] needs no clearing -- only min(dup_n, REC_DUP_MAX) is ever read
+    sub_rec_set_dup(app, 0); // push the reset into the view model -- draw_listening()/draw_stats()
+                              // must not show a stale "dup N" left over from the previous session
+}
+
+// FNV-1a over the firmware's own one-line decoder string. Called on the GUI
+// thread from sub_rec_capture_finish(), after subghz_worker_stop() has joined
+// the worker -- the same synchronisation that makes app->decoded safe to read.
+// Deliberately a second get_string() call: the duplicate check must run BEFORE
+// anything is written, and the label is only wanted after the write succeeds.
+static uint32_t sub_rec_decoded_hash(SubRecApp* app) {
+    FuriString* s = furi_string_alloc();
+    uint32_t h = 0;
+    if(subghz_protocol_decoder_base_get_string(app->decoded, s)) {
+        h = 2166136261u;
+        for(const char* c = furi_string_get_cstr(s); *c; c++) {
+            h ^= (uint32_t)(uint8_t)*c;
+            h *= 16777619u;
+        }
+        if(h == 0) h = 1; // 0 is the "no identity" sentinel
+    }
+    furi_string_free(s);
+    return h;
+}
+
+// Ring, not a fill-then-stop set: the most recent REC_DUP_MAX bursts are what
+// matters, and a ring needs no "full" branch.
+static bool sub_rec_dup_seen(SubRecApp* app, uint32_t h) {
+    uint32_t n = (app->dup_n < REC_DUP_MAX) ? app->dup_n : REC_DUP_MAX;
+    for(uint32_t i = 0; i < n; i++)
+        if(app->dup_hash[i] == h) return true;
+    return false;
+}
+
+static void sub_rec_dup_add(SubRecApp* app, uint32_t h) {
+    app->dup_hash[app->dup_n % REC_DUP_MAX] = h;
+    app->dup_n++;
 }
 
 // GUI thread only, and only from sub_rec_capture_finish() AFTER its
@@ -229,6 +267,15 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
     const char* final_name = "";
     char proto_label[REC_TEXT_LINE_MAX] = "";
     bool kept = spl >= MIN_RAW_SAMPLES;
+    bool dup = false;
+    if(kept && app->dedup && app->decoded) {
+        uint32_t h = sub_rec_decoded_hash(app);
+        if(h) {
+            if(sub_rec_dup_seen(app, h)) dup = true;
+            else sub_rec_dup_add(app, h);
+        }
+    }
+
     if(!kept) {
         const char* drop_path = furi_string_get_cstr(app->capture_path);
         if(!storage_simply_remove(app->storage, drop_path)) {
@@ -238,6 +285,16 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
             FURI_LOG_W(TAG, "drop: remove failed: %s", drop_path);
         }
         app->dropped++;
+    } else if(dup) {
+        // Same checked remove the drop path uses: storage_simply_remove() returns
+        // true for an already-absent file, so an unchecked call would hide a real
+        // failure. No _D sidecar was written, so there is nothing else to clean up.
+        const char* raw_path = furi_string_get_cstr(app->capture_path);
+        if(!storage_simply_remove(app->storage, raw_path)) {
+            FURI_LOG_W(TAG, "dup: remove failed: %s", raw_path);
+        }
+        app->dup++;
+        FURI_LOG_I(TAG, "capture duplicate: %u samples", (unsigned)spl);
     } else {
         // The rolling-code flag is only known now, after the burst has been
         // decoded -- it is the sole persistence of the warning, re-appended
@@ -248,7 +305,9 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
             furi_string_set_n(renamed, app->capture_path, 0, len - 4); // strip ".sub"
             furi_string_cat_str(renamed, "_RC.sub");
             FS_Error err = storage_common_rename(
-                app->storage, furi_string_get_cstr(app->capture_path), furi_string_get_cstr(renamed));
+                app->storage,
+                furi_string_get_cstr(app->capture_path),
+                furi_string_get_cstr(renamed));
             if(err != FSE_OK) {
                 FURI_LOG_W(TAG, "rename to _RC failed: %s", storage_error_get_desc(err));
             } else {
@@ -269,9 +328,13 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
         subghz_worker_start(app->worker);
     }
     sub_rec_set_state(app, SubRecStateArmed, capped);
-    sub_rec_set_counts(app, app->saved, app->dropped, final_name);
+    sub_rec_set_counts(app, app->saved, app->dropped, app->dup, final_name);
     sub_rec_set_proto_line(app, proto_label);
-    FURI_LOG_I(TAG, "capture %s: %u samples", kept ? "saved" : "dropped", (unsigned)spl);
+    if(!dup) {
+        // The dup branch above already logged "capture duplicate: ..." --
+        // this must never also claim "saved" for a file that was removed.
+        FURI_LOG_I(TAG, "capture %s: %u samples", kept ? "saved" : "dropped", (unsigned)spl);
+    }
 }
 
 void sub_rec_capture_begin(SubRecApp* app) {
@@ -645,7 +708,7 @@ void sub_rec_replay(SubRecApp* app) {
 
     const char* base = strrchr(path, '/');
     FURI_LOG_I(TAG, "replay: TX started: %s", base ? base + 1 : path);
-    sub_rec_set_counts(app, app->saved, app->dropped, base ? base + 1 : path);
+    sub_rec_set_counts(app, app->saved, app->dropped, app->dup, base ? base + 1 : path);
     sub_rec_set_state(app, SubRecStateSending, false);
     sub_rec_switch_view(app, SubRecViewStatus);
     app->tx_start_tick = furi_get_tick();
