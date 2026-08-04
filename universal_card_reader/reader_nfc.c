@@ -191,6 +191,27 @@ static NfcCommand reader_poller_callback(NfcGenericEvent event, void* context) {
     }
     case NfcProtocolIso14443_4a:
         if(((Iso14443_4aPollerEvent*)event.event_data)->type == Iso14443_4aPollerEventTypeReady) {
+            // The scanner's child-protocol detection (Momentum's EMV / Type4Tag
+            // pollers) sends SELECT APDUs during detection and frees the poller
+            // without halting, leaving the card's application layer in a
+            // half-open state. Our own poller re-activates (RATS succeeds),
+            // but the card's applet refuses the first APDU → FWT Timeout →
+            // sw=0000 → "No EMV app on card".
+            //
+            // Fix: on the first Ready, halt the card (reset 3a/4a poller state
+            // to Idle) and ask the nfc worker for a full field reset. Returning
+            // Continue here is wrong: the 4a poller would immediately retry
+            // ReadAts on a just-halted card, RATS would FWT-timeout, and the
+            // Error → Idle → ReadAts loop would repeat until the read timeout.
+            // NfcCommandReset power-cycles the field (~100 ms), so the next
+            // PollerReady re-activates the card cleanly and the second Ready
+            // runs emv_read().
+            if(!app->emv_reactivate) {
+                app->emv_reactivate = true;
+                iso14443_4a_poller_halt((Iso14443_4aPoller*)event.instance);
+                return NfcCommandReset;
+            }
+            app->emv_reactivate = false;
             // The read-only EMV chain must run here:
             // iso14443_4a_poller_send_block() is only legal inside the callback.
             memset(&app->emv, 0, sizeof(app->emv));
@@ -367,6 +388,7 @@ void reader_nfc_handle_scanned(ReaderApp* app) {
     app->mfc_pass = 0;
     app->mfc_sector = 0;
     memset(&app->emv, 0, sizeof(app->emv)); // no stale bank data from a previous card
+    app->emv_reactivate = false; // first Ready → halt+reactivate to reset card app state
     app->poller = nfc_poller_alloc(app->nfc, app->poll_protocol);
     nfc_poller_start(app->poller, reader_poller_callback, app);
     // Bounded read: a card removed now must not leave us stuck on "Reading".
