@@ -1567,6 +1567,153 @@ until actually observed. The CLI `input send` view-switch race above
 
 ---
 
+# Universal Toolkit
+
+New app, `universal_toolkit/` — a launcher shell that hosts multiple tool
+modules behind one `ViewDispatcher`, one Submenu launcher, and one shared
+session log, instead of one FAP per tool. **Phase 0** (this section) stands up
+the shell and the module lifecycle contract against a single, deliberately
+harmless proof module (GPIO header info) and touches none of the other three
+apps in this repo — they are wrapped in as modules in Phase 1, against this
+same contract.
+
+## Verified firmware / SDK — re-check before you build (STEP 0)
+
+Verified **2026-08-06**: `device_info` read live off the device, matching the
+block already recorded under "Universal Card Reader" above exactly (same
+commit, same build date, same fork) — no redo of the fork-ABI diff needed,
+see that section for the full NfcProtocol/LFRFIDProtocol/MfClassic drift.
+Phase 0 does not touch NFC, LF RFID, SubGHz, BLE, or BadUSB at all, so none of
+that documented drift applies here; the only APIs in play (`view_dispatcher_*`,
+`submenu_*`, `furi_hal_gpio_*`, `furi_timer_*`, `furi_hal_rtc_get_timestamp`,
+`flipper_format_*`, `storage_simply_mkdir`) were individually confirmed
+present and linkable (`Function,+`) in `api_symbols.csv`, and the
+view-remove/re-add-by-id semantics this whole contract rests on were
+confirmed against the firmware's own `view_dispatcher.c` source (see
+Architecture below), not inferred.
+
+| | Device | ufbt SDK |
+|---|---|---|
+| Target | `hardware_target` 7 | `hw_target` f7 |
+| Firmware | `mntm-dev`, commit `8ed809fb`, built 03-06-2026 | official, API 87.1 |
+| Fork | **`Momentum`** (Next-Flip/Momentum-Firmware) | Official |
+| API | 87.1 | 87.1 |
+| Port | **COM4** (was COM3 under Universal Card Reader's last check — Windows reassigned it on reconnect; re-enumerate, don't trust a remembered number) | — |
+
+## Layout
+
+```
+universal_toolkit/              <- the app; run ufbt HERE, not at repo root
+  application.fam               appid universal_toolkit, entry toolkit_app, Tools category, stack_size 8*1024
+  toolkit_app.h                 ToolkitApp / ToolkitModule / ToolkitLogRecord types, EVENT_MAKE/ID/GEN, view-base #defines
+  toolkit.c                     dispatch (custom-event + nav routers), module enter/exit, the modules[] table, launcher, alloc/free, entry point
+  toolkit_log.c / .h            toolkit_log_append() -- the shared session.log writer
+  toolkit_ui.c / .h             shared chrome (title bar only, so far)
+  modules/gpio_info.c / .h      Phase 0 proof module: reads the 8 external GPIO header pins
+  icon.png / make_icon.py       10x10 1-bit icon
+```
+
+Installs to `/ext/apps/Tools/universal_toolkit.fap`.
+
+## Architecture -- the module lifecycle contract
+
+A module is pure description + four callbacks (`toolkit_app.h`'s
+`ToolkitModule`: `name`, `view_base`, `enter`, `exit`, `event`, `nav`), listed
+in the append-only `static const ToolkitModule modules[]` table in `toolkit.c`.
+Only **one** module is active at a time (`app->active`); its private state
+lives in `app->active_ctx`, and its views occupy a fixed 16-id namespace
+starting at its `view_base` (launcher = 0, first module = `0x10`, next would
+be `0x20`, ...) so ids never collide even though modules are never registered
+concurrently.
+
+`toolkit_enter_module()` sets `app->active` and calls the module's `enter`
+(adds its views, allocs its ctx, acquires whatever peripheral it needs,
+switches to its root view). `toolkit_exit_module()` -- called from a module's
+`nav` when Back is pressed at its root -- **switches back to the launcher
+view *before* calling the module's `exit`**, then bumps `app->gen` and clears
+`app->active`. That ordering is load-bearing, not stylistic: confirmed against
+the firmware's `view_dispatcher.c` that `view_dispatcher_remove_view()` on the
+*currently shown* view calls `view_dispatcher_set_current_view(dispatcher,
+NULL)`, which unconditionally calls `view_dispatcher_stop()` -- so removing a
+module's view (inside `exit`) while it is still on screen stops the whole app,
+not just the module. This was a real bug caught live on 2026-08-06 (`loader
+info` showed "No application is running" after a single Back from the proof
+module); fixed by switching to the launcher first. Re-adding a view id after
+it was removed (module re-enter) is separately confirmed legal and
+non-asserting from the same source (`ViewDict_get(...) == NULL` holds again
+once `remove_view` has erased it).
+
+Custom events are packed `EVENT_MAKE(id, gen)`: `id` in the low byte
+(module-local, always `< 256`, since only the active module's `event` is ever
+dispatched), `app->gen` above it. `app->gen` is `volatile`: written on the GUI
+thread (`toolkit_exit_module`), read on TimersSrv by every module's timer
+callback when it stamps an event (same convention as `reader_app.h` /
+`recorder_app.h`'s own `gen` fields). `toolkit_custom_event()` drops any event
+whose stamped gen doesn't match the current one -- a tick a module's timer
+queued just before its own teardown reads back stale and is silently
+dropped, instead of reaching whatever module (or the launcher) is active next.
+`toolkit_nav()` delegates Back to the active module, or -- at the launcher
+root, with no active module -- returns `false`, which is what the
+dispatcher's own navigation-callback contract turns into `view_dispatcher_stop()`.
+
+## Reserved log record
+
+`/ext/apps_data/universal_toolkit/session.log`, a `FlipperFormat` file with
+one repeated `Entry:` key per record, value `"<ts> <subsys> <summary>|<file>"`
+(`toolkit_log.c`, `TOOLKIT_LOG_LINE_MAX` sized to the exact worst case).
+`summary` may itself contain spaces; `|` -- not producible by `TextInput` --
+is what separates it from the trailing `file` path, so a future reader takes
+the first two whitespace tokens as `ts`/`subsys` and everything after as
+`summary|file`. `ts` is `furi_hal_rtc_get_timestamp()`. `subsys` is
+`ToolkitSubsys` (`toolkit_app.h`), append-only, values never renumbered.
+Every module calls `toolkit_log_append()`; Phase 0's GPIO module is the only
+writer so far (one entry per module entry, summary `"gpio module opened"`,
+empty file). No reader exists yet -- that is Phase 4's viewer.
+
+## Tool-level invariants
+
+1. **Subsystem exclusivity.** Exactly one module is ever active; the previous
+   module's peripheral is fully released (its `exit`) before the next one's
+   `enter` runs. There is no path that enters a second module while one is
+   already active -- `toolkit_custom_event()` only reaches the launcher's
+   dispatch when `app->active == NULL`.
+2. **Module lifecycle.** `enter` adds views + allocs ctx + acquires its
+   peripheral + switches to its root view, in that order; `exit` -- reached
+   only after the launcher view is already showing (see Architecture) --
+   releases the peripheral, frees ctx, and removes its views, in that order.
+   The launcher bumps `gen` after `exit` returns, never before.
+3. **USB mode.** N/A in Phase 0 (no module here touches USB). Documented now
+   for BadUSB, wrapped in a later phase: entering a USB-mode-changing module
+   must restore the prior USB mode in `exit` on every path, including a
+   mid-operation Back.
+
+## Testing this app
+
+Verified device: Momentum `mntm-dev`, API 87.1, **COM4** (see table above).
+Helper: `cap.py` at the repo root (see "Universal Card Reader" -> Testing for
+its flags).
+
+**Verified 2026-08-06 -- Phase 0 contract, on device.** Enter -> own view ->
+log write -> Back -> launcher (app alive, confirmed via `loader info` and
+`uptime`'s refusal message while running) -> Back -> clean app exit
+(`loader info` "No application is running", `uptime` answering and climbing,
+no crash-reboot across the whole session) -- proven over 8+ enter/exit
+cycles, `session.log` gaining one well-formed `Entry:` line per cycle.
+Thread hygiene: 22 threads with the GPIO view open *or* back at the launcher
+(no dedicated worker thread -- the refresh timer runs on the shared system
+`TimersSrv`, so there is nothing module-specific to leak by construction), 21
+after full exit (`universal_toolkit`'s own thread gone). Heap: GPIO
+module open/close is an exact 88-byte round trip repeated across 8+ cycles;
+app launch/exit is an exact byte-for-byte round trip in a controlled
+before/launch/after test (a real ~7 KB swing exists between "app running" and
+"idle desktop showing" states, but it is Desktop's own idle-screen resource,
+confirmed symmetric and unrelated to this app -- do not compare a heap
+reading taken while an app is running against one taken at the idle desktop
+and call the delta a leak). `Stack Min` with the GPIO view open: 7316 of 8188
+bytes free -- no `stack_size` increase needed.
+
+---
+
 # Review — mandatory final step
 
 Every task that writes or changes C ends with **two** review passes, in order:

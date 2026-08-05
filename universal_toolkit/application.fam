@@ -1,0 +1,17 @@
+App(
+    appid="universal_toolkit",
+    name="Universal Toolkit",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="toolkit_app",
+    requires=["gui"],
+    # 8 KB: Phase 0 is the launcher Submenu plus one module (GPIO info: one
+    # view, one 200 ms timer, one FlipperFormat append). Re-measure `Stack
+    # Min` after build (CLAUDE.md ritual) and raise here -- in this commit,
+    # not later -- if it is not comfortably above the 2048-byte floor.
+    stack_size=8 * 1024,
+    fap_category="Tools",
+    fap_description="Launcher shell for the Flipper Zero tool modules in this repo.",
+    fap_author="farhadsoft",
+    fap_version="0.1",
+    fap_icon="icon.png",
+)
