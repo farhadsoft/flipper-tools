@@ -10,6 +10,10 @@
 
 #define BRUTE_NOTICE_MS 2500U
 #define BRUTE_SEQ_TOTAL 100000U
+/* Cyfral keys are 2 bytes -- the entire keyspace is small enough to always
+   walk exhaustively rather than apply the same bounded bruteforce budget
+   Dallas/Metakom use for their much larger (2^32) spaces. */
+#define BRUTE_CYFRAL_KEYSPACE 65536U
 
 static void brute_progress_save(BruteApp* app, bool force);
 static void brute_number_input_callback(void* context, int32_t number);
@@ -321,7 +325,8 @@ static void brute_run_start(BruteApp* app, BruteMode mode) {
             app->current_index = resume_index;
         }
     } else {
-        app->total_keys = BRUTE_SEQ_TOTAL;
+        app->total_keys = (app->protocol_item == BruteProtocolCyfral) ? BRUTE_CYFRAL_KEYSPACE :
+                                                                          BRUTE_SEQ_TOTAL;
         app->current_index = app->start_index;
         if(resume_index > app->start_index && resume_index < app->total_keys) {
             app->current_index = resume_index;
