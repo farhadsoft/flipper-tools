@@ -2,6 +2,7 @@
 
 #include <furi.h>
 #include <string.h>
+#include <storage/storage.h>
 
 #include "master_keys.h"
 
@@ -38,7 +39,10 @@ BruteApp* brute_worker_setup(BruteApp* app) {
         return NULL;
     }
 
-    if(!brute_master_keys_self_check(app->protocols)) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    const bool master_keys_ok = brute_master_keys_load(storage, app->protocols);
+    furi_record_close(RECORD_STORAGE);
+    if(!master_keys_ok) {
         return NULL;
     }
 
@@ -104,6 +108,8 @@ void brute_worker_teardown(BruteApp* app) {
         ibutton_protocols_free(app->protocols);
         app->protocols = NULL;
     }
+
+    brute_master_keys_free();
 }
 
 bool brute_worker_start(BruteApp* app) {
