@@ -16,13 +16,16 @@ This app cycles iButton/1-Wire candidate keys at a reader:
 - **Master keys** — walks a small curated table of documented community master
   keys (Dallas/DS1990, Cyfral, Metakom). At the default 400 ms dwell + 150 ms
   gap this is ~1.1 keys/s; a few dozen keys takes minutes.
-- **Sequential walk** — generates keys from a chosen Dallas family code plus an
-  incrementing 32-bit serial, with a locally computed Dallas CRC8. The walk is
-  bounded to 100 000 keys by default; at the same 550 ms period that is ~15
-  hours. The full 48-bit serial space is ~2.8 × 10^14 keys and would take
-  billions of years at this pace, so the sequential mode is only useful when
-  the search space is already reduced (partial-known serial, weak legacy
-  ranges).
+- **Sequential walk** — generates keys from an incrementing serial, with a
+  locally computed Dallas CRC8 for the Dallas protocol. Coverage depends on
+  protocol: **Cyfral is exhaustive** — its keyspace is exactly 65 536 keys
+  (2 bytes), small enough to walk in full every run. **Dallas and Metakom are
+  bounded, not exhaustive** — 100 000 keys by default (~15 hours at the
+  550 ms default period); Dallas's 32-bit serial space is ~4.3 × 10^9 keys
+  and Metakom's is comparable, both impractical to exhaust, so bounded mode
+  is only useful when the search space is already reduced (partial-known
+  serial, weak legacy ranges). The Dallas family byte is set via the
+  **Family** setting (default 0x01 / DS1990A).
 
 All `ibutton_worker_*` / `ibutton_protocols_*` calls happen on the GUI
 thread; the worker thread and the tick timer only ever post via
@@ -40,6 +43,8 @@ thread; the worker thread and the tick timer only ever post via
    to the menu.
 4. **Settings** lets you change:
    - **Protocol** — for sequential mode only (DSGeneric/Dallas, Cyfral, Metakom)
+   - **Family** — Dallas family byte for sequential mode (0-255, default
+     0x01 / DS1990A). Shown for every protocol; Cyfral/Metakom ignore it.
    - **Dwell** — how long each key is emulated (50–2000 ms, default 400 ms)
    - **Gap** — key-removed window between keys (50–2000 ms, default 150 ms)
    - **Start index** — where sequential mode begins
@@ -56,17 +61,27 @@ The file stores mode, protocol, current index, total, dwell, gap, family
 code, start index, resume flag, and the one-time ethics-accepted flag.
 It is written when the run stops and every 32 keys to bound SD wear.
 
+The master-key table lives at
+**`/ext/apps_data/ibutton_bruteforce/master_keys.txt`**, also FlipperFormat,
+as a sequence of `Name` / `Protocol` / `Data` records (one `Data` byte count
+per protocol: DS1990=8, Cyfral=2, Metakom=4). Edit it directly on the SD card
+to add your own keys. If it's missing, the app writes a small seed of
+clearly-labeled example entries and loads that. If it exists but fails to
+parse or fails validation, the app refuses to start rather than present keys
+it cannot trust — see Troubleshooting.
+
 The app never creates `.ibtn` files, never writes to the shared `/ext/ibutton/`
-tree, and never reads keys from the file system.
+tree, and never reads keys from the standard `/ext/ibutton/` file browser.
 
 ## Limitations
 
 - **The default master-key table contains only clearly-labeled example keys.**
   Replace them with keys from documented, authorized sources before any real
   use. A fabricated key wastes dwell budget and will not open anything.
-- **Cyfral and Metakom master keys are master-list only** in v1. Their code
-  spaces and reader behaviours differ from Dallas, and sequential mode for them
-  needs hardware evidence before it is enabled.
+- **Metakom sequential mode is bounded, like Dallas** — its keyspace (2^32) is
+  too large to exhaust, so the same 100 000-key default budget applies.
+  Cyfral sequential mode is exhaustive (see above) — its whole keyspace fits
+  inside a single run.
 - **Reader lockout is real.** Many readers freeze or alarm after some number of
   bad attempts. This app has no way to know or reset reader firmware behavior;
   pace your testing and monitor the reader.
@@ -87,11 +102,13 @@ tree, and never reads keys from the file system.
 
 If the app exits immediately on launch, check `log error` for a
 `master_keys self-check` line. This means either:
-- the table is empty,
-- a table entry names a protocol the firmware does not recognize, or
+- `master_keys.txt` has no entries,
+- an entry names a protocol the firmware does not recognize, or
 - a Dallas entry has a CRC mismatch.
 
-The app refuses to start rather than present keys it cannot trust.
+The app refuses to start rather than present keys it cannot trust. Delete
+`/ext/apps_data/ibutton_bruteforce/master_keys.txt` to get a fresh seed file
+on the next launch.
 
 ## Building
 
@@ -127,7 +144,7 @@ The menu icon is the `icon.png` file; if needed, it can be regenerated as a
 | `brute_app.h` | Shared structs, enums, constants — no `with_view_model()` calls |
 | `brute_worker.c/h` | iButton worker lifecycle and key stepping (the only file that calls `ibutton_worker_*`) |
 | `brute_ui.c/h` | Device UI — the only file that calls `with_view_model()` |
-| `master_keys.c/h` | Curated master-key table + alloc-time self-check |
+| `master_keys.c/h` | Curated master-key table, loaded/validated from `master_keys.txt` on the SD card |
 | `crc8_dallas.h` | Dallas/1-Wire CRC8 (poly 0x31, LSB-first), no firmware dependency |
 | `application.fam` | FAP manifest |
 | `icon.png` / `make_icon.py` | Menu icon |
