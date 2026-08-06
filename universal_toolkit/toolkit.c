@@ -4,6 +4,7 @@
 #include "modules/card_reader.h"
 #include "modules/rfid_multi.h"
 #include "modules/subghz_rec.h"
+#include "modules/ble_findmy.h"
 
 // Append-only module table: each row assembles one module's descriptor from
 // its exported callbacks. Phase 1 appends the three existing apps here, each
@@ -40,6 +41,14 @@ static const ToolkitModule modules[] = {
         .exit = subghz_rec_exit,
         .event = subghz_rec_event,
         .nav = subghz_rec_nav,
+    },
+    {
+        .name = "BLE Find My",
+        .view_base = TOOLKIT_VIEW_BASE_BLE_FINDMY,
+        .enter = ble_findmy_enter,
+        .exit = ble_findmy_exit,
+        .event = ble_findmy_event,
+        .nav = ble_findmy_nav,
     },
 };
 #define TOOLKIT_MODULE_COUNT (sizeof(modules) / sizeof(modules[0]))

@@ -33,6 +33,7 @@
 #define TOOLKIT_VIEW_BASE_CARD_READER 0x20u
 #define TOOLKIT_VIEW_BASE_RFID_MULTI  0x30u
 #define TOOLKIT_VIEW_BASE_SUBGHZ_REC  0x40u
+#define TOOLKIT_VIEW_BASE_BLE_FINDMY  0x50u
 
 // Append-only: values are persisted in session.log. Never renumber or reuse
 // a value, even for a subsystem that is later removed.
