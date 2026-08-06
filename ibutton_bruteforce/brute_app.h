@@ -48,6 +48,7 @@ typedef enum {
 /* Settings rows. */
 typedef enum {
     BruteSettingProtocol,
+    BruteSettingFamily,
     BruteSettingDwell,
     BruteSettingGap,
     BruteSettingStartIndex,
@@ -150,6 +151,10 @@ typedef struct {
     uint32_t start_index;
     bool resume;
     uint8_t family;
+    /* Which settings row opened BruteViewNumber -- Family and Start Index share
+       one NumberInput view, so brute_number_input_callback() needs to know which
+       app field to write the result into. */
+    BruteSettingItem number_input_target;
 
     uint32_t current_index;
     uint32_t total_keys;

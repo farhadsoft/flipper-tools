@@ -175,7 +175,7 @@ static void brute_settings_resume_change(VariableItem* item) {
 static void brute_settings_enter_callback(void* context, uint32_t index) {
     BruteApp* app = context;
     if(index == BruteSettingStartIndex) {
-        /* Open number input for start index. */
+        app->number_input_target = BruteSettingStartIndex;
         number_input_set_header_text(app->number_input, "Start index");
         number_input_set_result_callback(
             app->number_input,
@@ -185,13 +185,24 @@ static void brute_settings_enter_callback(void* context, uint32_t index) {
             0,
             999999);
         brute_switch_view(app, BruteViewNumber);
+    } else if(index == BruteSettingFamily) {
+        app->number_input_target = BruteSettingFamily;
+        number_input_set_header_text(app->number_input, "Family (0-255)");
+        number_input_set_result_callback(
+            app->number_input, brute_number_input_callback, app, (int32_t)app->family, 0, 255);
+        brute_switch_view(app, BruteViewNumber);
     }
 }
 
-/* Number input callback. */
+/* Number input callback -- shared by Start Index and Family; number_input_target
+   (set in brute_settings_enter_callback() just above) says which field to write. */
 static void brute_number_input_callback(void* context, int32_t number) {
     BruteApp* app = context;
-    app->start_index = (uint32_t)number;
+    if(app->number_input_target == BruteSettingFamily) {
+        app->family = (uint8_t)number;
+    } else {
+        app->start_index = (uint32_t)number;
+    }
     view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(BruteEventNumberDone, app->gen));
 }
 
@@ -205,6 +216,13 @@ static void brute_settings_setup(BruteApp* app) {
     item = variable_item_list_add(app->settings, "Protocol", BruteProtocolCount, brute_settings_protocol_change, app);
     variable_item_set_current_value_index(item, app->protocol_item);
     variable_item_set_current_value_text(item, brute_protocol_item_name(app, app->protocol_item));
+
+    /* Sequential-mode only (Dallas uses it; Cyfral/Metakom generators ignore it) --
+       shown unconditionally rather than rebuilding the list on protocol change. */
+    item = variable_item_list_add(app->settings, "Family", 1, NULL, app);
+    variable_item_set_current_value_index(item, 0);
+    snprintf(buf, sizeof(buf), "0x%02X", (unsigned)app->family);
+    variable_item_set_current_value_text(item, buf);
 
     item = variable_item_list_add(app->settings, "Dwell", brute_timing_index_count(), brute_settings_dwell_change, app);
     variable_item_set_current_value_index(item, brute_timing_index_from_ms(app->dwell_ms));
