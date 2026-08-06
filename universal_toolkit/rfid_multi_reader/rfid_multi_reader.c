@@ -22,6 +22,10 @@
 #include "ui.h"
 #include "backend_hf.h"
 #include "backend_lf.h"
+#undef TAG
+#include "../toolkit_app.h"
+#undef TAG
+#define TAG "RfidMultiReader"
 
 /* ----------------------------- helpers -------------------------------- */
 
@@ -80,7 +84,7 @@ void rfid_switch_view(RfidApp* app, RfidView view) {
     } else {
         furi_timer_stop(app->anim_timer);
     }
-    view_dispatcher_switch_to_view(app->view_dispatcher, view);
+    view_dispatcher_switch_to_view(app->view_dispatcher, app->view_base + view);
 }
 
 // GUI thread only. Shows a message on the status view and auto-returns to
@@ -88,7 +92,7 @@ void rfid_switch_view(RfidApp* app, RfidView view) {
 // this, so it never touches a radio itself.
 void rfid_show_notice(RfidApp* app, const char* title, const char* l1, const char* l2) {
     rfid_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
     app->active = NULL;
     app->timer_role = RfidTimerNotice;
     rfid_set_notice(app, title, l1, l2);
@@ -103,22 +107,22 @@ void rfid_show_notice(RfidApp* app, const char* title, const char* l1, const cha
 static void rfid_on_detect(void* ctx) {
     RfidApp* app = ctx;
     view_dispatcher_send_custom_event(
-        app->view_dispatcher, EVENT_MAKE(RfidEventDetected, app->gen));
+        app->view_dispatcher, EVENT_MAKE(RfidEventDetected, app->toolkit->gen));
 }
 
 static void rfid_on_read(void* ctx) {
     RfidApp* app = ctx;
-    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(RfidEventRead, app->gen));
+    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(RfidEventRead, app->toolkit->gen));
 }
 
 void rfid_start_scan(RfidApp* app) {
     rfid_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
     app->active = app->rotation[app->rot_idx];
     rfid_set_scanning(app, app->active->band_label, rfid_mode_label(app->mode));
     rfid_set_state(app, RfidStateScanning);
     rfid_switch_view(app, RfidViewStatus);
-    FURI_LOG_D(TAG, "phase: %s (gen %lu)", app->active->name, (unsigned long)app->gen);
+    FURI_LOG_D(TAG, "phase: %s (gen %lu)", app->active->name, (unsigned long)app->toolkit->gen);
     app->active->scan_start(app->active, rfid_on_detect, app);
     if(app->rotation_len > 1) {
         app->timer_role = RfidTimerPhase;
@@ -147,7 +151,7 @@ static void rfid_select_mode(RfidApp* app, RfidMode mode) {
 
 static void rfid_return_to_menu(RfidApp* app) {
     rfid_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
     app->active = NULL;
     rfid_set_state(app, RfidStateIdle);
     // submenu_set_selected_item() takes the row POSITION, not the item's
@@ -178,12 +182,13 @@ static void rfid_timer_callback(void* context) {
     default:
         return;
     }
-    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(id, app->gen));
+    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(id, app->toolkit->gen));
 }
 
 static void rfid_anim_timer_callback(void* context) {
     RfidApp* app = context;
-    view_dispatcher_send_custom_event(app->view_dispatcher, RfidEventAnimTick);
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, EVENT_MAKE(RfidEventAnimTick, app->toolkit->gen));
 }
 
 /* --------------------------- view callbacks ----------------------------- */
@@ -198,7 +203,7 @@ static void rfid_anim_timer_callback(void* context) {
 // RfidApp* - a real device crash in universal_card_reader. The dispatcher
 // passes event_context, i.e. the app, so every view transition funnels
 // through here and rfid_switch_view() instead.
-static bool rfid_navigation_callback(void* context) {
+bool rfid_navigation_callback(void* context) {
     RfidApp* app = context;
 
     if(app->current_view == RfidViewInfo || app->current_view == RfidViewStatus) {
@@ -206,7 +211,11 @@ static bool rfid_navigation_callback(void* context) {
         return true;
     }
     rfid_stop_all(app); // on the menu: leave
-    app->gen++;
+    app->toolkit->gen++;
+    if(app->module_mode) {
+        toolkit_exit_module(app->toolkit);
+        return true;
+    }
     return false; // dispatcher stops, run() returns
 }
 
@@ -216,25 +225,14 @@ static bool rfid_navigation_callback(void* context) {
 // RfidCustomEvent value the row was registered with.
 static void rfid_menu_callback(void* context, uint32_t index) {
     RfidApp* app = context;
-    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(index, app->gen));
+    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(index, app->toolkit->gen));
 }
 
-static bool rfid_custom_event_callback(void* context, uint32_t event) {
+bool rfid_custom_event_callback(void* context, uint32_t event) {
     RfidApp* app = context;
 
     if(event == RfidEventAnimTick) {
         rfid_bump_frame(app);
-        return true;
-    }
-
-    // Anything produced by a previous phase is stale - see EVENT_MAKE above.
-    if(EVENT_GEN(event) != app->gen) {
-        FURI_LOG_D(
-            TAG,
-            "drop stale event %lu (gen %lu != %lu)",
-            (unsigned long)EVENT_ID(event),
-            (unsigned long)EVENT_GEN(event),
-            (unsigned long)app->gen);
         return true;
     }
 
@@ -256,7 +254,7 @@ static bool rfid_custom_event_callback(void* context, uint32_t event) {
         furi_timer_stop(app->timer);
         app->timer_role = RfidTimerNone;
         rfid_set_state(app, RfidStateReading);
-        app->gen++;
+        app->toolkit->gen++;
         app->active->read(app->active, rfid_on_read, app);
         {
             uint32_t t = app->active->read_timeout_ms(app->active);
@@ -270,7 +268,7 @@ static bool rfid_custom_event_callback(void* context, uint32_t event) {
     case RfidEventRead:
         if(app->state != RfidStateReading) return true;
         rfid_stop_all(app);
-        app->gen++;
+        app->toolkit->gen++;
         rfid_report_begin(app);
         app->active->describe(app->active, app->info_text);
         rfid_set_state(app, RfidStateResult);
@@ -305,12 +303,12 @@ static bool rfid_custom_event_callback(void* context, uint32_t event) {
 
 /* ------------------------------ app life -------------------------------- */
 
-static RfidApp* rfid_app_alloc(void) {
+RfidApp* rfid_app_alloc(ViewDispatcher* view_dispatcher) {
     RfidApp* app = malloc(sizeof(RfidApp));
     memset(app, 0, sizeof(RfidApp));
+    app->view_base = TOOLKIT_VIEW_BASE_RFID_MULTI;
 
-    app->gui = furi_record_open(RECORD_GUI);
-    app->view_dispatcher = view_dispatcher_alloc();
+    app->view_dispatcher = view_dispatcher;
     app->status = view_alloc();
 
     view_allocate_model(app->status, ViewModelTypeLocking, sizeof(RfidModel));
@@ -323,22 +321,19 @@ static RfidApp* rfid_app_alloc(void) {
     // view_set_previous_callback() either, for the same reason documented
     // on rfid_navigation_callback().
 
-    view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
-    view_dispatcher_set_custom_event_callback(app->view_dispatcher, rfid_custom_event_callback);
-    view_dispatcher_set_navigation_event_callback(
-        app->view_dispatcher, rfid_navigation_callback);
-    view_dispatcher_add_view(app->view_dispatcher, RfidViewStatus, app->status);
+    view_dispatcher_add_view(app->view_dispatcher, app->view_base + RfidViewStatus, app->status);
 
     app->text_box = text_box_alloc();
     view_dispatcher_add_view(
-        app->view_dispatcher, RfidViewInfo, text_box_get_view(app->text_box));
+        app->view_dispatcher, app->view_base + RfidViewInfo, text_box_get_view(app->text_box));
     // text_box_set_text() stores the raw pointer, so this string must stay
     // alive and unmodified while the info view is shown.
     app->info_text = furi_string_alloc();
     furi_string_reserve(app->info_text, CARD_INFO_MAX);
 
     app->menu = submenu_alloc();
-    view_dispatcher_add_view(app->view_dispatcher, RfidViewMenu, submenu_get_view(app->menu));
+    view_dispatcher_add_view(
+        app->view_dispatcher, app->view_base + RfidViewMenu, submenu_get_view(app->menu));
     submenu_set_header(app->menu, "Select band");
     submenu_add_item(app->menu, "Auto (HF + LF)", RfidEventMenuAuto, rfid_menu_callback, app);
     submenu_add_item(app->menu, "13.56 MHz HF only", RfidEventMenuHf, rfid_menu_callback, app);
@@ -347,8 +342,6 @@ static RfidApp* rfid_app_alloc(void) {
 
     app->timer = furi_timer_alloc(rfid_timer_callback, FuriTimerTypeOnce, app);
     app->anim_timer = furi_timer_alloc(rfid_anim_timer_callback, FuriTimerTypePeriodic, app);
-
-    view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
 
     // Table of backends this build knows about. Steps 2/3/5 each add one
     // assignment here as their backend_*.c is written; every entry an
@@ -363,7 +356,7 @@ static RfidApp* rfid_app_alloc(void) {
     return app;
 }
 
-static void rfid_app_free(RfidApp* app) {
+void rfid_app_free(RfidApp* app) {
     // Silence the timers first so nothing can post into a dispatcher we are
     // about to tear down, then release the radios.
     furi_timer_stop(app->anim_timer);
@@ -378,24 +371,13 @@ static void rfid_app_free(RfidApp* app) {
     furi_timer_stop(app->timer);
     furi_timer_free(app->timer);
 
-    view_dispatcher_remove_view(app->view_dispatcher, RfidViewStatus);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + RfidViewStatus);
     view_free(app->status);
     text_box_reset(app->text_box); // release the pointer into info_text first
-    view_dispatcher_remove_view(app->view_dispatcher, RfidViewInfo);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + RfidViewInfo);
     text_box_free(app->text_box);
     furi_string_free(app->info_text);
-    view_dispatcher_remove_view(app->view_dispatcher, RfidViewMenu);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + RfidViewMenu);
     submenu_free(app->menu);
-    view_dispatcher_free(app->view_dispatcher);
-    furi_record_close(RECORD_GUI);
     free(app);
-}
-
-int32_t rfid_multi_reader_app(void* p) {
-    UNUSED(p);
-    RfidApp* app = rfid_app_alloc();
-    rfid_switch_view(app, RfidViewMenu); // start on the band menu
-    view_dispatcher_run(app->view_dispatcher);
-    rfid_app_free(app);
-    return 0;
 }

@@ -30,6 +30,10 @@
 #include "recorder_app.h"
 #include "recorder_radio.h"
 #include "recorder_ui.h"
+#undef TAG
+#include "../toolkit_app.h"
+#undef TAG
+#define TAG "SubGhzAutoRec"
 
 /* ----------------------------- helpers ------------------------------ */
 
@@ -119,7 +123,7 @@ void sub_rec_next_stem(SubRecApp* app, FuriString* out) {
 // there is nothing else to start or stop here.
 void sub_rec_switch_view(SubRecApp* app, SubRecView view) {
     app->current_view = view;
-    view_dispatcher_switch_to_view(app->view_dispatcher, view);
+    view_dispatcher_switch_to_view(app->view_dispatcher, app->view_base + view);
 }
 
 // GUI thread only. Shows a message as an overlay on the status view and
@@ -134,7 +138,7 @@ void sub_rec_show_notice(
     const char* l2,
     SubRecView return_view,
     SubRecCustomEvent next_event) {
-    app->gen++;
+    app->toolkit->gen++;
     app->notice_active = true;
     app->notice_return_view = return_view;
     app->notice_next = next_event;
@@ -149,18 +153,18 @@ void sub_rec_show_notice(
 // view model.
 static void sub_rec_rssi_timer_callback(void* context) {
     SubRecApp* app = context;
-    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(SubRecEventRssiTick, app->gen));
+    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(SubRecEventRssiTick, app->toolkit->gen));
 }
 
 static void sub_rec_tx_timer_callback(void* context) {
     SubRecApp* app = context;
-    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(SubRecEventTxPoll, app->gen));
+    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(SubRecEventTxPoll, app->toolkit->gen));
 }
 
 static void sub_rec_notice_timer_callback(void* context) {
     SubRecApp* app = context;
     view_dispatcher_send_custom_event(
-        app->view_dispatcher, EVENT_MAKE(SubRecEventNoticeDone, app->gen));
+        app->view_dispatcher, EVENT_MAKE(SubRecEventNoticeDone, app->toolkit->gen));
 }
 
 /* --------------------------- event handlers --------------------------- */
@@ -254,7 +258,7 @@ static void sub_rec_handle_rssi_tick(SubRecApp* app) {
 // -- for the rolling-code gate, an unwanted transmit. Clearing notice_next
 // is the second half of the same cancel.
 static void sub_rec_clear_notice(SubRecApp* app) {
-    app->gen++;
+    app->toolkit->gen++;
     app->notice_active = false;
     app->notice_next = 0;
     sub_rec_set_notice(app, "", "", "", false);
@@ -266,7 +270,7 @@ static void sub_rec_handle_notice_done(SubRecApp* app) {
     sub_rec_clear_notice(app);
     if(next != 0) {
         // Posted after the clear, so it carries the bumped gen.
-        view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(next, app->gen));
+        view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(next, app->toolkit->gen));
     } else {
         sub_rec_switch_view(app, return_view);
     }
@@ -1097,7 +1101,7 @@ static void sub_rec_dedup_changed(VariableItem* item) {
 // universal_card_reader's reader_navigation_callback(); see that file for
 // why this must be the dispatcher's navigation callback and never a
 // per-view previous_callback.
-static bool sub_rec_navigation_callback(void* context) {
+bool sub_rec_navigation_callback(void* context) {
     SubRecApp* app = context;
 
     if(app->current_view == SubRecViewStatus) {
@@ -1163,6 +1167,10 @@ static bool sub_rec_navigation_callback(void* context) {
 
     // SubRecViewMenu: let the dispatcher stop -- run() returns and
     // sub_rec_app_free() does the rest.
+    if(app->module_mode) {
+        toolkit_exit_module(app->toolkit);
+        return true;
+    }
     return false;
 }
 
@@ -1181,7 +1189,7 @@ static bool sub_rec_status_input_callback(InputEvent* event, void* context) {
     if(app->state == SubRecStateScanning) {
         if(event->key != InputKeyOk) return false;
         view_dispatcher_send_custom_event(
-            app->view_dispatcher, EVENT_MAKE(SubRecEventScanLock, app->gen));
+            app->view_dispatcher, EVENT_MAKE(SubRecEventScanLock, app->toolkit->gen));
         return true;
     }
     if(app->state == SubRecStateAnalyzing) {
@@ -1209,7 +1217,7 @@ static bool sub_rec_status_input_callback(InputEvent* event, void* context) {
             }
         }
         if(id == 0) return false; // Back must keep falling through to the nav callback
-        view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(id, app->gen));
+        view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(id, app->toolkit->gen));
         return true;
     }
     return false;
@@ -1220,7 +1228,7 @@ static bool sub_rec_status_input_callback(InputEvent* event, void* context) {
 // reader_action_callback().
 static void sub_rec_menu_callback(void* context, uint32_t index) {
     SubRecApp* app = context;
-    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(index, app->gen));
+    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(index, app->toolkit->gen));
 }
 
 // Placed here, ahead of the profiles/settings functions below, and NOT next
@@ -1372,7 +1380,7 @@ static void sub_rec_profile_row_callback(void* context, InputType type, uint32_t
     app->profile_sel = (uint8_t)(index - SubRecEventProfileSlot0);
     app->profile_del = (type == InputTypeLong);
     view_dispatcher_send_custom_event(
-        app->view_dispatcher, EVENT_MAKE(SubRecEventProfilePick, app->gen));
+        app->view_dispatcher, EVENT_MAKE(SubRecEventProfilePick, app->toolkit->gen));
 }
 
 // GUI thread. Rows: one per saved profile (OK loads, hold deletes), then
@@ -1567,20 +1575,8 @@ static void sub_rec_build_settings(SubRecApp* app) {
     variable_item_list_set_enter_callback(app->settings, sub_rec_settings_enter_callback, app);
 }
 
-static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
+bool sub_rec_custom_event_callback(void* context, uint32_t event) {
     SubRecApp* app = context;
-
-    // Every timer in this app belongs to exactly one state, so a stale tick
-    // must be dropped -- no event is exempt from this check.
-    if(EVENT_GEN(event) != app->gen) {
-        FURI_LOG_D(
-            TAG,
-            "drop stale event %lu (gen %lu != %lu)",
-            (unsigned long)EVENT_ID(event),
-            (unsigned long)EVENT_GEN(event),
-            (unsigned long)app->gen);
-        return true;
-    }
 
     switch(EVENT_ID(event)) {
     case SubRecEventRssiTick:
@@ -1680,7 +1676,7 @@ static bool sub_rec_custom_event_callback(void* context, uint32_t event) {
 
 /* ------------------------------- app life ------------------------------ */
 
-static SubRecApp* sub_rec_app_alloc(void) {
+SubRecApp* sub_rec_app_alloc(ViewDispatcher* view_dispatcher) {
     // Fail fast, before anything is allocated: see sub_rec_presets_self_check().
     if(!sub_rec_presets_self_check()) {
         return NULL;
@@ -1688,9 +1684,9 @@ static SubRecApp* sub_rec_app_alloc(void) {
 
     SubRecApp* app = malloc(sizeof(SubRecApp));
     memset(app, 0, sizeof(SubRecApp)); // zeroes app->preset too -- see recorder_app.h SubRecPreset
+    app->view_base = TOOLKIT_VIEW_BASE_SUBGHZ_REC;
 
-    app->gui = furi_record_open(RECORD_GUI);
-    app->view_dispatcher = view_dispatcher_alloc();
+    app->view_dispatcher = view_dispatcher;
     app->view = view_alloc();
 
     view_allocate_model(app->view, ViewModelTypeLocking, sizeof(SubRecModel));
@@ -1700,13 +1696,11 @@ static SubRecApp* sub_rec_app_alloc(void) {
     // own comment on why returning false for everything else matters.
     view_set_input_callback(app->view, sub_rec_status_input_callback);
 
-    view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
-    view_dispatcher_set_custom_event_callback(app->view_dispatcher, sub_rec_custom_event_callback);
-    view_dispatcher_set_navigation_event_callback(app->view_dispatcher, sub_rec_navigation_callback);
-    view_dispatcher_add_view(app->view_dispatcher, SubRecViewStatus, app->view);
+    view_dispatcher_add_view(app->view_dispatcher, app->view_base + SubRecViewStatus, app->view);
 
     app->menu = submenu_alloc();
-    view_dispatcher_add_view(app->view_dispatcher, SubRecViewMenu, submenu_get_view(app->menu));
+    view_dispatcher_add_view(
+        app->view_dispatcher, app->view_base + SubRecViewMenu, submenu_get_view(app->menu));
     submenu_add_item(app->menu, "Auto-record", SubRecEventMenuListen, sub_rec_menu_callback, app);
     submenu_add_item(app->menu, "Frequency scan", SubRecEventMenuScan, sub_rec_menu_callback, app);
     submenu_add_item(app->menu, "Settings", SubRecEventMenuSettings, sub_rec_menu_callback, app);
@@ -1715,7 +1709,9 @@ static SubRecApp* sub_rec_app_alloc(void) {
 
     app->file_menu = submenu_alloc();
     view_dispatcher_add_view(
-        app->view_dispatcher, SubRecViewFileMenu, submenu_get_view(app->file_menu));
+        app->view_dispatcher,
+        app->view_base + SubRecViewFileMenu,
+        submenu_get_view(app->file_menu));
     submenu_add_item(app->file_menu, "Replay", SubRecEventFileReplay, sub_rec_menu_callback, app);
     submenu_add_item(app->file_menu, "Analyze", SubRecEventFileAnalyze, sub_rec_menu_callback, app);
     submenu_add_item(app->file_menu, "Label", SubRecEventFileLabel, sub_rec_menu_callback, app);
@@ -1725,7 +1721,7 @@ static SubRecApp* sub_rec_app_alloc(void) {
 
     app->saved_menu = submenu_alloc();
     view_dispatcher_add_view(
-        app->view_dispatcher, SubRecViewSaved, submenu_get_view(app->saved_menu));
+        app->view_dispatcher, app->view_base + SubRecViewSaved, submenu_get_view(app->saved_menu));
     submenu_set_header(app->saved_menu, "Saved signals");
     submenu_add_item(
         app->saved_menu, "Browse files", SubRecEventSavedBrowse, sub_rec_menu_callback, app);
@@ -1746,7 +1742,9 @@ static SubRecApp* sub_rec_app_alloc(void) {
 
     app->confirm_menu = submenu_alloc();
     view_dispatcher_add_view(
-        app->view_dispatcher, SubRecViewConfirm, submenu_get_view(app->confirm_menu));
+        app->view_dispatcher,
+        app->view_base + SubRecViewConfirm,
+        submenu_get_view(app->confirm_menu));
     // Cancel first: see sub_rec_clear_all_start(). The header is set per entry.
     submenu_add_item(
         app->confirm_menu, "Cancel", SubRecEventConfirmNo, sub_rec_menu_callback, app);
@@ -1758,18 +1756,25 @@ static SubRecApp* sub_rec_app_alloc(void) {
     // last).
     app->profiles_menu = submenu_alloc();
     view_dispatcher_add_view(
-        app->view_dispatcher, SubRecViewProfiles, submenu_get_view(app->profiles_menu));
+        app->view_dispatcher,
+        app->view_base + SubRecViewProfiles,
+        submenu_get_view(app->profiles_menu));
 
     app->settings = variable_item_list_alloc();
     view_dispatcher_add_view(
-        app->view_dispatcher, SubRecViewSettings, variable_item_list_get_view(app->settings));
+        app->view_dispatcher,
+        app->view_base + SubRecViewSettings,
+        variable_item_list_get_view(app->settings));
 
     app->number = number_input_alloc();
     view_dispatcher_add_view(
-        app->view_dispatcher, SubRecViewNumber, number_input_get_view(app->number));
+        app->view_dispatcher,
+        app->view_base + SubRecViewNumber,
+        number_input_get_view(app->number));
 
     app->text = text_input_alloc();
-    view_dispatcher_add_view(app->view_dispatcher, SubRecViewText, text_input_get_view(app->text));
+    view_dispatcher_add_view(
+        app->view_dispatcher, app->view_base + SubRecViewText, text_input_get_view(app->text));
 
     app->rssi_timer = furi_timer_alloc(sub_rec_rssi_timer_callback, FuriTimerTypePeriodic, app);
     app->tx_timer = furi_timer_alloc(sub_rec_tx_timer_callback, FuriTimerTypePeriodic, app);
@@ -1792,12 +1797,10 @@ static SubRecApp* sub_rec_app_alloc(void) {
     sub_rec_config_load(app);
     sub_rec_build_settings(app);
 
-    view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
-
     return app;
 }
 
-static void sub_rec_app_free(SubRecApp* app) {
+void sub_rec_app_free(SubRecApp* app) {
     // Silence the posters first, then the radio, then the views -- mirrors
     // universal_card_reader's reader_app_free().
     furi_timer_stop(app->rssi_timer);
@@ -1817,23 +1820,23 @@ static void sub_rec_app_free(SubRecApp* app) {
     furi_timer_free(app->tx_timer);
     furi_timer_free(app->notice_timer);
 
-    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewStatus);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewStatus);
     view_free(app->view);
-    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewMenu);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewMenu);
     submenu_free(app->menu);
-    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewFileMenu);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewFileMenu);
     submenu_free(app->file_menu);
-    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewSaved);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewSaved);
     submenu_free(app->saved_menu);
-    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewConfirm);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewConfirm);
     submenu_free(app->confirm_menu);
-    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewProfiles);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewProfiles);
     submenu_free(app->profiles_menu);
-    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewSettings);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewSettings);
     variable_item_list_free(app->settings);
-    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewNumber);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewNumber);
     number_input_free(app->number);
-    view_dispatcher_remove_view(app->view_dispatcher, SubRecViewText);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewText);
     text_input_free(app->text);
 
     furi_string_free(app->capture_path);
@@ -1842,17 +1845,6 @@ static void sub_rec_app_free(SubRecApp* app) {
 
     sub_rec_config_save(app);
     furi_record_close(RECORD_STORAGE);
-    view_dispatcher_free(app->view_dispatcher);
-    furi_record_close(RECORD_GUI);
     free(app);
 }
 
-int32_t subghz_auto_recorder_app(void* p) {
-    UNUSED(p);
-    SubRecApp* app = sub_rec_app_alloc();
-    if(!app) return 0; // preset self-check failed; see sub_rec_presets_self_check()
-    sub_rec_switch_view(app, SubRecViewMenu);
-    view_dispatcher_run(app->view_dispatcher);
-    sub_rec_app_free(app);
-    return 0;
-}

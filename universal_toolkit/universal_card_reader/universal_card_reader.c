@@ -25,6 +25,10 @@
 #include "reader_nfc.h"
 #include "reader_lf.h"
 #include "card_info.h"
+#undef TAG
+#include "../toolkit_app.h"
+#undef TAG
+#define TAG "UniCardReader"
 
 /* ----------------------------- helpers ------------------------------ */
 
@@ -93,7 +97,7 @@ void reader_switch_view(ReaderApp* app, ReaderView view) {
     } else {
         furi_timer_stop(app->anim_timer);
     }
-    view_dispatcher_switch_to_view(app->view_dispatcher, view);
+    view_dispatcher_switch_to_view(app->view_dispatcher, app->view_base + view);
 }
 
 // GUI thread only. Shows a message on the status view (reusing ReaderViewScan)
@@ -104,7 +108,7 @@ void reader_show_notice(
     ReaderApp* app, const char* title, const char* l1, const char* l2, ReaderView back_to) {
     app->notice_return = back_to;
     reader_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
     app->notice_active = true;
     reader_set_notice(app, title, l1, l2);
     reader_switch_view(app, ReaderViewScan);
@@ -121,12 +125,13 @@ void reader_show_notice(
 static void reader_phase_timer_callback(void* context) {
     ReaderApp* app = context;
     uint8_t id = app->notice_active ? ReaderEventNoticeDone : ReaderEventPhaseTimeout;
-    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(id, app->gen));
+    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(id, app->toolkit->gen));
 }
 
 static void reader_anim_timer_callback(void* context) {
     ReaderApp* app = context;
-    view_dispatcher_send_custom_event(app->view_dispatcher, ReaderEventAnimTick);
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, EVENT_MAKE(ReaderEventAnimTick, app->toolkit->gen));
 }
 
 /* --------------------------- view callbacks ------------------------- */
@@ -142,7 +147,7 @@ static void reader_anim_timer_callback(void* context) {
 // 0x2000A5C0 — dereferencing it crashed the firmware. The dispatcher passes
 // event_context, i.e. the app, so every view transition funnels through here
 // and reader_switch_view() instead of a per-view previous_callback.
-static bool reader_navigation_callback(void* context) {
+bool reader_navigation_callback(void* context) {
     ReaderApp* app = context;
 
     // The info TextBox never consumes Back; the scan view consumes only short
@@ -166,7 +171,7 @@ static bool reader_navigation_callback(void* context) {
     // NFC phase, and radio starts belong in reader_custom_event_callback().
     if(app->current_view == ReaderViewFileMenu) {
         view_dispatcher_send_custom_event(
-            app->view_dispatcher, EVENT_MAKE(ReaderEventFileBack, app->gen));
+            app->view_dispatcher, EVENT_MAKE(ReaderEventFileBack, app->toolkit->gen));
         return true;
     }
 
@@ -181,7 +186,11 @@ static bool reader_navigation_callback(void* context) {
     // the phase we are killing, then let the dispatcher stop. run() returns and
     // reader_app_free() does the rest.
     reader_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
+    if(app->module_mode) {
+        toolkit_exit_module(app->toolkit);
+        return true;
+    }
     return false;
 }
 
@@ -191,7 +200,7 @@ static bool reader_navigation_callback(void* context) {
 // ReaderCustomEvent value the item was registered with.
 static void reader_action_callback(void* context, uint32_t index) {
     ReaderApp* app = context;
-    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(index, app->gen));
+    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(index, app->toolkit->gen));
 }
 
 
@@ -340,7 +349,7 @@ static void reader_do_load(ReaderApp* app) {
     app->load_from_scan = (app->current_view == ReaderViewScan);
 
     reader_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
     furi_timer_stop(app->anim_timer);
     reader_ensure_dirs();
 
@@ -526,26 +535,15 @@ static void reader_handle_phase_timeout(ReaderApp* app) {
 
 static void reader_handle_exit(ReaderApp* app) {
     reader_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
     view_dispatcher_stop(app->view_dispatcher);
 }
 
-static bool reader_custom_event_callback(void* context, uint32_t event) {
+bool reader_custom_event_callback(void* context, uint32_t event) {
     ReaderApp* app = context;
 
     if(event == ReaderEventAnimTick) {
         reader_bump_frame(app);
-        return true;
-    }
-
-    // Anything produced by a previous phase is stale — see EVENT_MAKE above.
-    if(EVENT_GEN(event) != app->gen) {
-        FURI_LOG_D(
-            TAG,
-            "drop stale event %lu (gen %lu != %lu)",
-            (unsigned long)EVENT_ID(event),
-            (unsigned long)EVENT_GEN(event),
-            (unsigned long)app->gen);
         return true;
     }
 
@@ -578,7 +576,7 @@ static bool reader_input_callback(InputEvent* event, void* context) {
     if(state == ReaderStateEmulating) {
         if(event->key == InputKeyBack) {
             reader_stop_all(app); // listener stop+free / LF worker stop+join
-            app->gen++;
+            app->toolkit->gen++;
             reader_switch_view(app, ReaderViewInfo);
             return true;
         }
@@ -598,7 +596,7 @@ static bool reader_input_callback(InputEvent* event, void* context) {
         // Routed through the dispatcher like every other action so the radio
         // teardown stays inside reader_custom_event_callback().
         view_dispatcher_send_custom_event(
-            app->view_dispatcher, EVENT_MAKE(ReaderEventActionLoad, app->gen));
+            app->view_dispatcher, EVENT_MAKE(ReaderEventActionLoad, app->toolkit->gen));
         return true;
     }
 
@@ -610,12 +608,12 @@ static bool reader_input_callback(InputEvent* event, void* context) {
 
 /* ------------------------------ app life ---------------------------- */
 
-static ReaderApp* reader_app_alloc(void) {
+ReaderApp* reader_app_alloc(ViewDispatcher* view_dispatcher) {
     ReaderApp* app = malloc(sizeof(ReaderApp));
     memset(app, 0, sizeof(ReaderApp));
+    app->view_base = TOOLKIT_VIEW_BASE_CARD_READER;
 
-    app->gui = furi_record_open(RECORD_GUI);
-    app->view_dispatcher = view_dispatcher_alloc();
+    app->view_dispatcher = view_dispatcher;
     app->view = view_alloc();
 
     view_allocate_model(app->view, ViewModelTypeLocking, sizeof(ReaderModel));
@@ -623,15 +621,11 @@ static ReaderApp* reader_app_alloc(void) {
     view_set_draw_callback(app->view, reader_draw_callback);
     view_set_input_callback(app->view, reader_input_callback);
 
-    view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
-    view_dispatcher_set_custom_event_callback(app->view_dispatcher, reader_custom_event_callback);
-    view_dispatcher_set_navigation_event_callback(
-        app->view_dispatcher, reader_navigation_callback);
-    view_dispatcher_add_view(app->view_dispatcher, ReaderViewScan, app->view);
+    view_dispatcher_add_view(app->view_dispatcher, app->view_base + ReaderViewScan, app->view);
 
     app->text_box = text_box_alloc();
     view_dispatcher_add_view(
-        app->view_dispatcher, ReaderViewInfo, text_box_get_view(app->text_box));
+        app->view_dispatcher, app->view_base + ReaderViewInfo, text_box_get_view(app->text_box));
     // text_box_set_text() stores the raw pointer, so this string must stay
     // alive and unmodified while the info view is shown.
     app->info_text = furi_string_alloc();
@@ -642,7 +636,7 @@ static ReaderApp* reader_app_alloc(void) {
 
     app->actions = submenu_alloc();
     view_dispatcher_add_view(
-        app->view_dispatcher, ReaderViewActions, submenu_get_view(app->actions));
+        app->view_dispatcher, app->view_base + ReaderViewActions, submenu_get_view(app->actions));
     submenu_add_item(app->actions, "Save", ReaderEventActionSave, reader_action_callback, app);
     submenu_add_item(
         app->actions, "Emulate", ReaderEventActionEmulate, reader_action_callback, app);
@@ -653,7 +647,7 @@ static ReaderApp* reader_app_alloc(void) {
 
     app->file_menu = submenu_alloc();
     view_dispatcher_add_view(
-        app->view_dispatcher, ReaderViewFileMenu, submenu_get_view(app->file_menu));
+        app->view_dispatcher, app->view_base + ReaderViewFileMenu, submenu_get_view(app->file_menu));
     submenu_add_item(app->file_menu, "Open", ReaderEventFileOpen, reader_action_callback, app);
     submenu_add_item(
         app->file_menu, "Rename", ReaderEventFileRename, reader_action_callback, app);
@@ -663,16 +657,13 @@ static ReaderApp* reader_app_alloc(void) {
 
     app->rename_input = text_input_alloc();
     view_dispatcher_add_view(
-        app->view_dispatcher, ReaderViewRename, text_input_get_view(app->rename_input));
+        app->view_dispatcher, app->view_base + ReaderViewRename, text_input_get_view(app->rename_input));
     app->selected_path = furi_string_alloc();
 
     app->phase_timer =
         furi_timer_alloc(reader_phase_timer_callback, FuriTimerTypeOnce, app);
     app->anim_timer =
         furi_timer_alloc(reader_anim_timer_callback, FuriTimerTypePeriodic, app);
-
-    view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
-    reader_switch_view(app, ReaderViewScan); // also starts the animation timer
 
     app->nfc = nfc_alloc();
     app->device = nfc_device_alloc();
@@ -684,7 +675,7 @@ static ReaderApp* reader_app_alloc(void) {
     return app;
 }
 
-static void reader_app_free(ReaderApp* app) {
+void reader_app_free(ReaderApp* app) {
     // Silence the timers first so nothing can post into a dispatcher we are
     // about to tear down, then release the radios.
     furi_timer_stop(app->anim_timer);
@@ -701,31 +692,19 @@ static void reader_app_free(ReaderApp* app) {
     furi_timer_stop(app->phase_timer);
     furi_timer_free(app->phase_timer);
 
-    view_dispatcher_remove_view(app->view_dispatcher, ReaderViewScan);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + ReaderViewScan);
     view_free(app->view);
     text_box_reset(app->text_box); // release the pointer into info_text first
-    view_dispatcher_remove_view(app->view_dispatcher, ReaderViewInfo);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + ReaderViewInfo);
     text_box_free(app->text_box);
     furi_string_free(app->info_text);
-    view_dispatcher_remove_view(app->view_dispatcher, ReaderViewActions);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + ReaderViewActions);
     submenu_free(app->actions);
-    view_dispatcher_remove_view(app->view_dispatcher, ReaderViewFileMenu);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + ReaderViewFileMenu);
     submenu_free(app->file_menu);
-    view_dispatcher_remove_view(app->view_dispatcher, ReaderViewRename);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + ReaderViewRename);
     text_input_free(app->rename_input);
     furi_string_free(app->selected_path);
-    view_dispatcher_free(app->view_dispatcher);
-    furi_record_close(RECORD_GUI);
     free(app);
 }
 
-int32_t universal_card_reader_app(void* p) {
-    UNUSED(p);
-    ReaderApp* app = reader_app_alloc();
-
-    reader_start_nfc_phase(app);
-    view_dispatcher_run(app->view_dispatcher);
-
-    reader_app_free(app);
-    return 0;
-}

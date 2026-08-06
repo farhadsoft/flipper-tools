@@ -28,7 +28,7 @@
 #define EVENT_MAKE(id, gen) ((uint32_t)(id) | ((uint32_t)(gen) << 8u))
 
 typedef enum {
-    RfidEventAnimTick = 100, // posted raw (gen 0); exempt from the gen check
+    RfidEventAnimTick = 100, // gen-stamped like every other event; the toolkit filters it centrally now
     RfidEventPhaseTimeout,
     RfidEventReadTimeout,
     RfidEventNoticeDone,
@@ -82,8 +82,9 @@ typedef struct {
     char notice_l2[40];
 } RfidModel;
 
+typedef struct ToolkitApp ToolkitApp; // forward declaration; full type in universal_toolkit/toolkit_app.h
+
 typedef struct {
-    Gui* gui;
     ViewDispatcher* view_dispatcher;
     View* status;
     TextBox* text_box;
@@ -102,7 +103,10 @@ typedef struct {
     RfidMode mode;
     RfidState state; // GUI-thread source of truth; the model gets a copy
     volatile RfidTimerRole timer_role; // cross-thread, see above; volatile because TimersSrv reads it
-    volatile uint32_t gen;
+
+    ToolkitApp* toolkit; // set by the module wrapper; NULL when standalone
+    bool module_mode; // true when running as a toolkit module
+    uint32_t view_base; // this instance's view-id namespace base
 } RfidApp;
 
 // Core services implemented in rfid_multi_reader.c.
@@ -111,3 +115,7 @@ void rfid_switch_view(RfidApp* app, RfidView view);
 void rfid_show_notice(RfidApp* app, const char* title, const char* l1, const char* l2);
 void rfid_start_scan(RfidApp* app);
 void rfid_advance_phase(RfidApp* app);
+RfidApp* rfid_app_alloc(ViewDispatcher* view_dispatcher);
+void rfid_app_free(RfidApp* app);
+bool rfid_custom_event_callback(void* context, uint32_t event);
+bool rfid_navigation_callback(void* context);

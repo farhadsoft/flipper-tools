@@ -2,6 +2,10 @@
 #include "reader_ui.h"
 #include "card_info.h"
 #include <lfrfid/protocols/lfrfid_protocols.h>
+#undef TAG
+#include "../toolkit_app.h"
+#undef TAG
+#define TAG "UniCardReader"
 
 /*
  * lfrfid_worker_stop() only asks the worker thread to leave read/emulate mode;
@@ -31,17 +35,17 @@ static void reader_lf_callback(LFRFIDWorkerReadResult result, ProtocolId protoco
 
     app->lf_protocol = protocol;
     view_dispatcher_send_custom_event(
-        app->view_dispatcher, EVENT_MAKE(ReaderEventLfRead, app->gen));
+        app->view_dispatcher, EVENT_MAKE(ReaderEventLfRead, app->toolkit->gen));
 }
 
 void reader_start_lf_phase(ReaderApp* app) {
     reader_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
     app->lf_phase = true;
     reader_set_scanning(app, true);
     reader_switch_view(app, ReaderViewScan);
 
-    FURI_LOG_D(TAG, "phase: LF (gen %lu)", (unsigned long)app->gen);
+    FURI_LOG_D(TAG, "phase: LF (gen %lu)", (unsigned long)app->toolkit->gen);
     lfrfid_worker_start_thread(app->worker);
     app->lf_thread_running = true;
     lfrfid_worker_read_start(app->worker, LFRFIDWorkerReadTypeAuto, reader_lf_callback, app);
@@ -53,7 +57,7 @@ void reader_start_lf_phase(ReaderApp* app) {
 // on the info/actions screens, so emulation starts it again (see reader_stop_lf).
 void reader_start_lf_emulation(ReaderApp* app) {
     reader_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
     lfrfid_worker_start_thread(app->worker);
     app->lf_thread_running = true;
     lfrfid_worker_emulate_start(app->worker, (LFRFIDProtocol)app->lf_protocol);
@@ -66,7 +70,7 @@ void reader_start_lf_emulation(ReaderApp* app) {
 void reader_lf_handle_read(ReaderApp* app) {
     if(!app->lf_phase || !app->lf_reading) return;
     reader_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
     app->card = ReaderCardLf;
 
     const char* name = protocol_dict_get_name(app->dict, app->lf_protocol);

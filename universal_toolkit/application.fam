@@ -4,14 +4,16 @@ App(
     apptype=FlipperAppType.EXTERNAL,
     entry_point="toolkit_app",
     requires=["gui"],
-    # 8 KB: Phase 0 is the launcher Submenu plus one module (GPIO info: one
-    # view, one 200 ms timer, one FlipperFormat append). Re-measure `Stack
-    # Min` after build (CLAUDE.md ritual) and raise here -- in this commit,
-    # not later -- if it is not comfortably above the 2048-byte floor.
-    stack_size=8 * 1024,
+    # 16 KB: Phase 1 compiles the three existing apps in as modules (NFC +
+    # EMV parsing, HF/LF RFID, SubGHz capture/replay) -- the heaviest,
+    # subghz_auto_recorder, alone used ~12 KB standalone. Re-measure
+    # `Stack Min` after build (CLAUDE.md ritual) and raise here -- in this
+    # commit, not later -- if any module is not comfortably above the
+    # 4096-byte floor (see Phase 1 verification in CLAUDE.md).
+    stack_size=16 * 1024,
     fap_category="Tools",
     fap_description="Launcher shell for the Flipper Zero tool modules in this repo.",
     fap_author="farhadsoft",
-    fap_version="0.1",
+    fap_version="0.2",
     fap_icon="icon.png",
 )

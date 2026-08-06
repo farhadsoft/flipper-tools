@@ -267,8 +267,15 @@ typedef struct {
     uint8_t trigger_idx; // index into sub_rec_triggers[]
 } SubRecProfile;
 
+// Forward declaration only -- this header must not depend on
+// universal_toolkit/toolkit_app.h; the .c files that dereference
+// app->toolkit include it themselves. Full typedef (not just a bare
+// `struct ToolkitApp;` tag) so `ToolkitApp*` below is a valid type name
+// regardless of include order -- identical redeclaration once the .c file's
+// own toolkit_app.h include lands is legal C11/GNU11.
+typedef struct ToolkitApp ToolkitApp;
+
 typedef struct {
-    Gui* gui;
     ViewDispatcher* view_dispatcher;
     View* view; // status view (SubRecViewStatus)
     Submenu* menu; // main menu
@@ -292,7 +299,12 @@ typedef struct {
     FuriTimer* rssi_timer; // periodic
     FuriTimer* tx_timer; // periodic
     FuriTimer* notice_timer; // one-shot
-    volatile uint32_t gen;
+    // Set by the module wrapper (universal_toolkit/modules/subghz_rec.c)
+    // when running inside the toolkit; NULL standalone. gen now lives on
+    // ToolkitApp -- see app->toolkit->gen below.
+    ToolkitApp* toolkit;
+    bool module_mode; // true when running as a toolkit module
+    uint32_t view_base; // this instance's view-id namespace base (set in alloc)
     SubRecView current_view;
     SubRecState state;
     Storage* storage;
@@ -400,3 +412,9 @@ void sub_rec_next_stem(SubRecApp* app, FuriString* out);
 // reading the view model; recorder_ui.c is the only file allowed to do
 // that) never drift apart.
 void sub_rec_format_freq_line(SubRecApp* app, char* out, size_t out_size);
+// Non-static: the module wrapper (universal_toolkit/modules/subghz_rec.c)
+// calls all four from a different translation unit.
+SubRecApp* sub_rec_app_alloc(ViewDispatcher* view_dispatcher);
+void sub_rec_app_free(SubRecApp* app);
+bool sub_rec_custom_event_callback(void* context, uint32_t event);
+bool sub_rec_navigation_callback(void* context);

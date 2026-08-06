@@ -115,8 +115,9 @@ typedef enum {
     ReaderCardEmvFile, // EMV fields loaded from a .emv file; v3 files also restore the 4A transport into device
 } ReaderCardKind;
 
+typedef struct ToolkitApp ToolkitApp; // forward declaration; full type is universal_toolkit/toolkit_app.h
+
 typedef struct {
-    Gui* gui;
     ViewDispatcher* view_dispatcher;
     View* view;
     TextBox* text_box;
@@ -168,7 +169,9 @@ typedef struct {
     // this mirrors the existing gen/lf_phase pattern of plain cross-thread
     // fields instead of the model's mutex.
     volatile bool notice_active; // ReaderStateNotice is currently showing
-    volatile uint32_t gen; // bumped on the GUI thread, read by the timer callback on TimersSrv
+    ToolkitApp* toolkit; // set by the module wrapper; NULL when standalone (dead path now, kept for symmetry)
+    bool module_mode; // true when running as a toolkit module
+    uint32_t view_base; // this instance's view-id namespace base (hardcoded in alloc)
 } ReaderApp;
 
 // Core services implemented in universal_card_reader.c.
@@ -176,3 +179,7 @@ void reader_stop_all(ReaderApp* app);
 void reader_switch_view(ReaderApp* app, ReaderView view);
 void reader_show_notice(ReaderApp* app, const char* title, const char* l1, const char* l2, ReaderView back_to);
 void reader_cat_hex(FuriString* out, const uint8_t* data, size_t len);
+ReaderApp* reader_app_alloc(ViewDispatcher* view_dispatcher);
+void reader_app_free(ReaderApp* app);
+bool reader_custom_event_callback(void* context, uint32_t event);
+bool reader_navigation_callback(void* context);

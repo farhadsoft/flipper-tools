@@ -2,6 +2,10 @@
 #include "reader_ui.h"
 #include "card_info.h"
 #include "emv.h"
+#undef TAG
+#include "../toolkit_app.h"
+#undef TAG
+#define TAG "UniCardReader"
 
 #include <nfc/protocols/iso14443_3a/iso14443_3a_poller.h>
 #include <nfc/protocols/iso14443_4a/iso14443_4a_poller.h>
@@ -140,7 +144,7 @@ static NfcCommand reader_nfc_done(ReaderApp* app, NfcProtocol polled) {
     nfc_device_set_data(app->device, polled, nfc_poller_get_data(app->poller));
     FURI_LOG_I(TAG, "NFC read: %s", nfc_device_get_protocol_name(app->display_protocol));
     view_dispatcher_send_custom_event(
-        app->view_dispatcher, EVENT_MAKE(ReaderEventNfcRead, app->gen));
+        app->view_dispatcher, EVENT_MAKE(ReaderEventNfcRead, app->toolkit->gen));
     return NfcCommandStop;
 }
 
@@ -314,7 +318,7 @@ static void reader_scanner_callback(NfcScannerEvent event, void* context) {
     app->poll_protocol = reader_poll_protocol(best);
     FURI_LOG_I(TAG, "NFC detected: %s", nfc_device_get_protocol_name(best));
     view_dispatcher_send_custom_event(
-        app->view_dispatcher, EVENT_MAKE(ReaderEventNfcScanned, app->gen));
+        app->view_dispatcher, EVENT_MAKE(ReaderEventNfcScanned, app->toolkit->gen));
 }
 
 // NFC emulation listener callback. Runs on the NFC worker thread; the
@@ -331,13 +335,13 @@ static NfcCommand reader_listener_callback(NfcGenericEvent event, void* context)
 // from the phase we are leaving.
 void reader_start_nfc_phase(ReaderApp* app) {
     reader_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
     app->lf_phase = false;
     reader_set_scanning(app, false);
     // Rescan from the info screen (Back) must land on the scan view again.
     reader_switch_view(app, ReaderViewScan);
 
-    FURI_LOG_D(TAG, "phase: NFC (gen %lu)", (unsigned long)app->gen);
+    FURI_LOG_D(TAG, "phase: NFC (gen %lu)", (unsigned long)app->toolkit->gen);
     app->scanner = nfc_scanner_alloc(app->nfc);
     nfc_scanner_start(app->scanner, reader_scanner_callback, app);
     furi_timer_start(app->phase_timer, furi_ms_to_ticks(NFC_PHASE_MS));
@@ -348,7 +352,7 @@ void reader_start_nfc_phase(ReaderApp* app) {
 // payment card.
 void reader_start_nfc_emulation(ReaderApp* app) {
     reader_stop_all(app); // scanner/poller/LF worker released and joined first
-    app->gen++;
+    app->toolkit->gen++;
     const NfcDeviceData* data = nfc_device_get_data(app->device, app->poll_protocol);
     app->listener = nfc_listener_alloc(app->nfc, app->poll_protocol, data);
     nfc_listener_start(app->listener, reader_listener_callback, app);
@@ -381,7 +385,7 @@ void reader_nfc_handle_scanned(ReaderApp* app) {
     app->scanner = NULL;
 
     // Retires any duplicate ReaderEventNfcScanned still in the queue.
-    app->gen++;
+    app->toolkit->gen++;
 
     reader_set_state(app, ReaderStateReading);
     // Restart every per-read state so a rescan begins cleanly.
@@ -402,7 +406,7 @@ void reader_nfc_handle_scanned(ReaderApp* app) {
 void reader_nfc_handle_read(ReaderApp* app) {
     if(!app->poller) return;
     reader_stop_all(app);
-    app->gen++;
+    app->toolkit->gen++;
     app->card = ReaderCardNfc;
     reader_report_begin(app);
     card_info_format_nfc(app->info_text, app->device, app->display_protocol, &app->emv);

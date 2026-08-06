@@ -1,5 +1,9 @@
 #include "recorder_radio.h"
 #include "recorder_ui.h"
+#undef TAG
+#include "../toolkit_app.h"
+#undef TAG
+#define TAG "SubGhzAutoRec"
 
 #include <stdio.h>
 #include <string.h>
@@ -106,7 +110,7 @@ void sub_rec_listen_start(SubRecApp* app) {
     // SubGhzStateIdle, so a duplicate Listen event must not reach it.
     if(app->state != SubRecStateIdle) return;
 
-    app->gen++;
+    app->toolkit->gen++;
 
     uint32_t freq = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
     if(!subghz_devices_is_frequency_valid(app->device, freq)) {
@@ -259,7 +263,7 @@ static void sub_rec_save_decoded(SubRecApp* app, char* label, size_t label_size)
 // close ordering matches the stock firmware (subghz_scene_read_raw.c:
 // subghz_txrx_stop() then subghz_protocol_raw_save_to_file_stop()).
 static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_worker) {
-    app->gen++;
+    app->toolkit->gen++;
     subghz_worker_stop(app->worker);
     size_t spl = subghz_protocol_raw_get_sample_write(app->raw);
     subghz_protocol_raw_save_to_file_stop(app->raw);
@@ -338,7 +342,7 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
 }
 
 void sub_rec_capture_begin(SubRecApp* app) {
-    app->gen++;
+    app->toolkit->gen++;
 
     FuriString* stem_fs = furi_string_alloc();
     sub_rec_next_stem(app, stem_fs);
@@ -400,7 +404,7 @@ void sub_rec_listen_stop(SubRecApp* app) {
     }
     subghz_devices_stop_async_rx(app->device);
     subghz_devices_idle(app->device);
-    app->gen++;
+    app->toolkit->gen++;
     sub_rec_set_state(app, SubRecStateIdle, false);
 }
 
@@ -411,7 +415,7 @@ void sub_rec_listen_stop(SubRecApp* app) {
 void sub_rec_scan_start(SubRecApp* app) {
     if(app->state != SubRecStateIdle) return;
 
-    app->gen++;
+    app->toolkit->gen++;
 
     subghz_devices_reset(app->device);
     subghz_devices_idle(app->device);
@@ -443,7 +447,7 @@ void sub_rec_scan_stop(SubRecApp* app) {
 
     furi_timer_stop(app->rssi_timer);
     subghz_devices_idle(app->device);
-    app->gen++;
+    app->toolkit->gen++;
     sub_rec_set_state(app, SubRecStateIdle, false);
 }
 
@@ -522,7 +526,7 @@ void sub_rec_tx_stop(SubRecApp* app) {
     app->fff_tx = NULL;
     subghz_devices_idle(app->device);
     sub_rec_set_state(app, SubRecStateIdle, false);
-    app->gen++;
+    app->toolkit->gen++;
 }
 
 // Async TX never started (or never will), so stop_async_tx() would
@@ -540,7 +544,7 @@ void sub_rec_tx_abort(SubRecApp* app) {
     }
     subghz_devices_idle(app->device); // no state check; safe from any state
     sub_rec_set_state(app, SubRecStateIdle, false);
-    app->gen++;
+    app->toolkit->gen++;
 }
 
 // GUI thread only. Every check that can abort runs before the first

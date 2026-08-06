@@ -1,6 +1,9 @@
 #include "toolkit_app.h"
 #include "toolkit_log.h"
 #include "modules/gpio_info.h"
+#include "modules/card_reader.h"
+#include "modules/rfid_multi.h"
+#include "modules/subghz_rec.h"
 
 // Append-only module table: each row assembles one module's descriptor from
 // its exported callbacks. Phase 1 appends the three existing apps here, each
@@ -13,6 +16,30 @@ static const ToolkitModule modules[] = {
         .exit = gpio_info_exit,
         .event = gpio_info_event,
         .nav = gpio_info_nav,
+    },
+    {
+        .name = "Card Reader",
+        .view_base = TOOLKIT_VIEW_BASE_CARD_READER,
+        .enter = card_reader_enter,
+        .exit = card_reader_exit,
+        .event = card_reader_event,
+        .nav = card_reader_nav,
+    },
+    {
+        .name = "RFID Multi",
+        .view_base = TOOLKIT_VIEW_BASE_RFID_MULTI,
+        .enter = rfid_multi_enter,
+        .exit = rfid_multi_exit,
+        .event = rfid_multi_event,
+        .nav = rfid_multi_nav,
+    },
+    {
+        .name = "SubGHz Recorder",
+        .view_base = TOOLKIT_VIEW_BASE_SUBGHZ_REC,
+        .enter = subghz_rec_enter,
+        .exit = subghz_rec_exit,
+        .event = subghz_rec_event,
+        .nav = subghz_rec_nav,
     },
 };
 #define TOOLKIT_MODULE_COUNT (sizeof(modules) / sizeof(modules[0]))

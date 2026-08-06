@@ -30,6 +30,9 @@
 // appended in later phases.
 #define TOOLKIT_VIEW_LAUNCHER  0u
 #define TOOLKIT_VIEW_BASE_GPIO 0x10u // Phase 0 proof module
+#define TOOLKIT_VIEW_BASE_CARD_READER 0x20u
+#define TOOLKIT_VIEW_BASE_RFID_MULTI  0x30u
+#define TOOLKIT_VIEW_BASE_SUBGHZ_REC  0x40u
 
 // Append-only: values are persisted in session.log. Never renumber or reuse
 // a value, even for a subsystem that is later removed.
@@ -80,9 +83,18 @@ struct ToolkitApp {
 
     const ToolkitModule* active; // NULL at the launcher root
     void* active_ctx; // the active module's private state; NULL when active == NULL
-    // Bumped on the GUI thread (toolkit_exit_module), read by every module's
-    // timer callback on TimersSrv to stamp EVENT_MAKE() -- same convention as
-    // reader_app.h / recorder_app.h's own `gen` fields.
+    // Bumped on the GUI thread: by toolkit_exit_module() on every module
+    // exit, AND (Phase 1) by each wrapped module's own phase-transition
+    // code (reader_start_nfc_phase(), sub_rec_capture_begin(), etc.) --
+    // every module's timer callback on TimersSrv reads it to stamp
+    // EVENT_MAKE(). Multi-writer by design: an app's own phase-transition
+    // bump invalidates a stale in-flight event from the phase it just left
+    // (same convention as when these apps ran standalone, reader_app.h /
+    // recorder_app.h originally owned this counter), while the toolkit's
+    // own bump on module exit invalidates anything still queued from the
+    // module that just tore down. Both purposes share one counter safely
+    // because every reader gen-filters against the CURRENT value at
+    // dispatch time -- there is no designated sole writer to bypass.
     volatile uint32_t gen;
 };
 
