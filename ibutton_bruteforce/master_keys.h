@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#include <storage/storage.h>
 #include <ibutton/ibutton_protocols.h>
 
 #ifdef __cplusplus
@@ -17,21 +18,26 @@ extern "C" {
 #define BRUTE_PROTOCOL_DALLAS_GENERIC "DSGeneric"
 
 typedef struct {
-    const char* name; /* What the key is documented for. */
-    const char* protocol_name;
-    iButtonProtocolId protocol_id; /* Filled by brute_master_keys_self_check(). */
-    uint8_t data[8];
+    char name[40]; /* Human label, truncated if larger. */
+    iButtonProtocolId protocol_id; /* Resolved at load time. */
+    uint8_t data[8]; /* Zero-padded past the protocol's real length. */
 } MasterKey;
 
-/* Curated table of documented community master keys. The default table ships
-   with only a few clearly-labeled example entries so the app self-checks and
-   runs out of the box; replace them with keys from documented, authorized
-   sources before any real use. */
-extern MasterKey master_keys[];
+/* Curated table of documented master keys, loaded from
+   /ext/apps_data/ibutton_bruteforce/master_keys.txt. If the file is missing, a small
+   seed of clearly-labeled example entries is written first so the app runs out of the
+   box; replace them with keys from documented, authorized sources before any real use.
+   Heap-allocated by brute_master_keys_load(); release with brute_master_keys_free(). */
+extern MasterKey* master_keys;
 extern size_t master_keys_count;
 
-/* Returns true if the table is valid and every protocol name resolved. */
-bool brute_master_keys_self_check(iButtonProtocols* protocols);
+/* Seeds the file if missing, then loads, parses, and validates every entry --
+   protocol whitelist, protocol name resolution, Dallas CRC8. Fails closed: on any
+   error master_keys/master_keys_count are left NULL/0 and false is returned. */
+bool brute_master_keys_load(Storage* storage, iButtonProtocols* protocols);
+
+/* Releases the table. Safe to call even if load was never called or failed. */
+void brute_master_keys_free(void);
 
 #ifdef __cplusplus
 }
