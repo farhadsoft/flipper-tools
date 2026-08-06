@@ -11,6 +11,9 @@ Three FAPs live in this workspace:
 - **[subghz_auto_recorder](subghz_auto_recorder/)** — listens on one
   Sub-GHz frequency, auto-records detected signals to `.sub`, and replays
   them.
+- **[ibutton_bruteforce](ibutton_bruteforce/)** — walks a curated
+  iButton/1-Wire master-key table or a bounded sequential range against an
+  authorized reader.
 
 ## Repo layout
 
@@ -43,6 +46,16 @@ flipper-tools/
 │   ├── recorder_ui.c / .h   # device UI
 │   ├── icon.png             # 10x10 menu icon
 │   └── README.md            # app-level instructions
+├── ibutton_bruteforce/      # iButton Brute Force FAP
+│   ├── application.fam      # manifest
+│   ├── ibutton_bruteforce.c # app lifetime, run engine, persistence
+│   ├── brute_app.h          # structs, enums, constants
+│   ├── brute_worker.c / .h  # iButton worker lifecycle + key stepping
+│   ├── brute_ui.c / .h       # device UI
+│   ├── master_keys.c / .h   # curated key table + self-check
+│   ├── crc8_dallas.h        # Dallas CRC8
+│   ├── icon.png             # 10x10 menu icon
+│   └── README.md            # app-level instructions
 ├── doc/
 │   └── emv-read-diagnosis.md  # EMV read diagnosis (historical)
 ├── cap.py                   # serial CLI log capture helper
@@ -68,13 +81,14 @@ ufbt launch # build, upload, and run on the connected device
 
 `ufbt launch` holds the USB port; if qFlipper is open, close it first.
 On the device: **Apps → Tools → Universal Card Reader**,
-**Apps → Tools → RFID Multi-Reader**, or
-**Apps → Sub-GHz → SubGHz Auto Recorder**.
+**Apps → Tools → RFID Multi-Reader**, **Apps → Sub-GHz → SubGHz Auto
+Recorder**, or **Apps → iButton → iButton Brute Force**.
 
 For detailed build steps, supported protocols/frequencies, and button
 navigation, see each app's own README:
 [universal_card_reader/README.md](universal_card_reader/README.md),
-[subghz_auto_recorder/README.md](subghz_auto_recorder/README.md)
+[subghz_auto_recorder/README.md](subghz_auto_recorder/README.md),
+[ibutton_bruteforce/README.md](ibutton_bruteforce/README.md)
 (rfid_multi_reader has no separate app README yet).
 For development rules (log capture, firmware fork compatibility, hardware
 sequencing), see: [CLAUDE.md](CLAUDE.md).
@@ -92,7 +106,8 @@ For detailed CLI commands and log-safety rules, see `CLAUDE.md`.
 
 ## Ethical/legal notice
 
-Only read, record, or replay devices you own, or that you have explicit
-permission to test. Reading/recording other people's or organizations'
-cards or RF transmissions without authorization is a legal violation in
-most countries.
+Only read, record, replay, or brute-force access systems you own, or that
+you have explicit permission to test. Reading, recording, replaying, or
+otherwise attempting to open other people's or organizations' cards, RF
+transmissions, readers, doors, intercoms, or access systems without
+authorization is a legal violation in most countries.

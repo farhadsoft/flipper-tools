@@ -1,0 +1,16 @@
+App(
+    appid="ibutton_bruteforce",
+    name="iButton Brute Force",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="ibutton_bruteforce_app",
+    requires=["gui"],
+    stack_size=12 * 1024,
+    fap_category="iButton",
+    fap_description="Walk a curated master-key table or a bounded sequential range against an iButton/1-Wire reader.",
+    fap_author="farhadsoft",
+    fap_version="1.0",
+    fap_icon="icon.png",
+    sources=[
+        "*.c",
+    ],
+)

@@ -1997,6 +1997,151 @@ non-clean finding (input-delivery hang, tracked, not blocking).
 
 ---
 
+# iButton Brute Force
+
+Fourth FAP in this repo, `ibutton_bruteforce/`. Emulates a curated
+master-key table and an optional bounded sequential walk against an
+iButton/1-Wire reader.
+
+## Verified firmware / SDK — re-check before you build (STEP 0)
+
+Last verified **2026-08-06**. Same device and SDK as the other apps
+above.
+
+| | Device | ufbt SDK |
+|---|---|---|
+| Target | `hardware_target` 7 | `hw_target` f7 |
+| Firmware | `mntm-dev`, commit `8ed809fb`, built 03-06-2026 | official `1.4.3`, channel `release` |
+| Fork | `Momentum` (Next-Flip/Momentum-Firmware) | Official |
+| API | 87.1 | 87.1 |
+| Port | COM4 confirmed this session | — |
+
+**iButton protocol surface is fork-ABI-drift safe in this app.** Both
+forks expose the same protocol names, and the app resolves every
+protocol id at runtime with `ibutton_protocols_get_id_by_name()`:
+`DS1990`, `DSGeneric` / `(non-specific)`, `Cyfral`, `Metakom`. Momentum
+adds `DS1420` to the Dallas group (between `DS1971` and `DSGeneric`),
+which shifts the flat `iButtonProtocolId` values for the catch-all and
+anything after it, but the app never compiles in a flat id. The worker
+thread registers as `iButtonWorker`.
+
+Every `ibutton_worker_*` / `ibutton_key_*` / `ibutton_protocols_*` symbol
+used was confirmed present in
+`~/.ufbt/current/sdk_headers/f7_sdk/targets/f7/api_symbols.csv` this
+session. `ibutton_worker_emulate_set_next_key()` is **not exported**, so
+key stepping uses the documented fallback: `ibutton_worker_stop()` +
+`ibutton_worker_emulate_start()` per key.
+
+## Layout
+
+Standalone FAP in `ibutton_bruteforce/`:
+
+```
+ibutton_bruteforce/          <- run ufbt HERE
+  application.fam            appid ibutton_bruteforce, entry ibutton_bruteforce_app,
+                             iButton category, stack_size 12*1024, fap_version 1.0
+  ibutton_bruteforce.c      app lifetime, event router, menus, run state machine,
+                              persistence (progress save/resume)
+  brute_app.h                 shared types/constants/App struct; no with_view_model calls
+  brute_worker.c/h          IButtonWorker lifecycle + key-stepping (only file that
+                              talks to ibutton_worker_* / ibutton_protocols_*)
+  brute_ui.c/h              drawing + the only with_view_model call site
+  master_keys.c/h           curated key table + alloc-time self-check
+  crc8_dallas.h             small static Dallas/1-Wire CRC8 (poly 0x31, LSB-first)
+  icon.png / make_icon.py   10x10 1-bit icon
+  README.md                 app-level docs
+```
+
+Installs to `/ext/apps/iButton/ibutton_bruteforce.fap`, i.e.
+**Apps → iButton**.
+
+## Architecture
+
+Four views on one `ViewDispatcher`: a Submenu (`BruteViewMenu`), a
+VariableItemList (`BruteViewSettings`), a NumberInput
+(`BruteViewNumber`, for the sequential start index), and a custom
+animated status View (`BruteViewStatus`). Back is owned exclusively by the
+dispatcher navigation callback; no `view_set_previous_callback()` or
+`view_set_context()` on any module view.
+
+Run engine: a 25 ms periodic timer posts `BruteEventTick`; the GUI
+thread advances the state machine. `BruteStateArmed` shows the
+one-time ethics notice overlay, then moves to `BruteStatePresent`;
+after `dwell_ms` it stops the worker and enters `BruteStateGap`; after
+`gap_ms` it loads the next key and re-enters `BruteStatePresent`.
+
+Key stepping: one key object per protocol family (`key_dallas`,
+`key_cyfral`, `key_metakom`) so a callback from the previous protocol
+still active briefly after `ibutton_worker_stop()` never reads data
+formatted for a different protocol. Key data is written through
+`ibutton_protocols_get_editable_data()` + `apply_edits()`.
+
+Persistence: FlipperFormat file at
+`/ext/apps_data/ibutton_bruteforce/progress.txt` carrying mode / protocol /
+index / total / dwell / gap / family / start_index / resume / ethics.
+Saved on stop and every 32 keys.
+
+## Invariants
+
+1. **No fork-sensitive enum values.** All protocol ids resolved at runtime
+   by name; the app never uses `iButtonProtocolIdInvalid` as a runtime value.
+2. **Generation-stamped events.** `EVENT_MAKE(id, gen)` packs `app->gen`;
+   `gen++` on every mode/phase change; stale events are dropped. The tick
+   event is exempt from the gen check (it drives the state machine).
+3. **The run owns the worker thread.** `ibutton_worker_start_thread()` only
+   in `brute_run_start()`; `ibutton_worker_stop_thread()` joins before exit.
+   Every worker stop is gated on `app->state` first.
+4. **Back belongs to the ViewDispatcher navigation callback.** Never a
+   per-view `previous_callback`; never `view_set_context()` on a module
+   view (that was the cause of the immediate input crash in early testing).
+5. **The tick timer callback only posts.** No `with_view_model`, no worker
+   calls, no storage from it.
+6. **No direct HAL calls.** All 1-Wire/iButton access routes through
+   `ibutton_worker_*` / `ibutton_protocols_*`.
+7. **Re-check `app->state` after any call that can stop the run.** The
+   navigation callback may call `brute_run_stop()` mid-tick; the tick handler
+   returns early when state becomes Idle.
+
+## Testing this app
+
+Same `cap.py` mechanics as the other apps, port COM4. Specific notes
+discovered this session:
+
+- **Do not `view_set_context()` on Submenu / VariableItemList / NumberInput
+  module views.** Those modules manage their own view context; overwriting it
+  with the app pointer caused an immediate crash on the first input event
+  (Back or OK). The per-item / per-callback context passed to
+  `submenu_add_item()` / `variable_item_list_set_enter_callback()` /
+  `number_input_set_result_callback()` is the correct channel.
+- **`view_dispatcher_enable_queue()` is deprecated** in this SDK; remove it.
+- **`view_dispatcher_set_navigation_event_callback()` now takes a `bool (*)(void*)`
+  handler.** Returning true consumes the event; explicitly switch views or
+  call `view_dispatcher_stop()` as needed.
+- **`number_input_set_result_callback()` takes five args** in this SDK:
+  `(NumberInput*, NumberInputCallback, context, current_number, min_value, max_value)`.
+- **`flipper_format_read_uint32` / `write_uint32` take a count** (`1` for a
+  single value) and a `uint32_t*` buffer. Pass local `uint32_t` variables,
+  not enum or `bool` pointers.
+
+**Verified 2026-08-06, on device, Momentum mntm-dev, API 87.1:**
+- Cold exit from the menu via Back: `uptime` refused while open, answered
+  after exit, no reboot.
+- Master-key walk: presented all 6 default example keys at 550 ms
+  intervals (400 ms dwell + 150 ms gap), saved progress, reached Done.
+- Sequential walk: started from index 0, presented keys at 550 ms
+  intervals, saved progress every 32 keys.
+- Resume: with Resume On and a saved index, sequential mode continued from
+  the saved index on relaunch.
+- Progress file round-trip: `/ext/apps_data/ibutton_bruteforce/progress.txt`
+  was created, read back, and updated correctly.
+
+**Not verified on device:** thread `Stack Min` headroom, heap stability
+across open/close cycles, and hardware-in-the-loop acceptance (no iButton
+reader was available this session). These should be confirmed before relying
+on the app in the field.
+
+---
+
 # Review — mandatory final step
 
 Every task that writes or changes C ends with **two** review passes, in order:
