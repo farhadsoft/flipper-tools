@@ -155,6 +155,7 @@ static bool brute_master_keys_parse(FlipperFormat* ff, iButtonProtocols* protoco
         return false;
     }
 
+    free(master_keys);
     master_keys = keys;
     master_keys_count = count;
     return true;
