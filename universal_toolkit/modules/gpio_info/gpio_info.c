@@ -1,6 +1,6 @@
 #include "gpio_info.h"
-#include "../toolkit_log.h"
-#include "../toolkit_ui.h"
+#include "../../toolkit_log.h"
+#include "../../toolkit_ui.h"
 
 #include <gui/view.h>
 #include <furi_hal_gpio.h>

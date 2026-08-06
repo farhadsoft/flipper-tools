@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../toolkit_app.h"
+#include "../../toolkit_app.h"
 
 // Phase 0 proof module: reads the 8 external GPIO header pins on a 200 ms
 // timer. No radio, no USB-mode change -- the safest possible module to

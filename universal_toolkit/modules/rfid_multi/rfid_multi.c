@@ -1,7 +1,7 @@
 #include "rfid_multi.h"
-#include "../toolkit_log.h"
+#include "../../toolkit_log.h"
 #undef TAG
-#include "../rfid_multi_reader/rfid_app.h"
+#include "../../rfid_multi_reader/rfid_app.h"
 
 #include <furi_hal_rtc.h>
 

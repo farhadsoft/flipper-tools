@@ -6,6 +6,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 capture, UI conventions) see `~/.claude/CLAUDE.md`. Only project-specific detail
 lives here.**
 
+# Repo structure & module rules
+
+This repo is a collection of Flipper tools plus a `universal_toolkit` launcher
+shell. The target layout and hard rules for adding modules/apps are in
+`docs/project-structure-conventions.md`. The short version:
+
+- **One module = one folder** under `universal_toolkit/modules/<name>/`.
+- **Domain code has no Flipper includes.** Pure payload/algorithm files live
+  inside the module folder (e.g. `modules/ble_findmy/findmy_payload.{c,h}`).
+- **Never copy an app or module.** Standalone apps live once in `apps/`; module
+  wrappers consume shared logic from `lib/` (Phase 1 for the three existing
+  apps).
+- **The module contract is the only integration point.** New subsystem → new
+  `ToolkitModule` entry + its folder; register/unregister its view-id block on
+  enter/exit; gen-stamped events (< 256, module-local); the corrected exit
+  order (`show_launcher → teardown → gen++`).
+
 # Universal Card Reader
 
 One FAP that reads **both** card families: NFC 13.56 MHz (ISO14443-3A/3B,

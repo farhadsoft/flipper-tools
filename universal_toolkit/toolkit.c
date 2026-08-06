@@ -1,10 +1,10 @@
 #include "toolkit_app.h"
 #include "toolkit_log.h"
-#include "modules/gpio_info.h"
-#include "modules/card_reader.h"
-#include "modules/rfid_multi.h"
-#include "modules/subghz_rec.h"
-#include "modules/ble_findmy.h"
+#include "modules/gpio_info/gpio_info.h"
+#include "modules/card_reader/card_reader.h"
+#include "modules/rfid_multi/rfid_multi.h"
+#include "modules/subghz_rec/subghz_rec.h"
+#include "modules/ble_findmy/ble_findmy.h"
 
 // Append-only module table: each row assembles one module's descriptor from
 // its exported callbacks. Phase 1 appends the three existing apps here, each

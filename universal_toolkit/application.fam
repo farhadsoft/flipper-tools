@@ -16,4 +16,13 @@ App(
     fap_author="farhadsoft",
     fap_version="0.2",
     fap_icon="icon.png",
+    sources=[
+        "toolkit.c",
+        "toolkit_log.c",
+        "toolkit_ui.c",
+        "modules/**/*.c",
+        "universal_card_reader/*.c",
+        "subghz_auto_recorder/*.c",
+        "rfid_multi_reader/*.c",
+    ],
 )

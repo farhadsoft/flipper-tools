@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../toolkit_app.h"
+#include "../../toolkit_app.h"
 
 // Wraps rfid_multi_reader as a toolkit module: the app's own alloc/free and
 // event/nav callbacks do the real work (see rfid_app.h), this is just the

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../toolkit_app.h"
+#include "../../toolkit_app.h"
 
 // Wraps subghz_auto_recorder as a toolkit module. See CLAUDE.md "Universal
 // Toolkit" -- Phase 1.

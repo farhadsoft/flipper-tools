@@ -1,9 +1,9 @@
 #include "subghz_rec.h"
-#include "../toolkit_log.h"
+#include "../../toolkit_log.h"
 // recorder_app.h #define's its own TAG ("SubGhzAutoRec"); this file makes no
 // FURI_LOG_* calls, so just drop toolkit_app.h's TAG rather than re-define it.
 #undef TAG
-#include "../subghz_auto_recorder/recorder_app.h"
+#include "../../subghz_auto_recorder/recorder_app.h"
 
 #include <furi_hal_rtc.h>
 #include <stdio.h>

@@ -1,8 +1,8 @@
 #include "card_reader.h"
-#include "../toolkit_log.h"
+#include "../../toolkit_log.h"
 #undef TAG
-#include "../universal_card_reader/reader_app.h"
-#include "../universal_card_reader/reader_nfc.h"
+#include "../../universal_card_reader/reader_app.h"
+#include "../../universal_card_reader/reader_nfc.h"
 
 #include <furi_hal_rtc.h>
 
