@@ -1,8 +1,12 @@
+// Reference-only snapshot of universal_toolkit/modules/ble_findmy/findmy_payload.c.
+// Not compiled by test/Makefile (which builds the real module file). See the
+// provenance note in reference/findmy_payload.h.
+
 #include "findmy_payload.h"
 
 #include <string.h>
 
-// OpenHaystack SECP224R1 public key (example — user replaces with their own).
+// OpenHaystack SECP224R1 public key (example -- user replaces with their own).
 // This array is intentionally in a HAL-free domain file so the payload can be
 // parsed/generated and unit-tested on a host without the Flipper SDK.
 const uint8_t findmy_public_key[FINDMY_PUBKEY_LEN] = {

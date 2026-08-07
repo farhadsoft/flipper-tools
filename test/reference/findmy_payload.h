@@ -1,3 +1,17 @@
+// Reference-only snapshot of universal_toolkit/modules/ble_findmy/findmy_payload.h.
+// Not compiled by test/Makefile (which builds the real module file); kept
+// here so the domain API this test harness targets has a standalone,
+// version-controlled record independent of the module tree.
+//
+// Provenance: the original plan for this harness called for placing a
+// user-delivered reference implementation here verbatim. That delivered
+// content was not recoverable from the workspace, git history, or any
+// session artifact (see the "Test harness provenance" note in ../../CLAUDE.md
+// under BLE Find My). This file was instead implemented directly against the
+// primary source the plan itself names as the correctness standard --
+// seemoo-lab/openhaystack's ESP32 reference firmware -- and is identical to
+// the shipped module header.
+
 #pragma once
 
 #include <stdbool.h>
@@ -35,7 +49,7 @@ void findmy_build_mac(const uint8_t pubkey[FINDMY_PUBKEY_LEN], uint8_t mac_out[F
 // carrying Apple's company ID (0x004C), the offline-finding type/length
 // (0x12, 0x19), a zero state byte, key bytes 6..27, the top 2 bits of
 // key[0], and a zero hint byte. This buffer is passed directly as the raw
-// advertising payload — it needs no separate Flags AD structure. Matches
+// advertising payload -- it needs no separate Flags AD structure. Matches
 // the OpenHaystack reference firmware's set_payload_from_key().
 void findmy_build_adv(const uint8_t pubkey[FINDMY_PUBKEY_LEN], uint8_t adv_out[FINDMY_ADV_LEN]);
 
