@@ -20,13 +20,16 @@
 typedef struct {
     View* view;
     FuriTimer* refresh_timer;
-    bool beacon_active;
 } BleFindMyCtx;
+
+typedef struct {
+    bool beacon_active;
+} BleFindMyModel;
 
 /* --------------------------------- draw ------------------------------------ */
 
 static void ble_findmy_draw_callback(Canvas* canvas, void* model) {
-    BleFindMyCtx* ctx = model;
+    BleFindMyModel* m = model;
     canvas_clear(canvas);
     toolkit_ui_draw_title_bar(canvas, "BLE Find My");
 
@@ -48,7 +51,7 @@ static void ble_findmy_draw_callback(Canvas* canvas, void* model) {
         findmy_public_key[20], findmy_public_key[21], findmy_public_key[22], findmy_public_key[23]);
     canvas_draw_str(canvas, 4, 46, line);
 
-    snprintf(line, sizeof(line), "Beacon: %s", ctx->beacon_active ? "ON" : "OFF");
+    snprintf(line, sizeof(line), "Beacon: %s", m->beacon_active ? "ON" : "OFF");
     canvas_draw_str(canvas, 4, 57, line);
 
     canvas_draw_str(canvas, 4, 63, "Back: exit module");
@@ -66,12 +69,11 @@ static void ble_findmy_timer_callback(void* context) {
 
 void ble_findmy_enter(ToolkitApp* app) {
     BleFindMyCtx* ctx = malloc(sizeof(BleFindMyCtx));
-    ctx->beacon_active = furi_hal_bt_extra_beacon_is_active();
     app->active_ctx = ctx;
 
     ctx->view = view_alloc();
+    view_allocate_model(ctx->view, ViewModelTypeLocking, sizeof(BleFindMyModel));
     view_set_draw_callback(ctx->view, ble_findmy_draw_callback);
-    view_allocate_model(ctx->view, ViewModelTypeLocking, sizeof(BleFindMyCtx));
     view_dispatcher_add_view(app->view_dispatcher, TOOLKIT_VIEW_BASE_BLE_FINDMY, ctx->view);
 
     // Core2 must be running the BLE stack for the extra beacon APIs to work.
@@ -103,6 +105,9 @@ void ble_findmy_enter(ToolkitApp* app) {
             FURI_LOG_W(TAG, "extra beacon start failed");
         }
     }
+
+    bool active = furi_hal_bt_extra_beacon_is_active();
+    with_view_model(ctx->view, BleFindMyModel * m, { m->beacon_active = active; }, true);
 
     ctx->refresh_timer = furi_timer_alloc(ble_findmy_timer_callback, FuriTimerTypePeriodic, app);
     furi_timer_start(ctx->refresh_timer, furi_ms_to_ticks(BLE_FINDMY_REFRESH_MS));
@@ -136,9 +141,8 @@ bool ble_findmy_event(ToolkitApp* app, uint32_t id) {
     if(id != BLE_FINDMY_REFRESH_EVENT) return false;
     BleFindMyCtx* ctx = app->active_ctx;
 
-    ctx->beacon_active = furi_hal_bt_extra_beacon_is_active();
-
-    with_view_model(ctx->view, BleFindMyCtx * m, { *m = *ctx; }, true);
+    bool active = furi_hal_bt_extra_beacon_is_active();
+    with_view_model(ctx->view, BleFindMyModel * m, { m->beacon_active = active; }, true);
     return true;
 }
 
