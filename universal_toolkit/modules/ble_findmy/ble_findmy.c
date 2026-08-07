@@ -87,18 +87,26 @@ void ble_findmy_enter(ToolkitApp* app) {
     // call start() on an already-running beacon — that triggers a
     // furi_check in the firmware.
     if(!furi_hal_bt_extra_beacon_is_active()) {
+        uint8_t adv[FINDMY_ADV_LEN];
+        findmy_build_adv(findmy_public_key, adv);
+
         GapExtraBeaconConfig config = {
             .min_adv_interval_ms = BLE_FINDMY_ADV_INTERVAL_MS,
             .max_adv_interval_ms = BLE_FINDMY_ADV_INTERVAL_MS,
             .adv_channel_map = GapAdvChannelMapAll,
             .adv_power_level = GapAdvPowerLevel_0dBm,
             .address_type = GapAddressTypeRandom,
-            .address = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06},
         };
+        // findmy_build_mac() returns MSB-first (address[0] = pubkey[0] | 0xC0).
+        // Unverified whether the STM32WB HAL expects transmission order
+        // (LSB-first) or this logical order here -- confirm with an on-air
+        // scanner (nRF Connect / LightBlue) before relying on tracking. If
+        // reversed, swap to a byte-reversed build here, not in the domain.
+        findmy_build_mac(findmy_public_key, config.address);
         if(!furi_hal_bt_extra_beacon_set_config(&config)) {
             FURI_LOG_W(TAG, "extra beacon set_config failed");
         }
-        if(!furi_hal_bt_extra_beacon_set_data(findmy_public_key, FINDMY_KEY_LEN)) {
+        if(!furi_hal_bt_extra_beacon_set_data(adv, sizeof(adv))) {
             FURI_LOG_W(TAG, "extra beacon set_data failed");
         }
         if(!furi_hal_bt_extra_beacon_start()) {
