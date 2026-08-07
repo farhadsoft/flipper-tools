@@ -2080,6 +2080,57 @@ convention this file already established (see the "Security note" under
 "Phase 1 -- wrapping the three existing apps" above) as this session's own
 record of the event, and as a reminder for future sessions.
 
+### On-device verification (Tier 2) -- 2026-08-07, ble_findmy fix
+
+Verified device: Momentum `mntm-dev`, API 87.1, **COM4** (`device_info`
+re-confirmed live, matching the block above exactly -- no drift). `power
+reboot` first, to guarantee `furi_hal_bt_extra_beacon_is_active()` starts
+false so the fixed code path (not the `is_active()` skip-guard) actually
+runs on the first entry. `ufbt launch` after reboot: installs and runs.
+
+Three full enter/exit cycles of BLE Find My via `cap.py` (`input send
+down short` x4 + `ok short` to enter, `back short` to exit): no crash
+across any cycle -- `uptime` climbed 0h0m20s -> 0h5m8s monotonically, and
+its mid-app refusal ("this command cannot be run while an application is
+open") is itself a liveness probe, per `flipper-perf-review`. `loader
+info` confirmed a clean full exit at the end ("No application is
+running"). `session.log` gained exactly one well-formed `Entry:` ...
+`6 ble findmy beacon started|` line per entry (subsys `6`/Ble), same
+format as every other module.
+
+**Thread hygiene:** `top`, all four snapshots (2 in-module, 2 at
+launcher): `Threads: 22` every time, no duplicate names, no
+`ble_findmy`-specific worker thread (expected -- the extra beacon runs on
+Core2 via `furi_hal_bt_extra_beacon_*`, not as a Flipper-app-level
+FreeRTOS thread; `bt BleEventWorker`/`BleGapDriver`/`BtSrv` are
+system-level BT services present regardless of which app is running, not
+evidence of a start/stop guard bug the way a leaked app-owned worker would
+be).
+
+**Stack:** `universal_toolkit` app thread `Stack Min` 15040-15348 of
+16380 free across all four snapshots -- far above both the 4096-byte pass
+bar and the 1024-byte defect bar.
+
+**Heap:** `free` while a module view/model is allocated fluctuated
+non-monotonically across the three in-module snapshots (65360 -> 15184 ->
+41960) -- initially looked leak-shaped until the launcher-baseline
+readings between cycles came back essentially identical (65704 -> 65712,
++8 bytes noise) and `minimum` stayed pinned at 14248 from cycle 2 onward
+instead of dropping further in cycle 3. Conclusion: **no leak** -- the
+module's ctx/view/model are fully reclaimed on every exit; the transient
+in-module dips track unrelated background heap churn (CLI/storage/BT
+housekeeping active at the sampling instant), not `ble_findmy`'s own
+allocations, which `findmy_build_mac`/`findmy_build_adv` don't even touch
+(stack-only, no `malloc`). Flagged as a real risk to rule out, not
+asserted away -- the non-monotonic trend and the stable launcher baseline
+are what actually rules it out; a monotonically falling `minimum` across
+the three launcher readings would have been a `defect`.
+
+**Not verified this session (needs a phone, not just a CLI):** the
+advertisement is actually correct on-air (company ID `0x004C`, type
+`0x12`, key bytes, derived MAC) -- no BLE scanner (nRF Connect/LightBlue)
+available from this environment. See the handback list in chat.
+
 ---
 
 # iButton Brute Force
