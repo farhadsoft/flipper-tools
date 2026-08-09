@@ -31,7 +31,7 @@ typedef struct {
 static void ble_findmy_draw_callback(Canvas* canvas, void* model) {
     BleFindMyModel* m = model;
     canvas_clear(canvas);
-    toolkit_ui_draw_title_bar(canvas, "BLE Find My");
+    ui_status_bar(canvas, "BLE Find My", NULL, 0, 0, 0);
 
     char line[40];
 

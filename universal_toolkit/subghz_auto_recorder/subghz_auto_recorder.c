@@ -1705,6 +1705,7 @@ SubRecApp* sub_rec_app_alloc(ViewDispatcher* view_dispatcher) {
     app->menu = submenu_alloc();
     view_dispatcher_add_view(
         app->view_dispatcher, app->view_base + SubRecViewMenu, submenu_get_view(app->menu));
+    submenu_set_header(app->menu, "Sub-GHz recorder");
     submenu_add_item(app->menu, "Auto-record", SubRecEventMenuListen, sub_rec_menu_callback, app);
     submenu_add_item(app->menu, "Frequency scan", SubRecEventMenuScan, sub_rec_menu_callback, app);
     submenu_add_item(app->menu, "Settings", SubRecEventMenuSettings, sub_rec_menu_callback, app);

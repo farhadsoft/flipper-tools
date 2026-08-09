@@ -251,8 +251,10 @@ typedef struct {
     char notice_l2[REC_TEXT_LINE_MAX];
     int8_t scan_dbm[COUNT_OF(sub_rec_freqs)]; // per-frequency RSSI, floor-filled at scan start
     uint8_t scan_peak; // index of the strongest entry seen; also the OK-lock target
+    uint8_t scan_idx; // current frequency index being scanned (0..16)
     SubRecAnalysis ana;
     uint8_t ana_page; // 0 = info, 1 = waveform
+    uint8_t anim_phase; // bumps on every redraw tick; drives REC blink, meter pulse, scan sweep
     uint32_t dup; // session duplicate count; 0 = hide the counter (see draw_listening/draw_stats)
     SubRecStats stats;
 } SubRecModel;

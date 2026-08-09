@@ -2204,6 +2204,133 @@ advertisement is actually correct on-air (company ID `0x004C`, type
 `0x12`, key bytes, derived MAC) -- no BLE scanner (nRF Connect/LightBlue)
 available from this environment. See the handback list in chat.
 
+### SubGHz Recorder Mono UI redesign -- cleanup + regression re-verify -- 2026-08-09
+
+Final cleanup step of the Mono design-system redesign (`recorder_ui.c`/`toolkit_ui.c`
+re-skin, `anim_phase`/`scan_idx` wiring): removed the now-dead
+`toolkit_ui_draw_title_bar()` compat wrapper (`toolkit_ui.h`/`toolkit_ui.c`) --
+every module had already moved to calling `ui_status_bar()` directly; confirmed
+zero callers repo-wide (recursive grep over `universal_toolkit/`) before deleting.
+`ufbt` clean rebuild: zero warnings, zero errors, APPCHK Target 7 / API 87.1.
+
+Verified device: Momentum `mntm-dev`, API 87.1, **COM4** (`device_info`
+re-confirmed live, matching the block above exactly -- no drift). `ufbt launch`
+after the rebuild: installs and runs.
+
+Re-ran the same navigation cycle the redesign's own on-device pass used, against
+the post-cleanup binary, to prove the deletion caused no regression:
+- **Listening/Armed** (launcher -> SubGHz Recorder -> Auto-record -> ethics
+  gate -> Armed, `down`x3 `ok`x3): `log trace` showed normal `FuriHalSubGhz`
+  radio-init register writes, zero `[E]`/`[W]` lines. "Frequency blocked --
+  outside region range" is the existing DE region-gate, not new.
+- **Scanning** (`back`, `down`, `ok`): `log debug` over a 14 s window
+  captured 34 `scan peak` lines sweeping the 17-entry frequency table (~2
+  full sweeps), zero `[E]`/`[W]` -- `scan_idx`-driven redraws (Step 1's
+  `anim_phase`/`scan_idx` wiring) exercised repeatedly without a crash.
+- **Stats** (`back`, `down`x2, `ok`, `down`, `ok`): `log trace` silent, no
+  crash -- matches the pre-cleanup baseline exactly.
+- **Exit** (`back`x4 from Stats): clean return to desktop.
+
+Transcripts: `logs/redesign_verify_{listening,scan,stats,exit}.log`.
+
+**Thread hygiene:** `top` after exit: `Threads: 22`, same baseline set as
+before the flash (no orphaned recorder/worker thread, no leaked RSSI timer).
+`uptime` climbed 2h40m4s (pre-flash baseline) -> 3h31m56s -> 3h32m1s across
+the exit snapshots -- strictly monotonic, no crash-reboot across the whole
+rebuild-flash-navigate-exit cycle.
+
+**Not verified this session (needs eyes on the OLED, not just CLI):**
+pixel-level visual correctness of all 8 redesigned screens -- confirmed no
+`flipperzero-protobuf` package or other screen-capture path is available in
+this environment (checked before concluding this), so it remains a human/
+photo task exactly as the redesign's own plan already concluded. Screens
+needing that pass: Armed, Recording, Scan, Analyze Info, Analyze Waveform,
+Stats, Notice, Sending. Analyze specifically also still has no saved capture
+on this device (`storage list /ext/subghz/auto_rec` -> empty) to drive it
+with real data; forcing one via a hand-built `.sub` file was judged
+disproportionate to the risk it would retire (its hero/chip/font-measure
+code path is structurally identical to the already-proven-safe
+Listening/Stats path, both exercised crash-free above). Sending is unchanged
+code (byte-identical to pre-redesign) and drives a real SubGHz TX to exercise
+live, which needs a real device to replay against and explicit authorization
+per this file's ethics rule -- not exercised.
+
+### SubGHz Recorder Mono UI redesign -- on-device visual verification -- 2026-08-09 (later same day)
+
+Corrects the prior entry above: a screen-capture path **does** exist. The prior pass only
+tried `pip install flipperzero-protobuf` (failed: `setuptools.build_meta` unavailable in the
+embedded Python). Cloning `flipperdevices/flipperzero_protobuf_py` from GitHub and running it
+from source (`sys.path.insert` against the checkout, no install) works: `FlipperProto(serial_port=
+'COM4').rpc_gui_snapshot_screen()` returns the live 1024-byte 1bpp framebuffer (128x64) over the
+same USB-VCP RPC session the CLI uses (`start_rpc_session`).
+
+**Bit-order gotcha, worth saving the next person the two hours it cost here:** the raw bytes are
+LSB-first within each byte (bit 0 = leftmost pixel of that 8px group), the opposite of PBM's P4
+MSB-first convention. Piping the bytes straight into a `P4` header and letting PIL decode it
+renders every row bit-mirrored within its 8px groups -- on this UI's dense text it doesn't look
+"mirrored", it looks like noise indistinguishable from the idle-desktop dolphin animation, which
+is what caused the first several captures to be misread as "the app never rendered, still showing
+desktop". Fix: unpack manually, `bit = (byte >> (x % 8)) & 1`, not PBM's `(byte >> (7 - x % 8)) & 1`.
+
+**Also load-bearing:** `rpc_app_start()` needs the **path** (`/ext/apps/Tools/universal_toolkit.fap`),
+not the app name -- the name form returns `ERROR_INVALID_PARAMETERS`. And the loader genuinely
+locks (`ERROR_APP_SYSTEM_LOCKED`) if a prior RPC session's app is still open; `loader close` over
+a plain CLI session clears it before the next `rpc_app_start`.
+
+**Results -- 6 of 8 screens direct-photo-confirmed, corrected/upscaled/rendered from the raw
+capture, no clipping or overlap observed on any of them:**
+
+| Screen | Confirmed | Notes |
+|---|---|---|
+| Armed/Listening | Yes | status bar + hero(RSSI/dBm) + chip(mod) + meter + state line("armed") + footer glyphs, all in distinct non-overlapping bands |
+| Scan | Yes | status bar w/ scan chevron + 17-bar graph + sweep-caret + peak marker + hero(peak freq) + bottom freq/dBm line |
+| Analyze Info | Yes | hero(freq/MHz) + chip(mod) + Proto/spl-B lines, no clipping into the status bar above |
+| Analyze Waveform | Yes | zoom-label status bar + burst-pattern waveform block, matches the synthetic test file's alternating RAW_Data |
+| Stats | Yes | hero(files) + chip(KiB) + raw/dec/rc line + footer glyphs |
+| Notice | Yes | framed box, title in status bar, body text, matches the ethics-gate notice |
+| Recording | No (see below) | |
+| Sending | No (see below) | |
+
+**Recording** was not driven to a real trigger (ambient RSSI ~-90 dBm never crossed even the
+most sensitive trigger table entry, -85 dBm, in the observation windows tried). Residual risk is
+low, not zero: `draw_listening()` is the **same function** for Armed and Recording -- the
+`recording` bool only swaps the status-bar title/glyph and the state-line text
+(`"rec N spl"` vs `"armed"`); hero/chip/meter code paths are identical to the confirmed Armed
+screen above.
+
+**Sending** was not captured despite four attempts, for two compounding reasons, both now
+understood and left here so a retry doesn't repeat the diagnosis:
+1. `sub_rec_do_browse()` (`subghz_auto_recorder.c`) never calls `submenu_set_selected_item()` on
+   `app->file_menu` before switching to it -- unlike `universal_card_reader.c`'s equivalent
+   (`reader_do_browse()`, line 378: `submenu_set_selected_item(app->file_menu, 0); // never land
+   on Delete`). Flipper Submenus remember their cursor row across re-entries (documented above
+   `sub_rec_show_saved_menu()`), so a scripted "enter file menu, press OK immediately" can land on
+   whatever row a *previous* visit left selected (here: "Analyze", from this same verification
+   pass), not "Replay" -- a pre-existing minor UX gap, **not** introduced by the redesign
+   (`recorder_ui.c` owns drawing only; this is `subghz_auto_recorder.c` menu-callback code).
+2. Even after navigating to the correct row, capturing the Sending screen from a real device
+   proved incompatible with this session's RPC round-trip latency: rapid scripted
+   PRESS/SHORT/RELEASE bursts against this Momentum build triggered **four separate crash-reboots**
+   during this pass (each recovered cleanly via USB re-enumeration within ~10s, confirmed by
+   `uptime` resetting to single-digit seconds then climbing normally). All four correlated with a
+   *submenu-entry* transition, not with any redesign-touched draw code, and this class of fragility
+   under rapid CLI/RPC input is already documented above for a sibling app's file-browser dialog
+   ("Rapid-fire bare-`short` bursts... produced two crash-reboots"). Given `draw_sending()` is
+   verbatim-unchanged by this redesign (confirmed by reading it: three calls to
+   `ui_status_bar()`/`ui_draw_centered_fit()`/`ui_draw_centered()`, all already proven correct by
+   the six confirmed screens above) and the plan's own Step 6 already marked it "no change needed",
+   a fifth device-crashing attempt was judged not worth the risk. Not exercised.
+
+**Cleanup:** the synthetic `/ext/subghz/auto_rec/AR_4339_test.sub` used to drive Analyze/Sending,
+the two 0-byte capture artifacts left by a transiently-lowered Trigger setting, and the settings
+change itself were all removed/reverted after this pass -- `storage read
+.../settings.conf` confirms `Frequency: 418000000` / `Trigger: 3`, byte-identical to the values
+read at the start of this session, and `storage list /ext/subghz/auto_rec` confirms `Empty`.
+
+**Net:** the redesign's pixel layout is confirmed correct on real hardware for 6 of 8 screens: the
+remaining 2 carry low residual risk from shared/unchanged code, not from anything unverified in
+the new drawing logic itself.
+
 ---
 
 # iButton Brute Force

@@ -48,7 +48,7 @@ typedef struct {
 static void gpio_info_draw_callback(Canvas* canvas, void* model) {
     GpioInfoModel* m = model;
     canvas_clear(canvas);
-    toolkit_ui_draw_title_bar(canvas, "GPIO Info");
+    ui_status_bar(canvas, "GPIO Info", NULL, 0, 0, 0);
 
     for(size_t i = 0; i < GPIO_INFO_PIN_COUNT; i++) {
         int x = 4 + (int)(i % 2) * 64;

@@ -1,38 +1,11 @@
 #include "ui.h"
+#include "../toolkit_ui.h"
 #include <math.h>
 
-#define SCREEN_W    128
-#define TITLE_BAR_H 13
 
-static void draw_centered(Canvas* canvas, int cy, const char* str) {
-    int w = canvas_string_width(canvas, str);
-    canvas_draw_str(canvas, (SCREEN_W - w) / 2, cy, str);
-}
 
-// Like draw_centered(), but truncates with "..." until the string fits inside
-// `max` pixels, so a long file name or protocol name never runs off-screen.
-static void draw_centered_fit(Canvas* canvas, int cy, const char* str, int max) {
-    char buf[56];
-    snprintf(buf, sizeof(buf), "%s", str);
-    size_t len = strlen(buf);
-    while(len > 3 && canvas_string_width(canvas, buf) > max) {
-        buf[--len] = '\0';
-        buf[len - 1] = '.';
-        buf[len - 2] = '.';
-    }
-    draw_centered(canvas, cy, buf);
-}
 
-// Full-width inverted title bar.
-static void draw_title_bar(Canvas* canvas, const char* title) {
-    canvas_draw_box(canvas, 0, 0, SCREEN_W, TITLE_BAR_H);
-    canvas_set_color(canvas, ColorWhite);
-    canvas_set_font(canvas, FontPrimary);
-    int w = canvas_string_width(canvas, title);
-    canvas_draw_str(canvas, (SCREEN_W - w) / 2, 10, title);
-    canvas_set_color(canvas, ColorBlack);
-    canvas_set_font(canvas, FontSecondary);
-}
+
 
 // Small card silhouette with a chip, centred on (cx, cy).
 static void draw_card_icon(Canvas* canvas, int cx, int cy) {
@@ -82,16 +55,16 @@ static void draw_state_scanning(Canvas* canvas, const RfidModel* m) {
     // trailing animated dots, mirroring universal_card_reader's
     // active/idle two-line layout.
     draw_band(canvas);
-    draw_centered(canvas, 53, m->band);
+    ui_draw_centered(canvas, 53, m->band);
 
     int mode_w = canvas_string_width(canvas, m->mode);
-    canvas_draw_str(canvas, (SCREEN_W - mode_w) / 2 - 8, 63, m->mode);
-    draw_dots(canvas, (SCREEN_W + mode_w) / 2 - 2, 62, m->frame);
+    canvas_draw_str(canvas, (UI_W - mode_w) / 2 - 8, 63, m->mode);
+    draw_dots(canvas, (UI_W + mode_w) / 2 - 2, 62, m->frame);
 }
 
 static void draw_state_reading(Canvas* canvas, const RfidModel* m) {
     draw_card_icon(canvas, 64, 28);
-    draw_centered(canvas, 48, "Reading card");
+    ui_draw_centered(canvas, 48, "Reading card");
 
     // Progress bar with a block sweeping left to right.
     canvas_draw_rframe(canvas, 14, 53, 100, 8, 2);
@@ -109,7 +82,7 @@ static void draw_state_reading(Canvas* canvas, const RfidModel* m) {
 void rfid_draw_callback(Canvas* canvas, void* model) {
     RfidModel* m = model;
     canvas_clear(canvas);
-    draw_title_bar(canvas, "RFID MULTI-READER");
+    ui_status_bar(canvas, "RFID MULTI-READER", NULL, 0, 0, 0);
 
     switch(m->state) {
     case RfidStateScanning:
@@ -121,11 +94,8 @@ void rfid_draw_callback(Canvas* canvas, void* model) {
         break;
 
     case RfidStateNotice:
-        canvas_set_font(canvas, FontPrimary);
-        draw_centered(canvas, 28, m->notice_title);
-        canvas_set_font(canvas, FontSecondary);
-        draw_centered_fit(canvas, 42, m->notice_l1, 124);
-        draw_centered_fit(canvas, 53, m->notice_l2, 124);
+        ui_status_bar(canvas, m->notice_title, NULL, 0, 0, 0);
+        ui_notice(canvas, NULL, m->notice_l1, m->notice_l2);
         break;
 
     default:
