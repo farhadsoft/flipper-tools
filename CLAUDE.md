@@ -1906,302 +1906,102 @@ firmware's own `view_dispatcher.c`); doing the gen bump *after* `m->exit()`
 returns, not before, is what lets a module's own teardown still legitimately
 post/observe events at the current gen while it tears down, with the bump
 only retiring whatever is left in flight once teardown is actually done.
-**Since 2026-08-09** (see "Known issue" and its resolution below):
+**Since 2026-08-09** (see "Module-exit crash fixes" below):
 `toolkit_exit_module()` -- the function every module's `nav()` callback
 actually calls -- only posts a deferred custom event; `toolkit_exit_module_now()`
 (this exact sequence, unchanged) runs from `toolkit_custom_event()` one
 dispatch-loop iteration later. No caller needed to change.
 
-### Known issue -- rare, recoverable input-delivery hang (fixed 2026-08-09, see below)
+### Module-exit crash fixes — two passes, one open issue (2026-08-09)
 
-During `flipper-perf-review`'s mandated repeated-cycle on-device testing
-(2026-08-06, this session), a **low-probability** (empirically ~15-20% per
-module-exit across many CLI-driven trials), **non-deterministic** hang was
-observed: after some module exits, the app keeps running (`loader info`
-keeps answering, `top` shows no leaked/stuck worker threads, `session.log`
-stays intact and correct) but stops responding to *any* further input --
-Back, Down, and OK all become no-ops -- until `power reboot`. Root-caused (by
-reading Momentum's actual `applications/services/gui/view_dispatcher.c`
-source directly, not inferred) to `ViewDispatcher`'s own
-`ongoing_input_view` tracking: it records which view was current when a
-button's `InputTypePress` arrived, and routes that gesture's later
-`InputTypeShort`/`InputTypeLong`/`InputTypeRelease` events based on whether
-`current_view` is still the same view by the time each later event is
-processed. `toolkit_exit_module()` switches `current_view` away and removes
-the old view *synchronously*, from inside the navigation callback that is
-itself invoked synchronously from inside the firmware's own input-delivery
-call for that same gesture -- exactly the same pattern Phase 0's GPIO module
-already ships with (this is not a Phase-1-specific pattern; it is the
-toolkit's whole exit-a-module design). `view_dispatcher_remove_view()` does
-explicitly null out a stale `ongoing_input_view` pointer when it matches the
-view being removed, which is why this does not manifest as a memory-safety
-bug (no crash, no corruption observed in any trial) -- but the mechanism by
-which `ongoing_input_view` gets *reacquired* for the next gesture appears to
-have a narrow race that this session could not fully pin down: the plan's
-own required single-pass verification (one clean cycle through all four
-modules) succeeded twice in a row, and 5/5 repeated RFID short-press
-enter/exit cycles were clean, but Card Reader's long-press exit reproduced
-the hang on roughly 1 in 5-6 attempts regardless of how generously the CLI
-commands were paced (ruling out "the CLI disconnected mid-command" as the
-full explanation, though it may still be a contributing factor).
+Two distinct `furi_check` reboots on leaving a wrapped module, fixed in **two passes**.
+Both are the same class: a module tearing down state from **inside ViewDispatcher's
+input-delivery call** (reentrancy), specific to **module mode** — the wrapped standalone
+apps' exit mechanisms were never adapted to running under the toolkit's single shared
+ViewDispatcher.
 
-**Not fixed this session, deliberately.** This session only had CLI-injected
-input (`cap.py` / `input send`) available, never a real physical button --
-so whether this reproduces at all outside CLI-driven testing is unconfirmed.
-Changing `toolkit_exit_module()`'s call timing (e.g. deferring it via a
-self-posted custom event instead of a synchronous call from the nav
-callback) is a plausible fix, but it touches the exact load-bearing exit
-sequencing this file already documents as firmware-source-confirmed, its
-bug is non-deterministic (so a handful of clean re-runs cannot prove a fix
-works, only that the failure got rarer), and physical-button ground truth
-doesn't exist yet. Shipping an unverified change to core dispatch timing to
-chase a rare, recoverable, non-corrupting hang is a worse trade than leaving
-it tracked. **Next session with device access:** reproduce with a real
-physical Back press (short and long, repeated) before touching this code; if
-confirmed, implement the deferred-exit fix and re-verify over many cycles.
+#### Crash 1 — Back / nav idle exit  (commit `2f2adba`)
 
-**Resolution 2026-08-09:** the escalation below reproduced a harder failure
-mode of this same race (crash/reboot, not just a hang) under CLI-driven
-testing, and the deferred-exit fix sketched above was implemented and
-verified. See "deferred-exit hardening fix applied and verified" further
-down. Physical-button ground truth is still outstanding -- everything below
-remains CLI-only, same limitation this note originally flagged.
+- **Symptom:** intermittent reboot on idle Back exit; screen shows only `furi_check failed`
+  (`file:line` is console-only).
+- **Root cause:** the 2026-08-06 `ongoing_input_view` reentrancy known-issue — every
+  module's `nav()` called `toolkit_exit_module()` synchronously, nested inside
+  ViewDispatcher's Back-press input delivery. Escalated from a rare silent hang to an
+  actual reboot at dwell ≥1.15 s, crossing the NFC/LF phase-alternation boundary with an
+  EMV read in flight.
+- **Fix:** `toolkit_exit_module()` posts a self-targeted deferred custom event
+  (`TOOLKIT_EVENT_DEFERRED_EXIT = 0xFF`, reserved), intercepted in
+  `toolkit_custom_event()` before it reaches a module, running teardown one dispatch tick
+  **off** the input stack. Zero call-site changes.
+- **Verification:** 410 CLI cycles clean (vs 2 reboots in 10–20 pre-fix); 48 physical GPIO
+  Back cycles clean; 4/4 clean thread teardowns; stack/heap healthy.
+- **Status — RARER, NOT PROVEN.** A non-deterministic race is never *proven* fixed by clean
+  runs, only made rarer. `file:line` was never captured (UART adapter did not enumerate;
+  `uart_capture.py` staged). CLI injection never reproduced this one, so the CLI passes are
+  a **weaker** proxy than for Crash 2. Physical Back path clean over 48 cycles, but the
+  caveat stands.
 
-### 2026-08-09 -- idle-exit `furi_check`/reboot crash: reproduced, NOT localized (USB-only capture is structurally insufficient)
+#### Crash 2 — module-menu "Exit"  (module-mode `view_dispatcher_stop`)
 
-Investigating a user report: Card Reader crashes intermittently exiting the
-idle scan screen via Back, screen shows only `furi_check failed`, hadn't
-reproduced in 10+ manual cycles. Instrumented every teardown step in the
-idle-exit path (`reader_navigation_callback`'s exit block, `reader_app_free`,
-`reader_stop_nfc`, `reader_stop_lf`, `toolkit_exit_module`,
-`card_reader_exit`) with paired `FURI_LOG_I(TAG, "cr_exit before/after: <step>")`
-lines, each marked `// TEMP diagnostic -- remove in the fix commit` (still in
-the tree, uncommitted -- not yet removed, see below for why).
+- **Symptom:** **deterministic** reboot when selecting **Exit from a module's menu** (not
+  the Back button), with an EMV read in flight.
+- **Root cause:** `reader_handle_exit()` (`universal_card_reader.c`) and
+  `SubRecEventMenuExit` (`subghz_auto_recorder.c`) called `view_dispatcher_stop()`
+  unconditionally — the standalone-app exit. In module mode that stops the toolkit's
+  **shared** ViewDispatcher from inside its own custom-event dispatch, bypassing
+  `toolkit_exit_module_now()`, so `reader_app_free()`/`sub_rec_app_free()` never run →
+  views stay registered → wedged/hard-fault. A **Phase-1 wrapping leak** (standalone exit
+  not adapted to module mode). `2f2adba` fixed only the Back path; this path was missed.
+- **Fix:** both sites branch on `app->module_mode` → `toolkit_exit_module()` (deferred) in
+  module mode; standalone `else` branch unchanged. `+10/−2`.
+- **Verification — the strongest in the project, because it has a negative control:**
+  - **Pre-fix negative control:** reverted both hunks, rebuilt, reproduced the hard crash
+    on the exact Exit press. This proves the repro exercises the real fault, so the
+    post-fix clean runs are trusted.
+  - Post-fix: 30× Load→Actions→Exit clean, 10× rapid double-tap clean, 10× Back regression
+    clean, 10× SubGHz Exit clean; heap reclaimed; zero leaked
+    `NfcWorker`/`NfcScanWorker`/`LfrfidWorker`; uptime monotonic.
+  - **F3 — synchronous worker teardown, traced not asserted:**
+    `reader_app_free() → reader_stop_all() → reader_stop_nfc()` (+ `reader_stop_lf()`
+    calling the **joining** `lfrfid_worker_stop_thread()`), and `sub_rec_app_free() →
+    sub_rec_listen_stop() → subghz_worker_stop() → furi_thread_join()` (confirmed against
+    Momentum `subghz_worker.c`). Both drain their radio workers before freeing.
+  - **F2 — physical confirmation:** EMV card in field + read in flight + module-menu Exit,
+    repeated on the reflashed fixed build — **no crash.** Closes the physical input-path
+    gap.
+- **Status — CONFIRMED.** Deterministic + negative control + physical: this crash earns the
+  word.
+- `repro_menu_exit.py` added as a reusable regression check (card-free Load path hits the
+  same `ReaderEventActionExit`).
 
-**Reproduced, with a strong dwell-time correlation.** Two automated sweeps,
-both `down short` -> `ok short` (enter Card Reader, start NFC phase) -> dwell
--> `back short` (exit), looped without a `loader open` between cycles (Back
-at the idle scan screen only exits the *module* -- `toolkit_exit_module`
-switches to the toolkit's own internal launcher, the `.fap` itself stays
-resident; a repeat `loader open` on the same path fails with "Loader is
-locked").
-- **100 cycles, dwell in {0.01, 0.05, 0.1, 0.2, 0.5} s (20x each): zero
-  crashes.** `uptime` monotonic throughout, no stuck app.
-- **Dwell in {1.15, 1.20, 1.25, 1.6, 1.8, 2.0, 2.8, 3.0, 4.0, 5.0} s (crosses
-  the `NFC_PHASE_MS`=1200 ms / `LF_PHASE_MS`=1600 ms phase-alternation
-  boundary): the device rebooted twice inside the first ~10-cycle block**
-  (`uptime` dropped from ~4800 s to 61 s, then again to 29 s during
-  reconnection attempts a short time later; each time "No application is
-  running" after recovery, i.e. NOT the previously-known silent input hang --
-  the device actually reset). A live EMV/payment card was on the antenna the
-  entire time (same as every prior session's testing -- see "Not
-  independently isolated" note above), so the NFC phase reliably progressed
-  scan -> detect -> poll/read, not just idle scanning.
+#### Open issue — F1: loader-close during active scan  (NOT fixed)
 
-**The plan's own capture mechanism (Step 1-3) cannot work over USB as
-designed, confirmed empirically, not inferred:** `log <level>` streaming and
-CLI command dispatch (`input send`, `loader open`, even `uptime`) are
-*mutually exclusive* on the single USB-CDC CLI channel -- once `log info`
-starts, every other command is silently dropped (no echo, no effect
-whatsoever) until `CTRL+C` is sent to break the stream. Confirmed in
-isolation (idle desktop, no Card Reader involved): `log info` then
-`loader open ...` produced zero effect; recovered only after `CTRL+C`.
-Windows also only allows one open handle on `COM4` at a time (`PermissionError:
-Access is denied` on a second concurrent open), so there is no way to run a
-second host process that streams logs while a first injects input. Since the
-bug requires *injecting* Back over USB at the same time as *observing* the
-`cr_exit` log trail, and both need the same single CLI channel, USB alone
-cannot capture file:line or the before/after trail for this specific crash --
-matches this file's own "Log capture" section (`log` "accepts no more
-commands") more literally than expected. The hardware UART (a physically
-separate channel from USB-CDC) is not just one option but the only way to get
-that data while also injecting input over USB.
+- **Symptom:** `loader close` (external force-kill) crashes a module while its NFC/LF radio
+  is actively scanning. Orthogonal to the in-app Exit fixes (external-teardown path),
+  untouched by these edits. Same family — teardown while a radio worker is active.
+- **Status — REPORTED, NOT REPRODUCED WITH CAPTURE.** Idle loader-close is confirmed clean
+  (`iso_baseline.log`/`iso_recover.log`). The active-scan crash is attributed to the prior
+  session's finding, **not** re-verified here with a captured repro (~1800 session logs
+  searched, no capture of the crash itself). Do not treat as confirmed. Next step before
+  any fix: capture it (instrument or UART). The test harness avoids force-close during an
+  active scan; product code is untouched.
 
-**This is likely the same bug as the "Known issue" above, now with a
-stronger trigger and a worse outcome.** The 2026-08-06 session's "rare,
-recoverable input-delivery hang" (empirically ~15-20% per Card-Reader
-module-exit, root-caused to `ViewDispatcher`'s `ongoing_input_view` racing
-against `toolkit_exit_module`'s synchronous view-swap from inside the nav
-callback that Back's own input delivery is still running on) was deliberately
-left unfixed pending a *physical* Back press, because that session (like this
-one) only had CLI-injected input. `reader_input_callback` only intercepts
-`InputTypeShort`/`InputTypeRepeat` and explicitly leaves Back unconsumed
-("Back is deliberately left unconsumed" in `universal_card_reader.c`), so a
-CLI `input send back short` drives the exact same `InputTypePress` ->
-`InputTypeShort` -> `InputTypeRelease` sequence through the same
-`ongoing_input_view` mechanism the prior finding describes -- "short" is not
-exempt, that session's specific repro just happened to use long-press. A
-silent hang under lighter load escalating to a hard reset under a busier one
-(active EMV read in flight, more queued events, longer `nfc_poller_stop()`
-join) is a plausible progression of the *same* race, not proof of a second,
-unrelated bug.
+#### Invariant added (tool-level #4, above)
 
-**Not fixed. Escalating per the plan's Step 7 -- two options, not chosen
-unilaterally:**
-1. Wire the hardware UART (pin 13 TX -> adapter RX, GND -> GND, 230400 8N1)
-   and re-run the *second* sweep (dwell >= 1.15 s reproduces within ~10
-   cycles -- far tighter than the original 100-cycle budget) with the UART
-   streaming continuously and USB free for input injection. This gets
-   file:line and the full `cr_exit` trail in one pass.
-2. Approve applying the already-analyzed, already-deferred fix from the
-   "Known issue" above (defer `toolkit_exit_module()`'s call via a
-   self-posted custom event instead of a synchronous call from the nav
-   callback), labeled explicitly as unconfirmed hardening, and re-verify with
-   the same longer-dwell sweep. Same caveat that session recorded still
-   applies: it touches the firmware-source-confirmed load-bearing exit
-   sequencing (P2 in the canonical module template above), and a clean
-   re-run cannot prove a non-deterministic race is fixed, only that it got
-   rarer.
+In **module mode**, no code may call `view_dispatcher_stop()` or
+`toolkit_exit_module_now()` directly; every module exit posts the deferred `0xFF` event.
+A grep check is in the mandatory review step (see "Review & self-run trigger" below). This
+exists because the bug **recurred once** — the first fix was per-site (nav only), not
+construction-level, so the menu-Exit path slipped through. The invariant + grep is what
+prevents a third missed exit path.
 
-Device left idle, no application open, `uptime` climbing normally (no
-further resets) after this session's testing. Instrumentation
-(`// TEMP diagnostic`) and `stress_cr_exit.py` (repo root, a corrected/
-parametrized version of the plan's script -- the plan's original never sent
-`back` and assumed a full-app relaunch each cycle, both wrong, see the
-script's own header comment) are left in place, uncommitted, pending the
-choice above.
+#### Honest status, one line each
 
-### 2026-08-09 (continued) -- deferred-exit hardening fix applied and verified
+- **Crash 2 (menu-Exit): confirmed** — deterministic, negative control, physical.
+- **Crash 1 (Back): rarer, not proven** — intermittent, no captured `file:line`.
+- **F1 (loader-close during scan): reported, not reproduced.**
 
-User picked hardware UART first. The adapter never enumerated on Windows
-after ~20s of repeated `pyserial`/`Get-PnpDevice` checks -- no CH340/CP2102/
-FTDI/PL2303-class device, no new COM port, nothing new in the full PnP list
-beyond stale historical entries for this same Flipper. Switched to the
-hardening-fix path (approved) instead of continuing to guess at the
-adapter's physical state.
 
-**Fix implemented** (`toolkit_app.h`, `toolkit.c`): `toolkit_exit_module()`
-no longer runs the P2 sequence synchronously. It now only posts a
-toolkit-reserved custom event (`TOOLKIT_EVENT_DEFERRED_EXIT = 0xFF`, per-module
-ids must stay `<= 254`); `toolkit_custom_event()` intercepts that id *before*
-ever routing to a module and calls the renamed `toolkit_exit_module_now()`
-(the original, unchanged P2 body) -- which now runs from the custom-event
-dispatch loop, off the raw input-delivery call stack the original "Known
-issue" implicated. Zero call-site changes needed in any of the 5 modules
-(`ble_findmy`, `gpio_info`, `card_reader`, `rfid_multi`, `subghz_rec`,
-including the non-nav-callback bounce-back call in `subghz_rec_enter()` on a
-failed preset self-check -- traced separately: that call already runs from
-`toolkit_custom_event()`'s own dispatch, not raw input delivery, so it was
-never exposed to this race; deferring it again is a harmless extra hop
-through the same already-safe mechanism, not a new risk). Self-protecting
-against a hypothetical double-post: both events would carry the same gen
-(nothing bumps `app->gen` in the one-iteration gap), so the second is
-correctly dropped by the existing stale-event filter once the first
-processes and bumps gen.
-
-**Verified.** Pre-fix baseline: 2 reboots within 10-20 cycles at dwell
->= 1.15 s (see the entry above). Post-fix, same dwell range: 150 cycles
-clean (instrumentation still in at that point) -> instrumentation removed,
-rebuilt (zero warnings, APPCHK Target 7/API 87.1) -> 50 cycles at the
-original short-dwell range, clean (regression check) -> 90 cycles clean
-before a bash-tool timeout hard-killed the script mid-run; the device then
-read `uptime` 16s (a reset) on reconnect, but a `ClearCommError`/
-`PermissionError` on the same reconnect attempt matches this session's
-earlier-observed signature for an abrupt host-side port-handle kill, not an
-app-level crash -- an immediate, complete, uninterrupted re-run of the same
-120-cycle sweep afterward was 120/120 clean, uptime monotonic throughout
-(109s -> 651s), so the 16s reading is recorded here but not counted as a
-fix failure. **410 total post-fix cycles at the crash-triggering dwell
-range and below, one ambiguous non-reproducing incident, zero confirmed
-application-level crashes.**
-
-**`flipper-c-review`:** all 9 checklist items pass on the diff
-(`toolkit.c`/`toolkit_app.h` only -- the 5 instrumented reader/module files
-are back to byte-identical pre-session content). Precondition check specific
-to this change: `app->active`/`app->active_ctx` validity at the now-deferred
-dispatch point is provably unchanged from post-time, since nothing else runs
-in the one-iteration gap (entering a new module requires `app->active ==
-NULL`, which cannot be true while a deferred exit for the current module is
-still in flight). One `smell` found and fixed: "P2 -- exit order" above
-named `toolkit_exit_module()` as owning the sequence; corrected to
-`toolkit_exit_module_now()` plus a note on the split.
-
-**`flipper-perf-review`:** static half clean -- no new alloc/free, no new
-stack buffers, no blocking-call reordering (the anim/phase-timer stops and
-radio-stop calls inside `reader_stop_all()`/`reader_app_free()` keep their
-existing call sites and timing; only `toolkit_show_launcher()`+`m->exit()`
-+the two bumps move by one dispatch-loop tick). Note, not a defect: the
-anim_timer can now tick at most once more before `reader_app_free()`'s own
-`anim_timer_stop()` runs (bounded by the one-tick defer, not accumulating --
-the deferred event is the next thing dispatched); any such tick is filtered
-as stale by the existing gen check regardless. On-device, 4x Card Reader
-enter/exit via `cap.py` + `top` (`parse_top.py` from the skill):
-`universal_toolkit` app-thread `Stack Min` 15516/15032 of 16380 free (>>
-4096 floor) across all 4 cycles; zero worker threads (`NfcScanWorker`/
-`NfcWorker`/`LfrfidWorker`) present in any of the 4 post-exit snapshots --
-clean teardown, no leak; `Heap: free` after exit 65040/65016/65072/65104
-(flat, not falling); `Heap: minimum` (all-time watermark) 16688 -> 13632
-once between cycles 2 and 3 then held flat -- a single new low-water mark
-from one larger transient allocation (plausibly the EMV read in progress at
-that moment), not a per-cycle ratchet, so not a leak signature. `log debug`
-capture during the hot path was not attempted -- same structural conflict
-documented above (streaming blocks `input send`), `unverified` for that one
-line item. Combined with 410 crash-free cycles across the whole session
-(a true unbounded leak would eventually exhaust the heap and crash), no
-leak or thread-hygiene defect.
-
-**Caveats, unchanged from the original "Known issue":** this is CLI-only
-verification; a non-deterministic race is never provably fixed by clean
-re-runs, only demonstrated rarer. Physical-button ground truth (short and
-long Back, repeated) is still the next confirmation step whenever the device
-is next in hand outside a CLI-driven session.
-
-Instrumentation (`// TEMP diagnostic`) fully removed, `ufbt` warning-clean,
-`APPCHK` Target 7/API 87.1. `stress_cr_exit.py` and `uart_capture.py` left
-at the repo root (both reusable for the next verification pass; the UART
-script is untested end-to-end since the adapter never enumerated this
-session). Device left idle, no application open, `uptime` climbing normally
-at session end.
-
-### 2026-08-09 (continued) -- menu-Exit path missed the deferred-exit fix: crash, fix, two tracked follow-ups
-
-`toolkit_exit_module()` (above) only replaced the synchronous
-`view_dispatcher_stop()` call on the **nav-callback Back** path. The
-**menu-Exit** path -- submenu row -> custom event ->
-`reader_handle_exit()` / `SubRecEventMenuExit` -- still called
-`view_dispatcher_stop()` directly, from inside the toolkit's own
-custom-event dispatch loop, in module mode: the standalone-app shutdown
-call, applied to the toolkit's single shared `ViewDispatcher`. It never
-reaches `toolkit_exit_module_now()`, so `reader_app_free()`/
-`sub_rec_app_free()` don't run and the exiting module's views stay
-registered -- a deterministic `furi_check` crash-reboot. Reproduced via a
-card-free Load -> Actions -> Exit cycle (`ReaderEventActionExit`, the same
-event a live EMV read reaches) and confirmed with a pre-fix negative
-control: revert both hunks, rebuild, crash on the first cycle; reapply,
-rebuild, clean.
-
-**Fix:** both sites now branch on `app->module_mode`, same shape as the
-already-correct Back path -- `toolkit_exit_module(app->toolkit)` in module
-mode, `view_dispatcher_stop()` kept for the (currently unused) standalone
-path. `universal_card_reader.c`'s `reader_handle_exit()` and
-`subghz_auto_recorder.c`'s `SubRecEventMenuExit` case, +10/-2 total; `grep
--n "view_dispatcher_stop" universal_toolkit/**/*.c` confirms no third site.
-Verified: 30x card-free Load/EMV-path menu-Exit + 10x rapid double-tap on
-Card Reader, 10x menu-Exit on SubGHz Recorder, 10x Back-path regression --
-0 crashes; `top` before/after shows the heap fully reclaimed and zero
-leaked `NfcScanWorker`/`NfcWorker`/`LfrfidWorker`/`BrowserWorker` threads;
-uptime monotonic throughout. See "Tool-level invariants" #4 for the
-invariant this closes.
-
-**Known issue, not fixed here -- external `loader close` during an active
-NFC/LF scan.** Force-killing a module from outside (CLI `loader close`, or
-the physical equivalent) while its radio worker is actively scanning
-crashes the app -- found during this fix's verification pass. An
-idle-case control isolates it to the scanning state, not `loader close`
-itself: closing from the launcher (radio idle) is clean (`loader close` ->
-`uptime` keeps climbing, no crash). Not the menu-Exit bug above -- this is
-the *external* teardown path (`loader close` -> the toolkit's own
-`m->exit()`), never any of this app's own event loops -- but almost
-certainly the same family: teardown racing a live radio worker. Tracked,
-not blocking this fix; needs its own repro script and root-cause pass.
-
-**Outstanding physical verification.** This fix's verification used the
-card-free Load -> Actions -> Exit path (identical `ReaderEventActionExit`
-codepath to a live read, but CLI-only evidence). The original user report
-was a live EMV card in the field with a read in flight. Next session with
-device and a real EMV card, required before calling this closed: present
-card -> wait for read complete -> OK into the actions menu -> Exit, >= 10x.
-Expected: 0 crashes, launcher appears every time.
 
 ### The session.log unbounded-growth note (P4 from sign-off)
 
