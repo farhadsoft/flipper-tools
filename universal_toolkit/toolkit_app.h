@@ -14,12 +14,18 @@
 // down -- FreeRTOS message queues are not flushed synchronously by
 // furi_timer_stop() -- reads back with a stale generation and is dropped by
 // toolkit_custom_event() instead of reaching whatever module is active next.
-// Keep every per-module event id < 256: ids are module-local, since only the
-// active module's `event` callback is ever dispatched, so modules never
-// coordinate id ranges with each other.
+// Keep every per-module event id <= 254: ids are module-local, since only
+// the active module's `event` callback is ever dispatched, so modules never
+// coordinate id ranges with each other. 0xFF/255 is reserved -- see below.
 #define EVENT_ID(e)         ((e) & 0xFFu)
 #define EVENT_GEN(e)        ((e) >> 8u)
 #define EVENT_MAKE(id, gen) ((uint32_t)(id) | ((uint32_t)(gen) << 8u))
+
+// Reserved, toolkit-owned event id -- never a module's own id.
+// toolkit_custom_event() (toolkit.c) intercepts it before ever routing to a
+// module; see toolkit_exit_module()'s UNCONFIRMED HARDENING comment in
+// toolkit.c for why the deferral it drives exists.
+#define TOOLKIT_EVENT_DEFERRED_EXIT 0xFFu
 
 // View id 0 is the launcher's Submenu: added once in toolkit_app_alloc(),
 // never removed, always safe to switch to. Every module owns a namespace of

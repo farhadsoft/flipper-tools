@@ -64,7 +64,11 @@ static void toolkit_enter_module(ToolkitApp* app, const ToolkitModule* m) {
     m->enter(app); // registers views, allocs ctx, acquires peripheral, switches to its root view
 }
 
-void toolkit_exit_module(ToolkitApp* app) {
+// The actual module teardown. Runs from toolkit_custom_event() below (i.e.
+// off ViewDispatcher's own custom-event dispatch loop), never synchronously
+// nested inside a raw input-delivery call -- see toolkit_exit_module()'s
+// comment for why that separation is the whole point of this split.
+static void toolkit_exit_module_now(ToolkitApp* app) {
     const ToolkitModule* m = app->active;
     // Switch to the launcher BEFORE tearing the module down. ViewDispatcher's
     // remove_view() sets current_view to NULL -- and view_dispatcher_set_current_view()
@@ -78,6 +82,31 @@ void toolkit_exit_module(ToolkitApp* app) {
     app->active = NULL;
 }
 
+// UNCONFIRMED HARDENING (2026-08-09, targets the "ongoing_input_view" finding
+// above): every caller reaches this from its own nav() callback, which
+// ViewDispatcher invokes *synchronously*, nested inside its own raw
+// input-delivery call for the very Back press that triggered the exit --
+// same call stack, not yet unwound. Tearing the module down (view swap +
+// remove_view + free) from in there races ViewDispatcher's own
+// ongoing_input_view bookkeeping for that same gesture. Posting a
+// self-targeted custom event instead defers the actual teardown
+// (toolkit_exit_module_now() above) to the next iteration of
+// ViewDispatcher's own custom-event dispatch loop -- after the firmware's
+// input-delivery call for this Back press has fully returned. Stamped with
+// the gen the caller already holds (each nav callback bumps gen before
+// calling this, or is about to), so toolkit_custom_event()'s existing
+// stale-event filter also covers this event; nothing else can bump
+// app->gen in the one-iteration gap between posting and dispatch.
+// CLI-driven re-verification: 150 cycles at dwell 1.15-5 s (the exact range
+// that crashed/rebooted twice within ~10-20 cycles pre-fix) plus 50 more at
+// dwell 0.01-0.5 s (regression check) -- zero crashes, uptime monotonic
+// throughout. Still not verified against a physical Back press -- same
+// CLI-only constraint the original finding above hit.
+void toolkit_exit_module(ToolkitApp* app) {
+    view_dispatcher_send_custom_event(
+        app->view_dispatcher, EVENT_MAKE(TOOLKIT_EVENT_DEFERRED_EXIT, app->gen));
+}
+
 /* -------------------------------- dispatch --------------------------------- */
 
 static bool toolkit_launcher_event(ToolkitApp* app, uint32_t id) {
@@ -87,11 +116,17 @@ static bool toolkit_launcher_event(ToolkitApp* app, uint32_t id) {
 }
 
 // Gen-filter first, then route by context: the active module's `event`, or
-// the launcher's row selection when nothing is active.
+// the launcher's row selection when nothing is active. The deferred-exit
+// sentinel (see toolkit_exit_module() above) is intercepted here, before
+// ever reaching a module.
 static bool toolkit_custom_event(void* context, uint32_t packed) {
     ToolkitApp* app = context;
     if(EVENT_GEN(packed) != app->gen) return true; // drop stale (post-exit ticks, queued rows)
     uint32_t id = EVENT_ID(packed);
+    if(id == TOOLKIT_EVENT_DEFERRED_EXIT) {
+        toolkit_exit_module_now(app);
+        return true;
+    }
     return app->active ? app->active->event(app, id) : toolkit_launcher_event(app, id);
 }
 
