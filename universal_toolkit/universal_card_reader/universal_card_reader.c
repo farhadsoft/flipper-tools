@@ -536,7 +536,11 @@ static void reader_handle_phase_timeout(ReaderApp* app) {
 static void reader_handle_exit(ReaderApp* app) {
     reader_stop_all(app);
     app->toolkit->gen++;
-    view_dispatcher_stop(app->view_dispatcher);
+    if(app->module_mode) {
+        toolkit_exit_module(app->toolkit);
+    } else {
+        view_dispatcher_stop(app->view_dispatcher);
+    }
 }
 
 bool reader_custom_event_callback(void* context, uint32_t event) {

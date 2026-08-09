@@ -1722,6 +1722,20 @@ empty file). No reader exists yet -- that is Phase 4's viewer.
    for BadUSB, wrapped in a later phase: entering a USB-mode-changing module
    must restore the prior USB mode in `exit` on every path, including a
    mid-operation Back.
+4. **No direct exit calls from module code.** In module mode, no code may
+   call `view_dispatcher_stop()` or `toolkit_exit_module_now()` directly --
+   both act on the toolkit's single shared `ViewDispatcher`, synchronously,
+   from whatever call stack the module's event/nav callback is already
+   nested in. Every exit path -- Back/nav, a menu Exit row, a failed
+   precondition bounce-back -- must instead call
+   `toolkit_exit_module(app->toolkit)`, which posts
+   `TOOLKIT_EVENT_DEFERRED_EXIT` (0xFF) and lets `toolkit_custom_event()`
+   run the real teardown one dispatch-loop iteration later, off the
+   caller's stack. Two call sites missed this once each so far
+   (`reader_navigation_callback()`'s Back path, fixed in `2f2adba`; then
+   `reader_handle_exit()`'s menu-Exit path and `SubRecEventMenuExit`, fixed
+   the same day) -- see "Review — mandatory final step" for the grep check
+   that guards against a third.
 
 ## Testing this app
 
@@ -2139,6 +2153,56 @@ script is untested end-to-end since the adapter never enumerated this
 session). Device left idle, no application open, `uptime` climbing normally
 at session end.
 
+### 2026-08-09 (continued) -- menu-Exit path missed the deferred-exit fix: crash, fix, two tracked follow-ups
+
+`toolkit_exit_module()` (above) only replaced the synchronous
+`view_dispatcher_stop()` call on the **nav-callback Back** path. The
+**menu-Exit** path -- submenu row -> custom event ->
+`reader_handle_exit()` / `SubRecEventMenuExit` -- still called
+`view_dispatcher_stop()` directly, from inside the toolkit's own
+custom-event dispatch loop, in module mode: the standalone-app shutdown
+call, applied to the toolkit's single shared `ViewDispatcher`. It never
+reaches `toolkit_exit_module_now()`, so `reader_app_free()`/
+`sub_rec_app_free()` don't run and the exiting module's views stay
+registered -- a deterministic `furi_check` crash-reboot. Reproduced via a
+card-free Load -> Actions -> Exit cycle (`ReaderEventActionExit`, the same
+event a live EMV read reaches) and confirmed with a pre-fix negative
+control: revert both hunks, rebuild, crash on the first cycle; reapply,
+rebuild, clean.
+
+**Fix:** both sites now branch on `app->module_mode`, same shape as the
+already-correct Back path -- `toolkit_exit_module(app->toolkit)` in module
+mode, `view_dispatcher_stop()` kept for the (currently unused) standalone
+path. `universal_card_reader.c`'s `reader_handle_exit()` and
+`subghz_auto_recorder.c`'s `SubRecEventMenuExit` case, +10/-2 total; `grep
+-n "view_dispatcher_stop" universal_toolkit/**/*.c` confirms no third site.
+Verified: 30x card-free Load/EMV-path menu-Exit + 10x rapid double-tap on
+Card Reader, 10x menu-Exit on SubGHz Recorder, 10x Back-path regression --
+0 crashes; `top` before/after shows the heap fully reclaimed and zero
+leaked `NfcScanWorker`/`NfcWorker`/`LfrfidWorker`/`BrowserWorker` threads;
+uptime monotonic throughout. See "Tool-level invariants" #4 for the
+invariant this closes.
+
+**Known issue, not fixed here -- external `loader close` during an active
+NFC/LF scan.** Force-killing a module from outside (CLI `loader close`, or
+the physical equivalent) while its radio worker is actively scanning
+crashes the app -- found during this fix's verification pass. An
+idle-case control isolates it to the scanning state, not `loader close`
+itself: closing from the launcher (radio idle) is clean (`loader close` ->
+`uptime` keeps climbing, no crash). Not the menu-Exit bug above -- this is
+the *external* teardown path (`loader close` -> the toolkit's own
+`m->exit()`), never any of this app's own event loops -- but almost
+certainly the same family: teardown racing a live radio worker. Tracked,
+not blocking this fix; needs its own repro script and root-cause pass.
+
+**Outstanding physical verification.** This fix's verification used the
+card-free Load -> Actions -> Exit path (identical `ReaderEventActionExit`
+codepath to a live read, but CLI-only evidence). The original user report
+was a live EMV card in the field with a read in flight. Next session with
+device and a real EMV card, required before calling this closed: present
+card -> wait for read complete -> OK into the actions menu -> Exit, >= 10x.
+Expected: 0 crashes, launcher appears every time.
+
 ### The session.log unbounded-growth note (P4 from sign-off)
 
 `toolkit_log_append()` (`toolkit_log.c`) only ever appends; nothing in this
@@ -2497,6 +2561,14 @@ Every task that writes or changes C ends with **two** review passes, in order:
 Invoke both by name; do not review from memory. Run after `ufbt` is
 warning-clean and after any on-device verification, but before writing the
 commit message. If either pass changes code, rebuild and re-verify.
+
+**`universal_toolkit/` changes specifically:** as part of the
+`flipper-c-review` pass, run `grep -n "view_dispatcher_stop\|toolkit_exit_module_now"
+universal_toolkit/**/*.c` and confirm every hit is either
+`toolkit_exit_module_now()`'s own definition/dispatch in `toolkit.c`, or a
+module call site guarded behind `if(app->module_mode) { toolkit_exit_module(...) }
+else { view_dispatcher_stop(...) }` (see "Tool-level invariants" #4). An
+unguarded hit is a `defect`, not a `smell`.
 
 **Self-run trigger:** at the end of any C-touching task these run without the
 user asking. They also run on demand when the user says "review", "check

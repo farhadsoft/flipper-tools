@@ -1610,7 +1610,11 @@ bool sub_rec_custom_event_callback(void* context, uint32_t event) {
         sub_rec_show_saved_menu(app);
         return true;
     case SubRecEventMenuExit:
-        view_dispatcher_stop(app->view_dispatcher);
+        if(app->module_mode) {
+            toolkit_exit_module(app->toolkit);
+        } else {
+            view_dispatcher_stop(app->view_dispatcher);
+        }
         return true;
     case SubRecEventFileReplay:
         sub_rec_replay(app);
