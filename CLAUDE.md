@@ -32,19 +32,17 @@ a card is found, with an animated scanning UI.
 
 ## Verified firmware / SDK — re-check before you build (STEP 0)
 
-Last verified **2026-08-02**, re-checked after a firmware update: `device_info`
-read live off the device, and the fork-ABI drift below re-confirmed against
-Momentum's actual header sources at the new commit (not just assumed stable
-because the API number didn't move). Update this block again if anything
-changes. Do not skip: a mismatch here caused a wedged device and a crash that
-`APPCHK` did not catch.
+Last verified **2026-08-08**: this session re-checked only the ufbt SDK
+(no device connected). `device_info` was not read live; update this block
+before flashing if the device firmware has changed. Do not skip: a mismatch
+here caused a wedged device and a crash that `APPCHK` did not catch.
 
 | | Device | ufbt SDK |
 |---|---|---|
-| Target | `hardware_target` 7 | `hw_target` f7 |
-| Firmware | `mntm-dev`, commit `8ed809fb`, built 03-06-2026 | official `1.4.3`, channel `release` |
-| Fork | **`Momentum`** (Next-Flip/Momentum-Firmware) | Official |
-| API | 87.1 | 87.1 |
+| Target | `hardware_target` 7 (last known) | `hw_target` f7 |
+| Firmware | `mntm-dev`, commit `8ed809fb`, built 03-06-2026 (last known) | official `1.4.3`, channel `release` |
+| Fork | **`Momentum`** (Next-Flip/Momentum-Firmware) (last known) | Official |
+| API | 87.1 (last known) | 87.1 |
 | Port | COM3 last confirmed (VID_0483 / PID_5740) — re-enumerate before trusting; not re-checked this session | — |
 
 **The API versions match exactly, so the FAP loads — but the forks are not
@@ -56,11 +54,14 @@ commit `8ed809fb` (2026-06-02 build) — this app is written to survive all four
 - `LFRFIDProtocol`: Momentum has 26 entries vs 24 and inserts `Indala224`
   mid-enum, shifting later ids.
 - `MfClassicPollerMode`: Momentum inserts `MfClassicPollerModeDictAttackCUID`
-  at id 3 → `DictAttackEnhanced` shifts. This app survives it by using read
-  mode only (`MfClassicPollerModeRead`, id 0) and never requesting a dict attack.
+  at id 3 → `DictAttackEnhanced` shifts. The app still uses read mode
+  (`MfClassicPollerModeRead`, id 0) for the initial read. For partial reads it
+  now runs `MfClassicPollerModeDictAttackStandard` (id 2) from the GUI thread;
+  id 2 is unchanged on Momentum because the insertion is at id 3.
 - `MfClassicPollerEventDataKeyRequest`: Momentum inserts `key_type` before
-  `key_provided`. This app survives it by never touching `key_request_data` —
-  it is only used by the dict-attack modes above.
+  `key_provided`. The recovery callback deliberately never touches
+  `key_request_data` — it is only used by the dict-attack key-provider path,
+  and the standard dict attack derives missing keys from known keys internally.
 
 Everything else checked (`nfc_scanner.h`, `nfc_generic_event.h`, the poller
 headers, `nfc_device.h`) is identical or additive-only.
@@ -78,8 +79,12 @@ universal_card_reader/          <- the app; run ufbt HERE, not at repo root
   reader_lf.c / reader_lf.h    LF RFID scan/read/emulate
   card_info.c / card_info.h    card report renderer + minimal NDEF parser
   emv.c / emv.h                read-only EMV (bank card) APDU chain
+  mfc_key_recovery.c / .h      Mifare Classic key recovery for partial reads
+  emulation_state.h            HAL-free struct capturing emulator-presented state
   icon.png / make_icon.py      10x10 1-bit icon, regenerate with Pillow
   README.md                    user-facing docs + the fork-ABI explanation
+  docs/emulation-fidelity-report.md  per-protocol emulation fidelity and limits
+  test/                        host-side Tier-1 tests (see repo `test/`)
 ```
 
 Installs to `/ext/apps/Tools/universal_card_reader.fap` (from `fap_category`),
@@ -282,6 +287,14 @@ baseline) and returned to the report. Rescan and Exit (`uptime` refused →
 answered again after Exit, proving a clean `view_dispatcher_stop()`) both
 confirmed too. `Stack Min` for the app thread stayed at 11156–11184 of 12284
 bytes through all of it — comfortable margin.
+
+**Implemented 2026-08-08 — Mifare Classic key recovery for partial reads.**
+`mfc_key_recovery.c` runs `MfClassicPollerModeDictAttackStandard` on the GUI
+thread when the initial read leaves sectors locked. It is compiled, the host
+logic test passes, and `ufbt` builds cleanly, but it has **not been verified
+on a real partially-keyed card** this session because no device was connected.
+The recovery path deliberately never touches `MfClassicPollerEventDataKeyRequest`
+so it survives the Momentum fork ABI drift documented above.
 
 **Verified 2026-08-02 — same, on two more real cards, different protocol.**
 A card the scanner classified `ISO14443-4A` and another `Mifare Plus` (both

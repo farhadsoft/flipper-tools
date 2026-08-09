@@ -113,10 +113,15 @@ honestly if the remove failed instead of claiming success.
 
 ## Limitations
 
-- Mifare Classic sectors are only read with the transport key
-  `FF FF FF FF FF FF`; sectors requiring another key will not be read.
-- ISO14443-4B and SLIX emulation are not supported; these cards fall
-  back to being read via the transport protocol.
+- Mifare Classic sectors are first read with the transport key
+  `FF FF FF FF FF FF`. If that leaves sectors locked, the app attempts a
+  dictionary/nested key recovery pass; sectors that still cannot be read
+  remain zero-filled. This recovery path is implemented but not yet verified
+  on a real partially-keyed card.
+- ISO14443-3B, ISO14443-4B, SLIX and ST25TB emulation are not supported
+  because the firmware SDK does not expose the required listener allocators
+  for those protocols; these cards fall back to being read via the transport
+  protocol. DESFire is also not emulatable.
 - UHF / 2.45 GHz is not supported by Flipper's built-in hardware.
 - EMV emulation is at the ISO14443-4A transport level only.
 - **Emulating a loaded (opened-from-file) Mifare Classic card can

@@ -2,6 +2,7 @@
 #include "reader_ui.h"
 #include "card_info.h"
 #include "emv.h"
+#include "mfc_key_recovery.h"
 #undef TAG
 #include "../toolkit_app.h"
 #undef TAG
@@ -73,16 +74,17 @@ NfcProtocol reader_poll_protocol(NfcProtocol p) {
 }
 
 // Protocols nfc_listener_alloc() can actually emulate. Two things must both
-// hold, checked against Momentum mntm-dev 42630e91 (identical to official
-// 1.4.3); NfcProtocol enum ids re-confirmed unchanged at commit 8ed809fb
-// (2026-06-02 build) via nfc_protocol.h: the protocol's own entry in
-// nfc_listeners_api[] must be non-NULL
+// hold, checked against official firmware 1.4.3 (API 87.1): the protocol's
+// own entry in nfc_listeners_api[] must be non-NULL
 // (nfc_listener_alloc furi_check()s exactly that), AND every ancestor's entry
 // must be non-NULL too (nfc_listener_list_alloc() walks the whole parent
 // chain and calls each ancestor's ->alloc() with no NULL check at all — an
-// unchecked crash, not even a furi_check). Iso14443_3b and St25tb are NULL;
-// every protocol below either has no parent or descends only from
-// Iso14443_3a (non-NULL), so the whole chain is safe for each entry here.
+// unchecked crash, not even a furi_check).
+//
+// Re-verified 2026-08-08: iso14443_3b_listener_alloc and st25tb_listener_alloc
+// are NOT exported in api_symbols.csv for official 1.4.3, so those protocols
+// remain excluded. Every protocol below either has no parent or descends only
+// from Iso14443_3a (non-NULL), so the whole chain is safe for each entry here.
 static const NfcProtocol reader_emulatable_protocols[] = {
     NfcProtocolIso14443_3a,
     NfcProtocolIso14443_4a,
@@ -243,7 +245,10 @@ static NfcCommand reader_poller_callback(NfcGenericEvent event, void* context) {
         switch(e->type) {
         case MfClassicPollerEventTypeRequestMode:
             // The firmware furi_crash()es on an uninitialised mode. Read mode
-            // only: the DictAttack modes are ABI-unsafe on Momentum.
+            // for the initial pass; key recovery (if needed) runs as a second
+            // poller in DictAttackStandard mode on the GUI thread. We never
+            // answer RequestKey here, so Momentum's key_request_data ABI drift
+            // is avoided.
             e->data->poller_mode.mode = MfClassicPollerModeRead;
             e->data->poller_mode.data = NULL;
             break;
@@ -282,8 +287,24 @@ static NfcCommand reader_poller_callback(NfcGenericEvent event, void* context) {
             break;
         }
         case MfClassicPollerEventTypeSuccess:
-        case MfClassicPollerEventTypeFail:
+        case MfClassicPollerEventTypeFail: {
+            const MfClassicData* d =
+                (const MfClassicData*)nfc_poller_get_data(app->poller);
+            if(e->type == MfClassicPollerEventTypeSuccess &&
+               !mf_classic_is_card_read(d)) {
+                uint8_t sectors = mf_classic_get_total_sectors_num(d->type);
+                uint8_t read = 0, keys = 0;
+                mf_classic_get_read_sectors_and_keys(d, &read, &keys);
+                FURI_LOG_I(
+                    TAG,
+                    "MFC partial read: %u/%u sectors, %u keys found; will attempt recovery",
+                    (unsigned)read,
+                    (unsigned)sectors,
+                    (unsigned)keys);
+                app->mfc_recovery_pending = true;
+            }
             return reader_nfc_done(app, event.protocol);
+        }
         default:
             break; // CardDetected/CardLost/DataUpdate/...: keep polling
         }
@@ -356,7 +377,16 @@ void reader_start_nfc_emulation(ReaderApp* app) {
     const NfcDeviceData* data = nfc_device_get_data(app->device, app->poll_protocol);
     app->listener = nfc_listener_alloc(app->nfc, app->poll_protocol, data);
     nfc_listener_start(app->listener, reader_listener_callback, app);
-    FURI_LOG_I(TAG, "emulating NFC: %s", nfc_device_get_protocol_name(app->display_protocol));
+    size_t uid_len = 0;
+    const uint8_t* uid = nfc_device_get_uid(app->device, &uid_len);
+    FuriString* uid_hex = furi_string_alloc();
+    reader_cat_hex(uid_hex, uid, uid_len);
+    FURI_LOG_I(
+        TAG,
+        "emulating NFC: %s, UID %s",
+        nfc_device_get_protocol_name(app->display_protocol),
+        furi_string_get_cstr(uid_hex));
+    furi_string_free(uid_hex);
     reader_enter_emulating(app, nfc_device_get_protocol_name(app->display_protocol));
 }
 
@@ -391,6 +421,7 @@ void reader_nfc_handle_scanned(ReaderApp* app) {
     // Restart every per-read state so a rescan begins cleanly.
     app->mfc_pass = 0;
     app->mfc_sector = 0;
+    app->mfc_recovery_pending = false;
     memset(&app->emv, 0, sizeof(app->emv)); // no stale bank data from a previous card
     app->emv_reactivate = false; // first Ready → halt+reactivate to reset card app state
     app->poller = nfc_poller_alloc(app->nfc, app->poll_protocol);
@@ -408,6 +439,30 @@ void reader_nfc_handle_read(ReaderApp* app) {
     reader_stop_all(app);
     app->toolkit->gen++;
     app->card = ReaderCardNfc;
+
+    // If the MfClassic poller finished but left sectors locked, run a
+    // key-recovery pass before rendering. The recovery poller runs on the
+    // GUI thread so it never overlaps with the read poller (which is already
+    // stopped above).
+    if(app->mfc_recovery_pending) {
+        app->mfc_recovery_pending = false;
+        const MfClassicData* partial =
+            (const MfClassicData*)nfc_device_get_data(app->device, NfcProtocolMfClassic);
+        if(partial) {
+            MfClassicData* recovered = mf_classic_alloc();
+            mf_classic_copy(recovered, partial);
+
+            size_t uid_len = 0;
+            const uint8_t* uid = mf_classic_get_uid(recovered, &uid_len);
+
+            furi_timer_start(
+                app->phase_timer, furi_ms_to_ticks(MFC_RECOVERY_TIMEOUT_MS));
+            mfc_recover_keys(app->nfc, uid, uid_len, recovered);
+            nfc_device_set_data(app->device, NfcProtocolMfClassic, recovered);
+            mf_classic_free(recovered);
+        }
+    }
+
     reader_report_begin(app);
     card_info_format_nfc(app->info_text, app->device, app->display_protocol, &app->emv);
     if(reader_is_payment_card(app)) {

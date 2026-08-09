@@ -35,6 +35,7 @@
 #define READ_TIMEOUT_MS 2500
 #define EMV_READ_TIMEOUT_MS 8000 // fallback tries 10 AIDs before GPO/records
 #define MFC_READ_TIMEOUT_MS      12000 // 2 key passes x up to 80 sector requests
+#define MFC_RECOVERY_TIMEOUT_MS  60000 // nested key recovery can take tens of seconds
 #define MFUL_READ_TIMEOUT_MS     8000
 #define ISO15693_READ_TIMEOUT_MS 8000  // full block dump inside activate
 #define FELICA_READ_TIMEOUT_MS   6000
@@ -147,6 +148,7 @@ typedef struct {
     bool emv_reactivate; // 4A poller: halt+reactivate once before emv_read
     uint8_t mfc_pass; // MfClassic key pass: 0 = key A, 1 = key B
     uint8_t mfc_sector; // MfClassic next sector to offer a key for
+    bool mfc_recovery_pending; // MfClassic read succeeded but some sectors are still locked
 
     // LF side
     ProtocolDict* dict;

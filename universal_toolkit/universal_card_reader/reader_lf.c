@@ -63,7 +63,14 @@ void reader_start_lf_emulation(ReaderApp* app) {
     lfrfid_worker_emulate_start(app->worker, (LFRFIDProtocol)app->lf_protocol);
     app->lf_emulating = true;
     const char* name = protocol_dict_get_name(app->dict, app->lf_protocol);
-    FURI_LOG_I(TAG, "emulating LF: %s", name ? name : "Unknown");
+    FuriString* id_hex = furi_string_alloc();
+    reader_cat_hex(id_hex, app->scratch_id, app->scratch_id_len);
+    FURI_LOG_I(
+        TAG,
+        "emulating LF: %s, ID %s",
+        name ? name : "Unknown",
+        furi_string_get_cstr(id_hex));
+    furi_string_free(id_hex);
     reader_enter_emulating(app, name ? name : "LF card");
 }
 
