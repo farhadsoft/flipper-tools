@@ -4,6 +4,7 @@
 
 #include <gui/view.h>
 #include <furi_hal_gpio.h>
+#include <furi_hal_power.h>
 #include <furi_hal_rtc.h>
 
 // The 8 pins on the Flipper Zero's external GPIO header -- confirmed
@@ -39,26 +40,54 @@ typedef struct {
     FuriTimer* refresh_timer;
 } GpioInfoCtx;
 
+#define GPIO_INFO_FLASH_TICKS 3 // ~600 ms at the 200 ms refresh tick
 typedef struct {
     bool level[GPIO_INFO_PIN_COUNT];
+    uint8_t flash[GPIO_INFO_PIN_COUNT]; // >0 = cell drawn inverted; decrements each tick
+    uint8_t phase; // status-bar animation phase
+    uint8_t battery; // furi_hal_power_get_pct()
 } GpioInfoModel;
 
 /* --------------------------------- draw ------------------------------------ */
 
+#define GPIO_GRID_ROW_Y0  20 // row baselines: 20, 28, 36, 44 (8 px pitch)
+#define GPIO_GRID_CELL_H   8
+#define GPIO_GRID_COL0_X   6 // left column label x
+#define GPIO_GRID_COL1_X  70 // right column label x
+#define GPIO_GRID_DISC_DX 26 // disc center = label x + 26
+#define GPIO_GRID_DIV_X   64 // column divider x
+
 static void gpio_info_draw_callback(Canvas* canvas, void* model) {
     GpioInfoModel* m = model;
     canvas_clear(canvas);
-    ui_status_bar(canvas, "GPIO Info", NULL, 0, 0, 0);
+    ui_status_bar(canvas, "GPIO", NULL, UiStatusLive, m->battery, m->phase);
+
+    canvas_draw_line(canvas, GPIO_GRID_DIV_X, UI_RULE_Y + 2, GPIO_GRID_DIV_X, UI_FOOTER_Y - 1);
 
     for(size_t i = 0; i < GPIO_INFO_PIN_COUNT; i++) {
-        int x = 4 + (int)(i % 2) * 64;
-        int y = 26 + (int)(i / 2) * 11;
-        char line[16];
-        snprintf(line, sizeof(line), "%s: %s", gpio_info_pin_names[i], m->level[i] ? "hi" : "lo");
-        canvas_draw_str(canvas, x, y, line);
+        int col = (int)(i % 2);
+        int row = (int)(i / 2);
+        int x = col ? GPIO_GRID_COL1_X : GPIO_GRID_COL0_X;
+        int y = GPIO_GRID_ROW_Y0 + row * GPIO_GRID_CELL_H;
+
+        if(m->flash[i] > 0) {
+            canvas_draw_box(canvas, x - 2, y - 6, 36, 8);
+            canvas_set_color(canvas, ColorWhite);
+        }
+
+        canvas_draw_str(canvas, x, y, gpio_info_pin_names[i]);
+        if(m->level[i]) {
+            canvas_draw_disc(canvas, x + GPIO_GRID_DISC_DX, y - 3, 2);
+        } else {
+            canvas_draw_circle(canvas, x + GPIO_GRID_DISC_DX, y - 3, 2);
+        }
+
+        if(m->flash[i] > 0) {
+            canvas_set_color(canvas, ColorBlack);
+        }
     }
 
-    canvas_draw_str(canvas, 4, 62, "Back: exit module");
+    ui_draw_centered(canvas, UI_FOOTER_Y, "Back: exit module");
 }
 
 /* -------------------------------- timer ------------------------------------ */
@@ -130,7 +159,18 @@ bool gpio_info_event(ToolkitApp* app, uint32_t id) {
     }
 
     with_view_model(
-        ctx->view, GpioInfoModel * m, { memcpy(m->level, level, sizeof(level)); }, true);
+        ctx->view,
+        GpioInfoModel * m,
+        {
+            for(size_t i = 0; i < GPIO_INFO_PIN_COUNT; i++) {
+                if(level[i] != m->level[i]) m->flash[i] = GPIO_INFO_FLASH_TICKS;
+                else if(m->flash[i] > 0) m->flash[i]--;
+            }
+            memcpy(m->level, level, sizeof(level));
+            m->phase++;
+            m->battery = furi_hal_power_get_pct();
+        },
+        true);
     return true;
 }
 

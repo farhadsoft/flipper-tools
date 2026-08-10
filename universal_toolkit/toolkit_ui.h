@@ -23,6 +23,8 @@ typedef enum {
     UiStatusRecording = (1u << 0), // filled disc, blinks with phase
     UiStatusArmed     = (1u << 1), // hollow circle
     UiStatusScanning  = (1u << 2), // scan sweep chevron
+    UiStatusLive      = (1u << 3), // small disc, blinks with phase (live/monitoring)
+    UiStatusBle       = (1u << 4), // bluetooth rune (static)
 } UiStatus;
 
 /* ----------------------------- shared chrome ------------------------------- */

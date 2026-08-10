@@ -30,6 +30,20 @@ static void draw_scan_glyph(Canvas* canvas, int x, int y) {
     canvas_draw_line(canvas, x - 3, y + 3, x, y);
 }
 
+// Small blinking dot for live/monitoring.  frame 0-3 on, 4-7 off.
+static void draw_live_glyph(Canvas* canvas, int x, int y, uint8_t phase) {
+    if((phase & 4) == 0) canvas_draw_disc(canvas, x, y, 1);
+}
+
+// Bluetooth rune: vertical stem + two chevron halves, ~5x6 px.
+static void draw_ble_glyph(Canvas* canvas, int x, int y) {
+    canvas_draw_line(canvas, x, y - 3, x, y + 3); // stem
+    canvas_draw_line(canvas, x, y - 3, x - 2, y - 1); // upper left
+    canvas_draw_line(canvas, x, y - 3, x + 2, y - 1); // upper right
+    canvas_draw_line(canvas, x, y + 3, x - 2, y + 1); // lower left
+    canvas_draw_line(canvas, x, y + 3, x + 2, y + 1); // lower right
+}
+
 // Battery icon: frame + nub + proportional fill.
 // Frame is 10x6; nub is 2x3 to the right. Fill width = batt * 8 / 100.
 static void draw_battery(Canvas* canvas, int x, int y, uint8_t pct) {
@@ -87,6 +101,12 @@ void ui_status_bar(
         text_x = UI_MARGIN + 8;
     } else if(flags & UiStatusScanning) {
         draw_scan_glyph(canvas, UI_MARGIN + 3, 6);
+        text_x = UI_MARGIN + 8;
+    } else if(flags & UiStatusLive) {
+        draw_live_glyph(canvas, UI_MARGIN + 3, 6, phase);
+        text_x = UI_MARGIN + 8;
+    } else if(flags & UiStatusBle) {
+        draw_ble_glyph(canvas, UI_MARGIN + 3, 6);
         text_x = UI_MARGIN + 8;
     }
 
