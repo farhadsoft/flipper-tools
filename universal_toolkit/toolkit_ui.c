@@ -113,9 +113,18 @@ void ui_status_bar(
     // -- text --
     if(center_label && center_label[0]) {
         // Two-label mode: left label after glyph, center label centered.
-        canvas_draw_str(canvas, text_x, 10, left_label ? left_label : "");
+        // If the centered label is too long, drop the left label to avoid overlap.
+        const char* ll = left_label ? left_label : "";
+        int lw = canvas_string_width(canvas, ll);
         int cw = canvas_string_width(canvas, center_label);
-        canvas_draw_str(canvas, (UI_W - cw) / 2, 10, center_label);
+        int cx = (UI_W - cw) / 2;
+        if(text_x + lw + 4 > cx) {
+            // Collision: show center label only.
+            canvas_draw_str(canvas, cx, 10, center_label);
+        } else {
+            canvas_draw_str(canvas, text_x, 10, ll);
+            canvas_draw_str(canvas, cx, 10, center_label);
+        }
     } else {
         // Single-label mode: center the left label (current title-bar behaviour).
         const char* s = or_default(left_label, "");

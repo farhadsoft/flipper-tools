@@ -84,16 +84,17 @@ static void ble_findmy_draw_callback(Canvas* canvas, void* model) {
         canvas_draw_circle(canvas, BLE_WAVE_X, BLE_WAVE_Y, BLE_WAVE_ARC1);
     }
 
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 38, 24, m->beacon_active ? "On air" : "Stopped");
     canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 38, 24, m->key_hint);
 
-    canvas_draw_str(canvas, 38, 33, m->key_hint);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 38, 36, m->beacon_active ? "On air" : "Stopped");
 
+    canvas_set_font(canvas, FontSecondary);
     char line[24];
     snprintf(
         line, sizeof(line), "Int %lu s", (unsigned long)(BLE_FINDMY_ADV_INTERVAL_MS / 1000));
-    canvas_draw_str(canvas, 38, 42, line);
+    canvas_draw_str(canvas, 38, 43, line);
 
     canvas_draw_str(canvas, UI_MARGIN, UI_FOOTER_Y, m->beacon_active ? "OK: Stop" : "OK: Start");
 }
@@ -306,7 +307,7 @@ void ble_findmy_enter(ToolkitApp* app) {
         app->view_dispatcher,
         TOOLKIT_VIEW_BASE_BLE_FINDMY + BleFindMyViewKeyPick,
         submenu_get_view(ctx->key_menu));
-    submenu_set_header(ctx->key_menu, "Find My keys");
+    submenu_set_header(ctx->key_menu, "Find My Keys");
     for(uint8_t r = 0; r < ctx->key_count; r++) {
         submenu_add_item(
             ctx->key_menu,
