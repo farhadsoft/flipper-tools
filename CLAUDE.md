@@ -2331,6 +2331,100 @@ read at the start of this session, and `storage list /ext/subghz/auto_rec` confi
 remaining 2 carry low residual risk from shared/unchanged code, not from anything unverified in
 the new drawing logic itself.
 
+### gpio_info + ble_findmy Mono UI redesign -- 2026-08-10
+
+Verified device: Momentum `mntm-dev` `8ed809fb`, API 87.1, COM4 (`device_info`
+re-confirmed live at the start of this session, matching the block above
+exactly -- no drift; ufbt SDK also re-checked, API 87.1, still official
+1.4.3/release).
+
+Applied the mono design system to the last two unfixed modules.
+**`gpio_info`** (pure UI, behavior untouched): the flat 8-line pin list
+becomes a 2x4 grid (filled disc = HIGH, hollow ring = LOW) split by a
+vertical divider, plus a brief invert-highlight flash (`GPIO_INFO_FLASH_TICKS`,
+~600 ms) on level change and a live pulse-dot + battery in the status bar.
+**`ble_findmy`** gains a feature it never had -- the beacon used to
+auto-start on enter with the compile-time example key; it now lands on a
+native-chrome key-pick Submenu that enumerates `.key` files from
+`/ext/apps_data/ble_findmy` (seeding one `default.key` from the compile-time
+key when the directory is empty), and OK on the status view toggles
+start/stop. Picking a key always stops-then-starts the beacon, even for the
+same key, so the on-screen key hint can never drift from what Core2 is
+actually broadcasting. Exit still deliberately leaves the beacon running
+(unchanged persistence invariant). `toolkit_ui.{h,c}` grew two glyphs for
+this: `UiStatusLive` (small blinking dot) and `UiStatusBle` (static
+bluetooth rune), following the existing `draw_rec_glyph`/`draw_armed_glyph`
+pattern exactly.
+
+**Screen-capture decode correction, worth flagging for the next session:**
+the bit-order gotcha recorded above (SubGHz Recorder pass) is right about
+LSB-first bits, but the byte-to-pixel mapping it documents
+(`byte = data[y*16 + x/8]`, i.e. row-major) produced unreadable noise on
+every capture this session, including the idle launcher's own menu text.
+The `rpc_gui_snapshot_screen()` buffer is page-tiled (u8g2/SSD1306-style):
+`byte = data[(y/8)*128 + x]`, `bit = (byte >> (y % 8)) & 1` -- confirmed
+beyond doubt by decoding the launcher's "Universal Toolkit / GPIO Info /
+Card Reader / RFID Multi" text legibly with this formula and only this one.
+Whether the discrepancy is a different capture path or a genuine formula
+error in the earlier note, use the page-tiled formula going forward.
+
+**Verified this session (device, COM4, RPC screen captures decoded to PNG
+with the corrected formula above):**
+- Build: `ufbt` clean, zero warnings, `APPCHK` Target 7 / API 87.1, both
+  before and after the c-review fixes below.
+- gpio: status bar shows "GPIO" + pulsing live dot (confirmed changed
+  between two captures ~1.2 s apart) + battery; 2x4 grid with divider;
+  all 8 pins floating read as hollow rings (LOW), matching the old
+  text-list build's "lo" readings pin-for-pin. Flash/invert-on-change
+  **not exercised** -- no physical jumper reachable over RPC; the plan's
+  own fallback for this case.
+- ble: key submenu (native Submenu, header "Find My keys", seeded
+  `default.key`) -> pick -> On air (3 pulsing wave rings, confirmed
+  changed between captures ~1 s apart, "Key 00 01 02 03", "Int 2 s",
+  footer "OK: Stop") -> OK -> Stopped (static 2-ring wave, "OK: Start")
+  -> OK -> On air again -> Back -> key submenu -> Back -> launcher.
+- Persistence: full app restart (`loader close` + `rpc_app_start`) ->
+  key submenu still shows `default.key` -> pick -> On air; repeated for
+  a third independent enter/exit/pick cycle with identical results (no
+  state leak across malloc/free cycles).
+- Negative path: `bad.key` (non-hex) written alongside `default.key` ->
+  submenu lists both -> picking `bad.key` stays on the submenu (no
+  crash) -> picking `default.key` still works. Both files then deleted
+  -> re-enter -> `default.key` re-seeded and listed alone -> works.
+- Hygiene: 22 threads with the app open / 21 with it closed (matches the
+  documented 22-thread baseline exactly -- the delta is the app's own
+  thread, not a leak); `universal_toolkit` app-thread Stack Min 15204/16380
+  free; `Heap: minimum` identical (696) before and after the full
+  sequence above despite several more enter/exit cycles in between --
+  no leak; `uptime` strictly monotonic throughout (no crash-reboot).
+
+**`flipper-c-review` pass:** two `smell`s found and fixed (rebuilt +
+re-smoke-tested after): (1) `ble_findmy_enter()` set `ctx->current_view`
+directly instead of through `ble_findmy_switch_view()`, its documented
+sole writer -- now routed through the helper. (2) `ble_findmy_enumerate_keys()`
+had `storage_dir_read()` as the right operand of `&&`, gated by the
+key-count cap -- harmless here (the loop's intent *is* to stop reading once
+full) but matches the checklist's flagged shape, so the cap moved inside
+the loop body as a `break`. No defects. Repo-mandated
+`view_dispatcher_stop`/`toolkit_exit_module_now` grep: zero hits in either
+changed file.
+
+**`flipper-perf-review` pass:** gpio's 200 ms refresh keeps the original,
+unmodified unconditional `with_view_model(..., true)` repaint (~5 Hz) --
+pre-existing, out of scope (plan invariant: refresh timer untouched).
+ble's 500 ms refresh timer is now gated by `ble_findmy_switch_view()` to
+only run while the status view is showing, an improvement over the old
+single-view build where it ran continuously -- confirmed by design, not
+separately timed on-device. File I/O (enumerate/read/seed) never overlaps
+a running timer (both happen only while the key submenu owns the screen,
+timer stopped). No new worker thread; the beacon runs through the
+existing system `bt` service, not a thread this module owns. Not
+captured: microsecond-level file I/O latency (no instrumentation added;
+reasoned low-risk from I/O volume alone -- one ~56-byte read/write per
+key op) and a live `log debug` stream for the negative-path warning line
+(relied on the screen staying on the submenu instead, which is the actual
+contract).
+
 ---
 
 # iButton Brute Force
