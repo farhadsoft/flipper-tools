@@ -122,12 +122,17 @@ static void ble_findmy_start_beacon(BleFindMyCtx* ctx) {
         .adv_power_level = GapAdvPowerLevel_0dBm,
         .address_type = GapAddressTypeRandom,
     };
-    // findmy_build_mac() returns MSB-first (address[0] = pubkey[0] | 0xC0).
-    // Unverified whether the STM32WB HAL expects transmission order
-    // (LSB-first) or this logical order here -- confirm with an on-air
-    // scanner (nRF Connect / LightBlue) before relying on tracking. If
-    // reversed, swap to a byte-reversed build here, not in the domain.
+    // findmy_build_mac() returns the logical MSB-first MAC
+    // (address[0] = pubkey[0] | 0xC0), matching the OpenHaystack reference.
+    // STM32WB's aci_gap_additional_beacon_start sends the address bytes
+    // LSB-first over the air, so reverse them here (not in the domain
+    // function) so scanners observe the reference MAC order.
     findmy_build_mac(ctx->active_key, config.address);
+    for(size_t i = 0; i < EXTRA_BEACON_MAC_ADDR_SIZE / 2; i++) {
+        uint8_t tmp = config.address[i];
+        config.address[i] = config.address[EXTRA_BEACON_MAC_ADDR_SIZE - 1 - i];
+        config.address[EXTRA_BEACON_MAC_ADDR_SIZE - 1 - i] = tmp;
+    }
     if(!furi_hal_bt_extra_beacon_set_config(&config)) {
         FURI_LOG_W(TAG, "extra beacon set_config failed");
     }

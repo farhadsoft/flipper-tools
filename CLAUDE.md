@@ -1607,18 +1607,17 @@ same contract.
 
 ## Verified firmware / SDK — re-check before you build (STEP 0)
 
-Verified **2026-08-06**: `device_info` read live off the device, matching the
-block already recorded under "Universal Card Reader" above exactly (same
-commit, same build date, same fork) — no redo of the fork-ABI diff needed,
-see that section for the full NfcProtocol/LFRFIDProtocol/MfClassic drift.
-Phase 0 does not touch NFC, LF RFID, SubGHz, BLE, or BadUSB at all, so none of
-that documented drift applies here; the only APIs in play (`view_dispatcher_*`,
-`submenu_*`, `furi_hal_gpio_*`, `furi_timer_*`, `furi_hal_rtc_get_timestamp`,
-`flipper_format_*`, `storage_simply_mkdir`) were individually confirmed
-present and linkable (`Function,+`) in `api_symbols.csv`, and the
-view-remove/re-add-by-id semantics this whole contract rests on were
-confirmed against the firmware's own `view_dispatcher.c` source (see
-Architecture below), not inferred.
+Verified **2026-08-10**: `device_info` read live over the CLI (COM4) this
+session: Momentum `mntm-dev` commit `8ed809fb` built 03-06-2026, API 87.1,
+`hardware_target` 7. ufbt SDK is official `1.4.3` release, API 87.1,
+`hw_target` f7 — exact match, no drift since the 2026-08-06 check. The
+NfcProtocol/LFRFIDProtocol/MfClassic drift notes in the Universal Card Reader
+section still apply to modules that use those surfaces; for BLE, this session
+confirms `BleGlueC2ModeStack` remains value `2` on Momentum and the extra
+beacon APIs (`furi_hal_bt_extra_beacon_set_config/_set_data/_start/_stop`)
+link and run as on official firmware. All APIs touched by the current
+universal_toolkit build were re-confirmed present and linkable
+(`Function,+`) in `api_symbols.csv`.
 
 | | Device | ufbt SDK |
 |---|---|---|
@@ -2424,6 +2423,60 @@ reasoned low-risk from I/O volume alone -- one ~56-byte read/write per
 key op) and a live `log debug` stream for the negative-path warning line
 (relied on the screen staying on the submenu instead, which is the actual
 contract).
+
+### Screen re-capture + beacon on-air verification -- 2026-08-10 (follow-up)
+
+Revisited the same Momentum `mntm-dev` `8ed809fb` device on COM4 with the
+corrected u8g2/SSD1306 page-tiled decoder:
+`byte = data[(y/8)*128 + x]`, `bit = (byte >> (y % 8)) & 1`. All captures
+below were decoded with this formula and are legible at 128x64.
+
+**BLE FindMy beacon on-air (F2):**
+- Built and flashed the current FAP; default key `00 01 02 ... 1b` selected.
+- Scanned with `bleak` on the host PC (substitute for nRF Connect/LightBlue).
+- Initial code sent the logical MSB-first MAC `{C0,01,02,03,04,05}` straight
+  to `furi_hal_bt_extra_beacon_set_config()`. The on-air scanner observed the
+  byte-reversed address `05:04:03:02:01:C0` with the expected 25-byte Apple
+  manufacturer data `121900060708090a0b0c0d0e0f101112131415161718191a1b0000`.
+- Fixed in `modules/ble_findmy/ble_findmy.c`: reverse the 6-byte MAC after
+  `findmy_build_mac()` and before `furi_hal_bt_extra_beacon_set_config()`.
+  The domain function `findmy_build_mac()` was left untouched so it still
+  matches the OpenHaystack reference byte-for-byte.
+- Rebuilt, flashed, and rescanned: beacon now appears at the reference MAC
+  `C0:01:02:03:04:05` with the same correct payload. `BleGlueC2ModeStack`
+  value `2` remains valid on this Momentum build; the extra-beacon APIs link
+  and run as on official firmware.
+
+**Re-captured SubGHz Recorder screens (all 8):**
+| Screen | Captured | Notes |
+|---|---|---|
+| Armed | Yes | 433.92 MHz AM650, RSSI bar, "armed", footer counts |
+| Scan | Yes | frequency sweep bars, peak caret, 390/433 MHz peaks |
+| Analyze Info | Yes | hero freq, AM650 chip, Proto: RAW, 102 spl, 588 B |
+| Analyze Waveform | Yes | FIT waveform block, alternating barcode pattern |
+| Stats | Yes | 1 file, 0 KiB, raw/dec/rc line |
+| Notice | Yes | ethics gate "Own devices only" |
+| Recording | Yes | "RECORDING" status, "rec 1234 spl", same draw path as Armed |
+| Sending | Yes | filename centered, "..." progress dots |
+
+The Analyze/Recording/Sending screens were reached through a temporary
+menu bypass during this verification pass only. The stock
+`dialog_file_browser_show()` → `SubRecViewFileMenu` path crashes this
+Momentum build whenever an RPC screen-capture session runs while the file
+browser/file-menu transition is in flight; the bypass was removed before
+the final build. The bypass only changed navigation, not the draw
+functions, so the captured layout remains representative of the shipping
+code path.
+
+**Other screens captured:**
+- GPIO Info default state (2x4 grid, live pulse dot, battery icon).
+- BLE FindMy: key submenu (`default.key`), On air (pulsing rings), Stopped
+  (static rings).
+
+**Cleanup verified:**
+- Synthetic `/ext/subghz/auto_rec/AR_4339_test.sub` removed; directory empty.
+- `/ext/apps_data/ble_findmy/` contains only the seeded `default.key`.
+- SubGHz settings: `Frequency: 418000000`, `Trigger: 3` (defaults).
 
 ---
 
