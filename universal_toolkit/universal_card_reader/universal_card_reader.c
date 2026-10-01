@@ -276,8 +276,9 @@ static bool reader_load_emv_file(ReaderApp* app, const char* full) {
     if(ok) {
         app->card = ReaderCardEmvFile;
         if(app->emv.has_transport) {
-            // v3 file: the 4A transport was restored into the device, so
-            // Emulate can run exactly like a live ISO14443-4A read.
+            // v3/v4 file: the 4A transport was restored into the device, so
+            // Emulate can run exactly like a live ISO14443-4A read. A v4 file
+            // also carries the replay capture, armed below via has_replay.
             app->display_protocol = NfcProtocolIso14443_4a;
             app->poll_protocol = NfcProtocolIso14443_4a;
         }
@@ -499,7 +500,7 @@ static void reader_do_emulate(ReaderApp* app) {
             reader_show_notice(app, "Blocked", "no transport data", "in .emv file", ReaderViewInfo);
             return;
         }
-        reader_start_nfc_emulation(app);
+        reader_start_nfc_emulation(app, app->emv.has_replay);
         return;
     }
 
@@ -507,11 +508,15 @@ static void reader_do_emulate(ReaderApp* app) {
         reader_start_lf_emulation(app);
         return;
     }
-    // EMV / bank card: emulate at ISO14443-4A level (UID + ATS).
-    // The card presents its full data (PAN, expiry, AIDs, track2, log) to any
-    // reader that queries it, just like the original card.
+    // EMV / bank card: ISO14443-4A transport (UID + ATS) plus, when emv_read()
+    // captured one, an application-layer replay of the SELECT PPSE / SELECT AID
+    // / GPO / READ RECORD responses the real card gave. GENERATE AC answers
+    // 6985: online authorisation needs an ARQC computed under the issuer's
+    // secret key, which is sealed in the card's secure element -- unreadable,
+    // uncaptured, not reproducible. A terminal therefore recognises and
+    // processes the card, then declines at the cryptogram step.
     if(reader_is_payment_card(app)) {
-        reader_start_nfc_emulation(app);
+        reader_start_nfc_emulation(app, app->emv.has_replay);
         return;
     }
     if(!reader_protocol_emulatable(app->poll_protocol)) {
@@ -520,7 +525,7 @@ static void reader_do_emulate(ReaderApp* app) {
             ReaderViewInfo);
         return;
     }
-    reader_start_nfc_emulation(app);
+    reader_start_nfc_emulation(app, false);
 }
 
 static void reader_handle_phase_timeout(ReaderApp* app) {

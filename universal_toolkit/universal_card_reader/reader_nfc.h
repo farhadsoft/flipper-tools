@@ -13,7 +13,9 @@ bool reader_protocol_emulatable(NfcProtocol p);
 
 void reader_stop_nfc(ReaderApp* app);
 void reader_start_nfc_phase(ReaderApp* app);
-void reader_start_nfc_emulation(ReaderApp* app);
+// `emv_replay` asks for the EMV application-layer responder on top of the
+// transport listener; it is armed only when a replay was actually captured.
+void reader_start_nfc_emulation(ReaderApp* app, bool emv_replay);
 
 bool reader_is_payment_card(const ReaderApp* app);
 

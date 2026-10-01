@@ -479,6 +479,20 @@ static void emv_parse_log_record(
 
 /* --------------------------- APDU transport ---------------------------- */
 
+// Snapshot the final response INF (body + SW) still sitting in `rx` into a
+// replay blob, for the application-layer emulation in emv_emulate.c. `rx`
+// always holds the resolved final response here -- emv_apdu() has already
+// followed any 61xx/6Cxx continuation -- so a replay answers directly with
+// the final 9000 form. A response too big for the blob is dropped rather than
+// truncated: half an FCI would mis-frame the terminal's BER-TLV walk.
+static void emv_capture(const BitBuffer* rx, uint8_t* dst, uint16_t cap, uint16_t* dst_len) {
+    *dst_len = 0;
+    size_t n = bit_buffer_get_size_bytes(rx);
+    if(n == 0 || n > cap) return;
+    bit_buffer_write_bytes(rx, dst, n);
+    *dst_len = (uint16_t)n;
+}
+
 // Sends one already-built APDU, waits for the response, and splits SW1SW2
 // off it. A transport error or a response shorter than 2 bytes is reported
 // as `false`/`sw = 0`; anything else is `true` regardless of the actual SW,
@@ -658,6 +672,7 @@ static bool
     if(!ok || sw != EMV_SW_OK || out->aid_count == 0) return false;
 
     out->ppse_ok = true;
+    emv_capture(rx, out->replay.ppse, EMV_REPLAY_MAX_LEN, &out->replay.ppse_len);
     return true;
 }
 
@@ -697,6 +712,16 @@ static bool emv_select_aid(
 
         out->aid_selected = true;
         out->aid_selected_idx = i;
+        // Application-layer replay: the selected AID's FCI, plus the AID
+        // itself so emv_emu_apdu() can match a SELECT against it. Covers the
+        // fallback-AID path too -- emv_try_fallback_aids() only pre-seeds
+        // out->aid[], and this function re-selects afterwards.
+        emv_capture(rx, out->replay.adf, EMV_REPLAY_MAX_LEN, &out->replay.adf_len);
+        if(out->replay.adf_len > 0) {
+            out->replay.adf_aid_len =
+                (uint8_t)(alen < EMV_REPLAY_AID_MAX ? alen : EMV_REPLAY_AID_MAX);
+            memcpy(out->replay.adf_aid, out->aid[i], out->replay.adf_aid_len);
+        }
 
         const uint8_t* v;
         size_t vlen;
@@ -791,6 +816,7 @@ static void emv_gpo(
             }
         }
         out->gpo_ok = true;
+        emv_capture(rx, out->replay.gpo, EMV_REPLAY_MAX_LEN, &out->replay.gpo_len);
     }
 
     FURI_LOG_I(TAG, "GPO sw=%04X afl=%u", (unsigned)sw, (unsigned)(*afl_len / 4));
@@ -833,7 +859,19 @@ static void emv_read_records(
                 (unsigned)sw,
                 (unsigned)body_len);
 
-            if(ok && sw == EMV_SW_OK) emv_harvest(body, body_len, out);
+            if(ok && sw == EMV_SW_OK) {
+                // Store the raw record response for replay before harvesting
+                // fields out of it. A capture that fails (oversized response)
+                // simply is not stored: rec_count only advances on success.
+                if(out->replay.rec_count < EMV_REPLAY_MAX_RECORDS) {
+                    EmvReplayRecord* rr = &out->replay.rec[out->replay.rec_count];
+                    rr->sfi = sfi;
+                    rr->num = (uint8_t)rec;
+                    emv_capture(rx, rr->data, EMV_REPLAY_MAX_LEN, &rr->len);
+                    if(rr->len > 0) out->replay.rec_count++;
+                }
+                emv_harvest(body, body_len, out);
+            }
         }
     }
 }
@@ -1028,13 +1066,17 @@ bool emv_read(Iso14443_4aPoller* poller, EmvData* out) {
 
     bit_buffer_free(tx);
     bit_buffer_free(rx);
+    // One selected AID's FCI is the minimum an application-layer exchange
+    // needs; without it the responder stays unarmed and emulation is
+    // transport-only, exactly as before.
+    out->has_replay = out->replay.adf_len > 0;
     return out->aid_selected;
 }
 
 /* -------------------------- save / load --------------------------- */
 
 #define EMV_FILE_TYPE        "Universal EMV Card"
-#define EMV_FILE_VERSION     3 // v3 adds the ISO14443-4A transport block (UID/ATQA/SAK/ATS)
+#define EMV_FILE_VERSION     4 // v4 adds the raw APDU replay capture ("Replay *" keys)
 #define EMV_FILE_MIN_VERSION 2 // v2 (financial fields only) still loads, just cannot emulate
 
 static const struct {
@@ -1120,6 +1162,43 @@ static bool emv_save_transport(FlipperFormat* ff, const NfcDevice* device) {
     return iso14443_4a_save(transport, ff);
 }
 
+// Application-layer replay capture (v4). Skipped when nothing was captured, so
+// a card that never answered SELECT AID writes the same keys a v3 file did.
+// Per-record keys are indexed the way emv_save_aids()/emv_save_log() index
+// theirs; a record's length is its hex value count, so no separate length key.
+static bool emv_save_replay(FlipperFormat* ff, const EmvData* data) {
+    if(!data->has_replay) return true;
+    const EmvReplay* r = &data->replay;
+    // No AID means emv_emu_apdu() could never match a SELECT, so there is
+    // nothing worth persisting.
+    if(r->adf_aid_len == 0 || r->adf_len == 0) return true;
+
+    if(r->ppse_len > 0 && !flipper_format_write_hex(ff, "Replay PPSE", r->ppse, r->ppse_len)) {
+        return false;
+    }
+    if(!flipper_format_write_hex(ff, "Replay ADF AID", r->adf_aid, r->adf_aid_len)) return false;
+    if(!flipper_format_write_hex(ff, "Replay ADF", r->adf, r->adf_len)) return false;
+    if(r->gpo_len > 0 && !flipper_format_write_hex(ff, "Replay GPO", r->gpo, r->gpo_len)) {
+        return false;
+    }
+
+    uint32_t count = r->rec_count;
+    if(!flipper_format_write_uint32(ff, "Replay Rec Count", &count, 1)) return false;
+    for(uint8_t i = 0; i < r->rec_count && i < EMV_REPLAY_MAX_RECORDS; i++) {
+        const EmvReplayRecord* rec = &r->rec[i];
+        char key[24]; // "Replay Rec 23 Data" is the longest
+        uint32_t v = rec->sfi;
+        snprintf(key, sizeof(key), "Replay Rec %u SFI", (unsigned)i);
+        if(!flipper_format_write_uint32(ff, key, &v, 1)) return false;
+        v = rec->num;
+        snprintf(key, sizeof(key), "Replay Rec %u Num", (unsigned)i);
+        if(!flipper_format_write_uint32(ff, key, &v, 1)) return false;
+        snprintf(key, sizeof(key), "Replay Rec %u Data", (unsigned)i);
+        if(!flipper_format_write_hex(ff, key, rec->data, rec->len)) return false;
+    }
+    return true;
+}
+
 bool emv_save(const EmvData* data, const NfcDevice* device, const char* path) {
     if(!data || !device || !path) return false;
 
@@ -1136,6 +1215,7 @@ bool emv_save(const EmvData* data, const NfcDevice* device, const char* path) {
         if(!emv_save_track2(ff, data)) break;
         if(!emv_save_log(ff, data)) break;
         if(!emv_save_transport(ff, device)) break;
+        if(!emv_save_replay(ff, data)) break;
 
         ok = true;
     } while(0);
@@ -1277,6 +1357,68 @@ static void emv_load_transport(
     iso14443_4a_free(transport);
 }
 
+// Variable-length hex field: the value count in the file IS the length, the
+// same trick emv_load_aids() uses. get_value_count() restores the cursor
+// itself and emv_load_hex() rewinds on a failed read, so a missing field
+// cannot strand the cursor for the ones after it.
+static bool emv_load_hex_var(
+    FlipperFormat* ff,
+    const char* key,
+    uint8_t* dst,
+    uint16_t cap,
+    uint16_t* out_len) {
+    uint32_t count = 0;
+    if(!flipper_format_get_value_count(ff, key, &count)) return false;
+    if(count == 0 || count > cap) return false;
+    if(!emv_load_hex(ff, key, dst, (uint16_t)count)) return false;
+    *out_len = (uint16_t)count;
+    return true;
+}
+
+// Application-layer replay capture (v4 files). Every key is optional: v2/v3
+// files carry none, so has_replay stays false and emulation remains
+// transport-only, exactly as before. A truncated or corrupt record group keeps
+// the records loaded so far -- each stored entry is self-consistent, and
+// emv_emu_apdu() only ever walks [0, rec_count).
+static void emv_load_replay(FlipperFormat* ff, EmvData* data) {
+    EmvReplay* r = &data->replay;
+
+    emv_load_hex_var(ff, "Replay PPSE", r->ppse, EMV_REPLAY_MAX_LEN, &r->ppse_len);
+    uint16_t aid_len = 0;
+    if(emv_load_hex_var(ff, "Replay ADF AID", r->adf_aid, EMV_REPLAY_AID_MAX, &aid_len)) {
+        r->adf_aid_len = (uint8_t)aid_len; // capped at EMV_REPLAY_AID_MAX above
+    }
+    if(!emv_load_hex_var(ff, "Replay ADF", r->adf, EMV_REPLAY_MAX_LEN, &r->adf_len)) return;
+    emv_load_hex_var(ff, "Replay GPO", r->gpo, EMV_REPLAY_MAX_LEN, &r->gpo_len);
+
+    uint32_t rec_count = 0;
+    if(!emv_load_u32(ff, "Replay Rec Count", &rec_count)) {
+        data->has_replay = true;
+        return;
+    }
+    // uint8_t, like emv_load_aids()'s own count: keeps the loop index and the
+    // snprintf'd key name provably in range.
+    uint8_t count = (uint8_t)(
+        rec_count > EMV_REPLAY_MAX_RECORDS ? EMV_REPLAY_MAX_RECORDS : rec_count);
+    for(uint8_t i = 0; i < count; i++) {
+        EmvReplayRecord* rec = &r->rec[i];
+        char key[24];
+        uint32_t v = 0;
+        // Truncating a corrupt out-of-range SFI/record number to uint8_t is
+        // safe: it simply never matches a real READ RECORD and answers 6A83.
+        snprintf(key, sizeof(key), "Replay Rec %u SFI", (unsigned)i);
+        if(!emv_load_u32(ff, key, &v)) break;
+        rec->sfi = (uint8_t)v;
+        snprintf(key, sizeof(key), "Replay Rec %u Num", (unsigned)i);
+        if(!emv_load_u32(ff, key, &v)) break;
+        rec->num = (uint8_t)v;
+        snprintf(key, sizeof(key), "Replay Rec %u Data", (unsigned)i);
+        if(!emv_load_hex_var(ff, key, rec->data, EMV_REPLAY_MAX_LEN, &rec->len)) break;
+        r->rec_count++;
+    }
+    data->has_replay = r->adf_len > 0;
+}
+
 bool emv_load(EmvData* data, NfcDevice* device, const char* path) {
     if(!data || !device || !path) return false;
 
@@ -1314,6 +1456,7 @@ bool emv_load(EmvData* data, NfcDevice* device, const char* path) {
         emv_load_track2(ff, data);
         emv_load_log(ff, data);
         emv_load_transport(ff, data, device, version);
+        emv_load_replay(ff, data);
 
         data->ppse_ok = true;
         ok = true;

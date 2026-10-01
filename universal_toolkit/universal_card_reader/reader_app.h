@@ -141,6 +141,11 @@ typedef struct {
     NfcScanner* scanner;
     NfcPoller* poller;
     NfcListener* listener; // NFC emulation, NULL when idle
+    // Application-layer EMV replay responder, armed by
+    // reader_start_nfc_emulation() and released by reader_stop_nfc(). Owned
+    // and defined in reader_nfc.c -- an opaque pointer here keeps this header
+    // free of the replay core's types.
+    struct EmvEmuState* emv_emu;
     NfcDevice* device;
     NfcProtocol display_protocol; // most-derived protocol, used for the name/chain
     NfcProtocol poll_protocol; // protocol the poller actually runs (ids 0..11 only)

@@ -3,6 +3,7 @@
 #include "card_info.h"
 #include "emv.h"
 #include "mfc_key_recovery.h"
+#include "emv_emulate.h"
 #undef TAG
 #include "../toolkit_app.h"
 #undef TAG
@@ -16,6 +17,24 @@
 #include <nfc/protocols/st25tb/st25tb_poller.h>
 #include <nfc/protocols/mf_ultralight/mf_ultralight_poller.h>
 #include <nfc/protocols/mf_classic/mf_classic_poller.h>
+#include <nfc/helpers/iso14443_crc.h>
+#include <nfc/protocols/iso14443_4a/iso14443_4a_listener.h>
+#include <toolbox/bit_buffer.h>
+
+#include <stdlib.h>
+
+// App-layer EMV replay responder state. Defined here and only pointed at from
+// ReaderApp::emv_emu (an opaque struct pointer), so no other file needs the
+// replay core's types. Heap-allocated because it is used on the firmware NFC
+// worker thread, whose stack this app deliberately keeps small.
+struct EmvEmuState {
+    const EmvReplay* replay; // borrowed from app->emv.replay, outlives the listener
+    BitBuffer* tx; // one response frame: PCB + INF chunk + CRC-A
+    uint8_t in_buf[EMV_REPLAY_MAX_LEN]; // received INF copy
+    uint8_t out_buf[EMV_REPLAY_MAX_LEN + 2]; // response INF from emv_emu_apdu()
+    uint8_t block_num; // toggles after each fully-sent response
+    uint16_t fsc; // frame size for proximity card, from the ATS T(0)
+};
 
 /*
  * NfcProtocolNum and NfcProtocolInvalid are NOT stable across firmware forks:
@@ -124,6 +143,13 @@ static uint32_t reader_read_timeout_for(NfcProtocol p) {
 void reader_stop_nfc(ReaderApp* app) {
     if(app->listener) {
         nfc_listener_stop(app->listener);
+        // nfc_listener_stop() has joined the worker thread, so no listener
+        // callback can be in flight and the responder state is ours to free.
+        if(app->emv_emu) {
+            bit_buffer_free(app->emv_emu->tx);
+            free(app->emv_emu);
+            app->emv_emu = NULL;
+        }
         nfc_listener_free(app->listener);
         app->listener = NULL;
     }
@@ -342,13 +368,73 @@ static void reader_scanner_callback(NfcScannerEvent event, void* context) {
         app->view_dispatcher, EVENT_MAKE(ReaderEventNfcScanned, app->toolkit->gen));
 }
 
-// NFC emulation listener callback. Runs on the NFC worker thread; the
-// listener itself answers reader commands from firmware-side protocol state,
-// so there is nothing for the app to do here but keep going until Back stops
-// the listener from the GUI thread.
+// Answer one received APDU with the captured replay. Runs on the NFC worker
+// thread inside the listener callback: no with_view_model, no GUI calls, no
+// storage -- the same invariant the poller callback follows.
+//
+// Framing. Momentum's iso14443_4_layer_decode_command() copies the INF right
+// of the ISO-DEP prologue, so the command's block number never reaches us; we
+// track the parity ourselves instead. Both sides start at 0 and toggle once
+// per exchanged block, so our counter equals the one the terminal used --
+// which is exactly what the firmware's own iso14443_4_layer_set_i_block()
+// does (it mirrors the received block number into the response PCB). Chaining
+// is done by hand because the firmware's listener-side send_block leaves it
+// unimplemented, and each frame is built precisely the way
+// iso14443_3a_listener_send_standard_frame() builds one: payload ->
+// iso14443_crc_append() -> nfc_listener_tx(). No CID byte: CID is negotiated
+// in RATS below this layer and never surfaces (see the README limitation).
+static void reader_emv_emu_respond(ReaderApp* app, const BitBuffer* rx) {
+    struct EmvEmuState* st = app->emv_emu;
+    size_t n = bit_buffer_get_size_bytes(rx);
+    if(n == 0 || n > sizeof(st->in_buf)) return;
+    bit_buffer_write_bytes(rx, st->in_buf, n);
+
+    size_t out_len = 0;
+    if(!emv_emu_apdu(st->replay, st->in_buf, n, st->out_buf, sizeof(st->out_buf), &out_len)) {
+        return;
+    }
+
+    size_t chunk = emv_emu_chunk_max(st->fsc);
+    if(chunk == 0 || chunk > sizeof(st->out_buf)) chunk = sizeof(st->out_buf);
+
+    for(size_t off = 0; off < out_len;) {
+        size_t part = out_len - off;
+        if(part > chunk) part = chunk;
+        const bool last = off + part >= out_len;
+
+        bit_buffer_reset(st->tx);
+        bit_buffer_append_byte(st->tx, emv_emu_pcb(st->block_num, !last));
+        bit_buffer_append_bytes(st->tx, st->out_buf + off, part);
+        iso14443_crc_append(Iso14443CrcTypeA, st->tx);
+        if(nfc_listener_tx(app->nfc, st->tx) != NfcErrorNone) {
+            // Abandon the chain and leave block_num alone: the terminal either
+            // re-sends or halts, and Halted/FieldOff below resynchronises us.
+            FURI_LOG_W(TAG, "emv emu tx fail");
+            return;
+        }
+        off += part;
+    }
+    st->block_num ^= 1;
+    FURI_LOG_I(TAG, "emv emu: %02X%02X -> %u B", st->in_buf[0], st->in_buf[1], (unsigned)out_len);
+}
+
+// NFC emulation listener callback. Runs on the NFC worker thread. The firmware
+// listener still answers everything below ISO-DEP (anticollision, activation,
+// RATS, HALTA); all this adds is the application layer on top of it, and only
+// while a replay is armed. For every other protocol it is a pass-through.
 static NfcCommand reader_listener_callback(NfcGenericEvent event, void* context) {
-    UNUSED(event);
-    UNUSED(context);
+    ReaderApp* app = context;
+    if(app->emv_emu && event.protocol == NfcProtocolIso14443_4a && event.event_data) {
+        Iso14443_4aListenerEvent* e = event.event_data;
+        if(e->type == Iso14443_4aListenerEventTypeReceivedData && e->data && e->data->buffer) {
+            reader_emv_emu_respond(app, e->data->buffer);
+        } else if(
+            e->type == Iso14443_4aListenerEventTypeHalted ||
+            e->type == Iso14443_4aListenerEventTypeFieldOff) {
+            // The terminal restarts ISO-DEP framing from block number 0.
+            app->emv_emu->block_num = 0;
+        }
+    }
     return NfcCommandContinue;
 }
 
@@ -369,25 +455,54 @@ void reader_start_nfc_phase(ReaderApp* app) {
 }
 
 // GUI thread only. Caller (reader_do_emulate()) has already checked
-// reader_protocol_emulatable(app->poll_protocol) and that this is not a
-// payment card.
-void reader_start_nfc_emulation(ReaderApp* app) {
+// reader_protocol_emulatable(app->poll_protocol). `emv_replay` additionally
+// asks for the application-layer responder; it is armed only when a replay was
+// really captured and the transport really is ISO14443-4A -- that protocol
+// check is what keeps nfc_device_get_data()'s internal furi_check satisfied.
+// A failed allocation is not fatal: emulation simply stays transport-only.
+void reader_start_nfc_emulation(ReaderApp* app, bool emv_replay) {
     reader_stop_all(app); // scanner/poller/LF worker released and joined first
     app->toolkit->gen++;
     const NfcDeviceData* data = nfc_device_get_data(app->device, app->poll_protocol);
     app->listener = nfc_listener_alloc(app->nfc, app->poll_protocol, data);
+
+    // Armed before nfc_listener_start() so the pointer is fully published
+    // before the worker thread exists -- reader_emv_emu_respond() then needs
+    // no synchronisation, and reader_stop_nfc() frees it only after the join.
+    if(emv_replay && app->emv.has_replay && app->poll_protocol == NfcProtocolIso14443_4a) {
+        // poll_protocol was just checked to be ISO14443-4A, so `data` -- fetched
+        // two lines up with that same protocol -- already is the 4A data. No
+        // second nfc_device_get_data() call, and its furi_check stays satisfied.
+        const Iso14443_4aData* d4 = (const Iso14443_4aData*)data;
+        struct EmvEmuState* st = malloc(sizeof(struct EmvEmuState));
+        if(st) {
+            memset(st, 0, sizeof(*st));
+            // One frame's worst case: PCB (1) + the largest INF chunk we can
+            // produce (out_buf) + CRC-A (2). bit_buffer_alloc() dereferences its
+            // own malloc unchecked, so it returns a live buffer or the device
+            // has already faulted -- there is no NULL path to handle.
+            st->tx = bit_buffer_alloc(EMV_REPLAY_MAX_LEN + 8);
+            st->replay = &app->emv.replay;
+            st->fsc = emv_emu_fsc(d4->ats_data.t0);
+            app->emv_emu = st;
+        }
+    }
     nfc_listener_start(app->listener, reader_listener_callback, app);
+
     size_t uid_len = 0;
     const uint8_t* uid = nfc_device_get_uid(app->device, &uid_len);
     FuriString* uid_hex = furi_string_alloc();
     reader_cat_hex(uid_hex, uid, uid_len);
     FURI_LOG_I(
         TAG,
-        "emulating NFC: %s, UID %s",
+        "emulating NFC: %s, UID %s%s",
         nfc_device_get_protocol_name(app->display_protocol),
-        furi_string_get_cstr(uid_hex));
+        furi_string_get_cstr(uid_hex),
+        app->emv_emu ? " (app-layer replay armed)" : "");
     furi_string_free(uid_hex);
-    reader_enter_emulating(app, nfc_device_get_protocol_name(app->display_protocol));
+    reader_enter_emulating(
+        app,
+        app->emv_emu ? "EMV replay" : nfc_device_get_protocol_name(app->display_protocol));
 }
 
 // EMV / bank card. app->emv is populated by emv_read() (called from inside
@@ -468,7 +583,10 @@ void reader_nfc_handle_read(ReaderApp* app) {
     if(reader_is_payment_card(app)) {
         furi_string_cat_str(
             app->info_text,
-            "\n[Policy] Bank card: emulation disabled;\nsave stores UID/ATS only.\n");
+            "\n[Policy] EMV: emulate replays\n"
+            "captured app data; online auth\n"
+            "(ARQC) impossible - terminal\n"
+            "declines at cryptogram step.\n");
     }
     reader_report_show(app, nfc_device_get_protocol_name(app->display_protocol));
 }

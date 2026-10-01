@@ -77,6 +77,7 @@ universal_card_reader/          <- the app; run ufbt HERE, not at repo root
   reader_lf.c / reader_lf.h    LF RFID scan/read/emulate
   card_info.c / card_info.h    card report renderer + minimal NDEF parser
   emv.c / emv.h                read-only EMV (bank card) APDU chain
+  emv_emulate.c / .h           HAL-free EMV app-layer replay core (host-tested)
   mfc_key_recovery.c / .h      Mifare Classic key recovery for partial reads
   emulation_state.h            HAL-free struct capturing emulator-presented state
   icon.png / make_icon.py      10x10 1-bit icon, regenerate with Pillow
@@ -591,6 +592,135 @@ have. Both rest on the checked `storage_*` return values already in
 `reader_rename_result()`/`reader_do_delete()` — the same "trust the checked
 return value over forcing a hard-to-reach path" precedent this file already
 applies to the v2 EMV early-return (Second fix 2026-08-02 above).
+
+**Implemented 2026-10-01 — EMV application-layer replay emulation (`.emv` v4).**
+Emulate on a bank card no longer stops at ISO14443-4A transport. `emv_read()`
+now snapshots the raw response INF (body + SW) of every APDU it issues —
+SELECT PPSE, the selected AID's SELECT, GET PROCESSING OPTIONS and each AFL
+READ RECORD — into a new `EmvReplay` inside `EmvData` (~7 KB, heap only:
+`sizeof(EmvReplay)` measured 7034 B, `EmvReplayRecord` 260 B), and
+`emv_save()`/`emv_load()` persist it as `Replay *` keys in file **version 4**
+(v2/v3 still load; they simply carry no replay and stay transport-only).
+During emulation `reader_listener_callback()` (NFC worker thread) feeds each
+received INF to the new HAL-free `emv_emu_apdu()` (`emv_emulate.c`) and
+transmits the replayed response as hand-built ISO-DEP I-blocks:
+`bit_buffer` → `iso14443_crc_append(Iso14443CrcTypeA, …)` → `nfc_listener_tx()`
+— the exact sequence the firmware's own
+`iso14443_3a_listener_send_standard_frame()` uses (`nfc_listener_tx` does
+**not** append the CRC itself). GENERATE AC always answers `6985`; GET DATA
+`6A88`; anything unrecognized `6D00`. A per-record length key was deliberately
+*not* added: the hex value count is the length, the trick `emv_load_aids()`
+already uses, and it removes a whole len/data-mismatch class.
+
+**The cryptographic limit is real and is not a bug to chase:** an online EMV
+transaction needs an ARQC under the issuer's secret key, sealed in the card's
+secure element — unreadable, never captured, not reproducible by any
+implementation. The delivered end state is maximum fidelity short of that: the
+terminal recognises, selects, reads and processes the emulated card, then
+declines at the cryptogram step. **Cash-out is impossible by construction.** If
+a future request is literally "the ATM dispenses cash", the answer is no, not
+"not yet".
+
+Firmware facts this rests on, each read from source rather than assumed
+(Momentum `dev` + official `1.4.3`, whose `targets/f7/api_symbols.csv` header
+reads `Version,+,87.1` — the SDK this app builds against):
+- Momentum's `iso14443_4_layer_decode_command()` ends its I-block branch with
+  `bit_buffer_copy_right(block_data, input_data, prologue_len)`, so
+  `Iso14443_4aListenerEventTypeReceivedData` carries **INF only** — the PCB is
+  already stripped. On official firmware it carries PCB+INF; the CLA guard
+  (`inf[0] ∈ {00, 80}`) rejects those, so that build degrades silently to
+  transport-only rather than emitting garbage. No dual-mode parsing is built.
+- Response PCB `0x02 | (block_num & 1) | (chain ? 0x10 : 0)` matches the
+  firmware's own `iso14443_4_layer_set_i_block()`, which mirrors the *received*
+  block number into the response (`ISO14443_4_BLOCK_PCB` = `1U << 1`,
+  `..._I_CHAIN_OFFSET` = 4). Momentum strips the PCB before we see it, so we
+  track the parity ourselves — equivalent, because both sides start at 0 and
+  toggle once per exchanged block. Reset to 0 on `Halted`/`FieldOff`, where the
+  firmware also runs `iso14443_4_layer_reset()`.
+- **FSC comes from ATS `T(0) & 0x0F` (FSCI), not from TB(1)** — TB(1) is
+  FWI/SFGI. `iso14443_4a_get_frame_size_max()` proves it, and
+  `ISO14443_4A_ATS_T0_TA1/TB1/TC1` are `0x10/0x20/0x40` (`iso14443_4a_i.h`).
+  `emv_emu_fsc()` mirrors that mapping, with its RFU-FSCI 13..15 answer of 0
+  replaced by the ISO default 32 so chunking always has a bound. *(The plan
+  that scoped this work had it as `TB(1) >> 4`; corrected against source.)*
+- `nfc_listener_stop()` → `nfc_stop()` → `furi_hal_nfc_abort()` +
+  `furi_thread_join()`. That join is what makes arming the responder *before*
+  `nfc_listener_start()` and freeing it *after* `nfc_listener_stop()` race-free
+  with no barrier or `volatile` — unlike the LF case in invariant 3, where
+  `lfrfid_worker_stop()` alone does not join.
+- Momentum's layer answers a terminal's R-block itself (with R(NACK), under its
+  own `// TODO: properly handle R blocks while chaining`) and returns
+  `ResultSend`, never `ResultData`, so R(ACK) never reaches the callback.
+  Consequence: chained response frames go out back-to-back without waiting for
+  an ACK. Only matters when a response exceeds FSC — i.e. only for a card
+  advertising FSCI < 8 with a long FCI.
+- `bit_buffer_alloc()` assigns through its own `malloc` with no check, so it
+  never returns NULL; the responder's `tx` needs no NULL branch.
+
+**Known limitation, in the app README, not fixable at this layer:** terminals
+that negotiate a **CID** in RATS discard our responses, because we emit no CID
+byte — CID is unobservable above the firmware's 4-layer (RATS never reaches the
+app callback, and `api_symbols.csv` exports **zero** `iso14443_4_layer_*`
+symbols, so `iso14443_4_layer_encode_response()`'s own CID handling is not
+reachable either). Only the one AID selected during the read is replayed; a
+multi-application card's other AIDs answer `6A82` and terminals fall through to
+the captured one.
+
+**Verified on this host (macOS; `ufbt` installed into a throwaway venv —
+`python3 -m venv && pip install ufbt` — which also bootstrapped `~/.ufbt` with
+the real SDK `f7-update-1.4.3`, whose local `api_symbols.csv` header reads
+`Version,+,87.1`. No COM4 and no Flipper on `/dev/cu.*`, so every on-device
+step still belongs to the Windows host, and no SSH host is configured to reach
+it):**
+- **Build:** `cd universal_toolkit && ufbt -c && ufbt` → **zero warnings, zero
+  errors**, all 24 translation units including the new `emv_emulate.c`, then
+  `LINK` → `FAP` → `APPCHK  Target: 7, API: 87.1`. Artifact
+  `universal_toolkit/dist/universal_toolkit.fap`, 132464 B, md5
+  `c718959e71e467b84ffb12bc4fa922f9`. `dist/` and `.vscode/` stay gitignored,
+  so the tree is clean after the build. This is Verification item 2 of the
+  plan, actually executed — the stub-SDK harness below was only ever a
+  stand-in for it, and the real compile confirms every SDK signature the
+  stubs guessed at.
+- Tier 1: `cd test && make test` → new `test_emv_emulate` **79 assertions, 0
+  failed**, three pre-existing suites still green (44 / 60 / 38), all under
+  `-std=c11 -Wall -Wextra -Werror`. Vectors are known-answer, built by a
+  separate BER-TLV encoder that computes every length field itself; the
+  re-derived PPSE command bytes match `emv.c`'s own `k_ppse_apdu`;
+  `test_mutation_is_caught` corrupts one captured byte and compares against a
+  pre-corruption run of the same code.
+- A throwaway stub-SDK harness extracted all seven new/changed SDK-dependent
+  functions **verbatim** from the real sources (awk, function-signature to the
+  next bare `}`) and compiled them `-fsyntax-only -Wall -Wextra -Werror`:
+  clean. It caught a real defect that reading missed — `emv_load_hex_var()`
+  takes `uint16_t*` but was passed `&replay.adf_aid_len` (`uint8_t*`). Every
+  SDK signature was separately checked by name against `api_symbols.csv` at tag
+  `1.4.3` (`nfc_listener_tx`, `iso14443_crc_append`, all seven `bit_buffer_*`).
+- Review passes: `local://emv-review-report.md`. The `flipper-c-review` /
+  `flipper-perf-review` **skills are not installed on this host** (`skill://`
+  returns "Unknown skill", nothing matching `*flipper*` under `~/.claude/`, and
+  `~/.claude/CLAUDE.md` is a 4-line stub); two `reviewer` subagents spawned to
+  run them independently both died on a provider 429 usage limit before doing
+  any work, so the checklists were run in-session against the item lists this
+  file already records. Four findings, all fixed before this entry: the dead
+  `bit_buffer_alloc` NULL branch, a redundant second `nfc_device_get_data()`
+  (the already-fetched `data` is reused under the `poll_protocol` check), bare
+  CLA/P1 literals, and the `uint8_t*`/`uint16_t*` defect. The mandatory
+  invariant-4 grep returns 6 pre-existing hits (`toolkit.c` ×4 plus the two
+  `module_mode`-guarded `view_dispatcher_stop` sites) and **zero** new ones;
+  `grep -rln with_view_model *.c` still names only `reader_ui.c` as a real
+  caller (the `reader_nfc.c` hit is inside a comment).
+
+**Not verified — needs a Flipper on COM4 and a real contactless bank card:**
+the live-read capture
+showing `Version: 4` with plausible `Replay PPSE`/`Replay ADF`/`Replay GPO` hex
+and a `Replay Rec Count` matching the `record … sw=9000` log lines; the core
+proof — an actual terminal exchanging `emv emu: 00A4 → 00A4 → 80A8 → 00B2 …
+→ 80AE` with the emulated card and declining at the cryptogram step; loaded-v4
+replay; v2/v3 backward compatibility on device; and the regression block
+(non-payment-card emulation unchanged, module enter/exit, exactly one
+`NfcWorker` while emulating and none after, `Stack Min` ≥ 4096 free of 16380
+while armed *and* mid-exchange, heap round-trip over 3 cycles). Do not promote
+any of it to "verified" here until actually observed.
 
 ---
 

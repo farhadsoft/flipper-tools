@@ -74,18 +74,31 @@ element.
 (`/ext/apps_data/universal_card_reader/EMV_<UID>.emv`) and store the PAN,
 expiry date, cardholder, AIDs, Track2, and log — every financial field
 that was read — plus the ISO14443-4A transport data (UID/ATQA/SAK/ATS),
-so a loaded file can also be emulated just like a freshly read card.
+so a loaded file can also be emulated just like a freshly read card. From
+file format **v4** on, the raw SELECT/GPO/READ RECORD responses are stored
+too (the `Replay *` keys), which is what lets a loaded `.emv` replay the
+application layer as well. v2/v3 files still load, and still emulate at
+transport level only.
 
-**Emulation:** when Emulate is chosen for an EMV card, the app starts
-ISO14443-4A transport-level emulation (with the captured UID/ATS,
-regardless of whether the card was read live or loaded from an `.emv`
-file). There is **no** application-level EMV terminal emulation; the PAN
-and log are never relayed to another reader.
+**Emulation:** Emulate starts ISO14443-4A transport-level emulation with the
+captured UID/ATS — whether the card was read live or loaded from an `.emv`
+file — and, on top of that, **replays the EMV application layer** whenever the
+read captured one: the exact SELECT PPSE, SELECT AID, GET PROCESSING OPTIONS
+and READ RECORD responses the real card gave, byte for byte. A terminal
+therefore recognises the emulated card as a payment card, selects the
+application, reads its records and processes it as it would the original.
 
-> **Note:** the bottom of the result screen may still show the line
-> `[Policy] Bank card: emulation disabled; save stores UID/ATS only.`
-> This notice is stale: in the current code, EMV data is stored in the
-> `.emv` file and Emulate works at the ISO14443-4A level.
+GENERATE AC — the command that asks the card for a transaction cryptogram — is
+answered with status word `6985` ("conditions of use not satisfied") and never
+with fabricated bytes. An online EMV transaction needs an ARQC computed with
+the issuer's secret key, which is sealed inside the card's secure element:
+unreadable, never captured by this app, and not reproducible by any
+implementation. **Payment transactions can therefore never complete** — the
+terminal declines at the cryptogram step. Nothing short of that is limited on
+purpose.
+
+The `[Policy]` line at the bottom of the result screen says the same thing in
+short form.
 
 ## Saving and loading cards (Save / Load)
 
@@ -123,7 +136,16 @@ honestly if the remove failed instead of claiming success.
   for those protocols; these cards fall back to being read via the transport
   protocol. DESFire is also not emulatable.
 - UHF / 2.45 GHz is not supported by Flipper's built-in hardware.
-- EMV emulation is at the ISO14443-4A transport level only.
+- EMV emulation replays the captured application layer — SELECT PPSE / SELECT
+  AID, GET PROCESSING OPTIONS and READ RECORD are answered with the real
+  card's recorded responses, GENERATE AC with `6985`. Two limits fall out of
+  the firmware layer this runs on: terminals that negotiate a **CID** in RATS
+  are not supported (CID is not observable above the firmware's ISO-DEP layer,
+  so responses carry no CID byte and such a terminal discards them), and only
+  the **one** AID selected during the read is replayed — on a multi-application
+  card the other AIDs answer `6A82` and terminals fall through to the captured
+  one. **Payment transactions can never complete: the ARQC keys are sealed in
+  the card's secure element.**
 - **Emulating a loaded (opened-from-file) Mifare Classic card can
   sometimes hang the app** — this is a known, long-standing
   firmware-level issue (see: official firmware issue #2577, Unleashed

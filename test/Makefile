@@ -23,14 +23,19 @@ FIDE_SRCS := test_emulation_fidelity.c test_nfc_file_parse.c
 ROUND_BIN := $(BUILD_DIR)/test_save_load_roundtrip
 ROUND_SRCS := test_save_load_roundtrip.c test_nfc_file_parse.c
 
+EMVEMU_BIN := $(BUILD_DIR)/test_emv_emulate
+EMVEMU_SRCS := test_emv_emulate.c $(CARD_DIR)/emv_emulate.c
+EMVEMU_DEPS := framework/test_framework.h $(CARD_DIR)/emv_emulate.h
+
 CFLAGS := -std=c11 -Wall -Wextra -Werror -I$(BLE_DIR) $(CARD_CFLAGS)
 
 .PHONY: test clean
 
-test: $(BLE_BIN) $(FIDE_BIN) $(ROUND_BIN)
+test: $(BLE_BIN) $(FIDE_BIN) $(ROUND_BIN) $(EMVEMU_BIN)
 	./$(BLE_BIN)
 	./$(FIDE_BIN)
 	./$(ROUND_BIN)
+	./$(EMVEMU_BIN)
 
 $(BLE_BIN): $(BLE_SRCS) $(BLE_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $(BLE_SRCS)
@@ -40,6 +45,9 @@ $(FIDE_BIN): $(FIDE_SRCS) $(CARD_DEPS) | $(BUILD_DIR)
 
 $(ROUND_BIN): $(ROUND_SRCS) $(CARD_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $(ROUND_SRCS)
+
+$(EMVEMU_BIN): $(EMVEMU_SRCS) $(EMVEMU_DEPS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $(EMVEMU_SRCS)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
