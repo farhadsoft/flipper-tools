@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "../toolkit_ui.h"
 #include <math.h>
+#include <furi_hal_power.h>
 
 
 
@@ -82,20 +83,22 @@ static void draw_state_reading(Canvas* canvas, const RfidModel* m) {
 void rfid_draw_callback(Canvas* canvas, void* model) {
     RfidModel* m = model;
     canvas_clear(canvas);
-    ui_status_bar(canvas, "RFID MULTI-READER", NULL, 0, 0, 0);
+
+    if(m->state == RfidStateNotice) {
+        ui_status_bar(canvas, m->notice_title, NULL, 0, m->battery, 0);
+        ui_notice(canvas, NULL, m->notice_l1, m->notice_l2);
+        return;
+    }
 
     switch(m->state) {
     case RfidStateScanning:
+        ui_status_bar(canvas, "Scan", NULL, UiStatusScanning, m->battery, m->frame);
         draw_state_scanning(canvas, m);
         break;
 
     case RfidStateReading:
+        ui_status_bar(canvas, "Reading", NULL, UiStatusLive, m->battery, m->frame);
         draw_state_reading(canvas, m);
-        break;
-
-    case RfidStateNotice:
-        ui_status_bar(canvas, m->notice_title, NULL, 0, 0, 0);
-        ui_notice(canvas, NULL, m->notice_l1, m->notice_l2);
         break;
 
     default:
@@ -129,12 +132,19 @@ void rfid_set_notice(RfidApp* app, const char* title, const char* l1, const char
             snprintf(m->notice_title, sizeof(m->notice_title), "%s", title);
             snprintf(m->notice_l1, sizeof(m->notice_l1), "%s", l1 ? l1 : "");
             snprintf(m->notice_l2, sizeof(m->notice_l2), "%s", l2 ? l2 : "");
+            // Notice can be the very first status-view screen (e.g. the UHF
+            // menu row) with no anim bump behind it -- refresh here so the
+            // bar never draws the empty-battery initial value.
+            m->battery = furi_hal_power_get_pct();
         },
         true);
 }
 
 void rfid_bump_frame(RfidApp* app) {
-    with_view_model(app->status, RfidModel * m, { m->frame++; }, true);
+    with_view_model(app->status, RfidModel * m, {
+        m->frame++;
+        m->battery = furi_hal_power_get_pct();
+    }, true);
 }
 
 void rfid_report_begin(RfidApp* app) {

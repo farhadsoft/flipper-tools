@@ -165,7 +165,7 @@ static LfImpl lf_impl;
 
 static RfidBackend lf_backend = {
     .name = "125 kHz LF",
-    .band_label = "< 125 kHz LF >",
+    .band_label = "125 kHz LF",
     .band = RfidBandLf,
     .scan_ms = LF_PHASE_MS,
     .available = lf_available,

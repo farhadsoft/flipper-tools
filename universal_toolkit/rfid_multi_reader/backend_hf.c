@@ -662,7 +662,7 @@ static HfImpl hf_impl;
 
 static RfidBackend hf_backend = {
     .name = "13.56 MHz HF",
-    .band_label = "< 13.56 MHz HF >",
+    .band_label = "13.56 MHz HF",
     .band = RfidBandHf,
     .scan_ms = HF_PHASE_MS,
     .available = hf_available,

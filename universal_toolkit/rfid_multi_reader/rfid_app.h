@@ -75,7 +75,8 @@ typedef enum {
 typedef struct {
     RfidState state;
     uint8_t frame;
-    char band[24]; // "< 13.56 MHz HF >"
+    uint8_t battery; // furi_hal_power_get_pct(), refreshed on anim bump
+    char band[24]; // "13.56 MHz HF"
     char mode[16]; // "Auto" / "HF only" / "LF only"
     char notice_title[24];
     char notice_l1[32];

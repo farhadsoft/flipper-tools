@@ -20,7 +20,7 @@ typedef enum {
 
 struct RfidBackend {
     const char* name; // "13.56 MHz HF" - menu / logs
-    const char* band_label; // "< 13.56 MHz HF >" - boxed label on the scan screen
+    const char* band_label; // "13.56 MHz HF" - boxed label on the scan screen
     RfidBand band;
     uint32_t scan_ms; // scan budget for one Auto-mode phase
 
