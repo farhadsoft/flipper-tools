@@ -308,6 +308,7 @@ typedef struct {
     SubRecAnalysis ana;
     uint8_t ana_page; // 0 = info, 1 = waveform
     uint8_t anim_phase; // bumps on every redraw tick; drives REC blink, meter pulse, scan sweep
+    uint8_t battery; // furi_hal_power_get_pct(), refreshed with anim_phase and on screen entry
     uint32_t dup; // session duplicate count; 0 = hide the counter (see draw_listening/draw_stats)
     SubRecStats stats;
 } SubRecModel;

@@ -2,6 +2,7 @@
 #include "../toolkit_ui.h"
 #include <stdio.h>
 #include <string.h>
+#include <furi_hal_power.h>
 
 // Scan bar graph: one bar per sub_rec_freqs[] entry, centred.
 #define SCAN_BAR_W     6
@@ -33,7 +34,7 @@ static void draw_listening(Canvas* canvas, const SubRecModel* m) {
         recording ? "RECORDING" : "Listening",
         m->freq_line,
         recording ? UiStatusRecording : 0,
-        0,
+        m->battery,
         m->anim_phase);
 
     float rssi = m->rssi;
@@ -78,7 +79,7 @@ static void draw_listening(Canvas* canvas, const SubRecModel* m) {
 }
 
 static void draw_sending(Canvas* canvas, const SubRecModel* m) {
-    ui_status_bar(canvas, "Sending", NULL, 0, 0, 0);
+    ui_status_bar(canvas, "Sending", NULL, 0, m->battery, 0);
     ui_draw_centered_fit(canvas, 32, m->last_file, 120);
     // No animation timer exists in this app (see CLAUDE.md); the dots are a
     // static "in progress" decoration, not a cycling animation.
@@ -90,7 +91,7 @@ static void draw_sending(Canvas* canvas, const SubRecModel* m) {
 // Shares draw_listening()'s dBm->pixel mapping (RSSI_FLOOR_DBM/CEIL_DBM,
 // clamp01()) so the two screens read on the same scale.
 static void draw_scanning(Canvas* canvas, const SubRecModel* m) {
-    ui_status_bar(canvas, "Scan", "OK=tune", UiStatusScanning, 0, m->anim_phase);
+    ui_status_bar(canvas, "Scan", "OK=tune", UiStatusScanning, m->battery, m->anim_phase);
 
     canvas_draw_line(
         canvas,
@@ -141,7 +142,7 @@ static void draw_analyzing(Canvas* canvas, const SubRecModel* m) {
     char buf[40];
 
     if(m->ana_page == 0) {
-        ui_status_bar(canvas, "Info", "v wave", 0, 0, 0);
+        ui_status_bar(canvas, "Info", "v=wave", 0, m->battery, 0);
 
         char freq_str[8];
         snprintf(freq_str, sizeof(freq_str), "%lu", (unsigned long)(m->ana.freq / 1000000));
@@ -172,14 +173,12 @@ static void draw_analyzing(Canvas* canvas, const SubRecModel* m) {
             snprintf(buf, sizeof(buf), "Bit: %lu  Key: %s", (unsigned long)m->ana.bit, m->ana.key);
             ui_draw_centered_fit(canvas, 60, buf, 124);
         }
-        if(!has_note && !has_bit) {
-            ui_draw_centered(canvas, 63, "v wave");
-        }
+        // "v=wave" hint lives in the status bar permanently now.
         return;
     }
 
-    snprintf(buf, sizeof(buf), "Wave %s  ^info", sub_rec_zoom_labels[m->ana.zoom]);
-    ui_status_bar(canvas, buf, NULL, 0, 0, 0);
+    snprintf(buf, sizeof(buf), "Wave %s  ^=info", sub_rec_zoom_labels[m->ana.zoom]);
+    ui_status_bar(canvas, buf, NULL, 0, m->battery, 0);
     if(m->ana.wave_len == 0) {
         ui_draw_centered(canvas, 38, "no samples");
         return;
@@ -204,7 +203,7 @@ static void draw_analyzing(Canvas* canvas, const SubRecModel* m) {
 
 static void draw_stats(Canvas* canvas, const SubRecModel* m) {
     char buf[40];
-    ui_status_bar(canvas, "Stats", NULL, 0, 0, 0);
+    ui_status_bar(canvas, "Stats", NULL, 0, m->battery, 0);
 
     char files_str[8];
     snprintf(files_str, sizeof(files_str), "%lu", (unsigned long)m->stats.files);
@@ -234,7 +233,7 @@ void sub_rec_draw_callback(Canvas* canvas, void* model) {
     canvas_clear(canvas);
 
     if(m->notice_active) {
-        ui_status_bar(canvas, m->notice_title, NULL, 0, 0, 0);
+        ui_status_bar(canvas, m->notice_title, NULL, 0, m->battery, 0);
         ui_notice(canvas, NULL, m->notice_l1, m->notice_l2);
         return;
     }
@@ -268,7 +267,10 @@ void sub_rec_set_rssi(SubRecApp* app, float rssi, bool update) {
         SubRecModel * m,
         {
             m->rssi = rssi;
-            if(update) m->anim_phase++;
+            if(update) {
+                m->anim_phase++;
+                m->battery = furi_hal_power_get_pct();
+            }
         },
         update);
 }
@@ -287,6 +289,7 @@ void sub_rec_set_state(SubRecApp* app, SubRecState s, bool cooldown) {
             m->state = s;
             m->cooldown = cooldown;
             m->anim_phase++;
+            m->battery = furi_hal_power_get_pct();
         },
         true);
 }
@@ -301,6 +304,7 @@ void sub_rec_set_notice(
             snprintf(m->notice_l1, sizeof(m->notice_l1), "%s", l1);
             snprintf(m->notice_l2, sizeof(m->notice_l2), "%s", l2);
             m->notice_active = active;
+            m->battery = furi_hal_power_get_pct();
         },
         true);
 }
@@ -382,7 +386,10 @@ void sub_rec_reset_scan(SubRecApp* app) {
 }
 
 void sub_rec_set_analyze(SubRecApp* app, const SubRecAnalysis* a) {
-    with_view_model(app->view, SubRecModel * m, { m->ana = *a; }, false);
+    with_view_model(app->view, SubRecModel * m, {
+        m->ana = *a;
+        m->battery = furi_hal_power_get_pct();
+    }, false);
 }
 
 void sub_rec_set_analyze_page(SubRecApp* app, uint8_t page) {
@@ -391,7 +398,10 @@ void sub_rec_set_analyze_page(SubRecApp* app, uint8_t page) {
 }
 
 void sub_rec_set_stats(SubRecApp* app, const SubRecStats* s) {
-    with_view_model(app->view, SubRecModel * m, { m->stats = *s; }, false);
+    with_view_model(app->view, SubRecModel * m, {
+        m->stats = *s;
+        m->battery = furi_hal_power_get_pct();
+    }, false);
 }
 
 void sub_rec_set_analyze_window(
