@@ -1,4 +1,4 @@
-#include "recorder_parse.h"
+#include "recorder_logic.h"
 
 #include <string.h>
 
@@ -30,4 +30,23 @@ void sub_rec_live_parse(
             key[w] = '\0';
         }
     }
+}
+
+bool sub_rec_hopper_decide(bool* dwell, uint8_t* timeout, uint8_t dwell_ticks, bool above) {
+    if(*dwell) {
+        if(*timeout) {
+            (*timeout)--;
+            return false; // still dwelling: no RSSI read, no advance
+        }
+        // Countdown expired: stock leaves its RSSITimeOut state here and
+        // advances without re-reading RSSI, and so must this.
+        *dwell = false;
+        return true;
+    }
+    if(above) {
+        *timeout = dwell_ticks;
+        *dwell = true;
+        return false;
+    }
+    return true; // quiet band: move on
 }

@@ -11,7 +11,7 @@
 //   linear:    "Key:0x%03lX\r\n"
 // which is exactly the spread of Key-line shapes the parser has to survive.
 
-#include "recorder_parse.h"
+#include "recorder_logic.h"
 #include "framework/test_framework.h"
 
 #define PROTO_BUF 24
@@ -103,6 +103,49 @@ TEST_CASE(test_empty_and_null_frames) {
     ASSERT_TRUE(key[0] == '\0');
 }
 
+TEST_CASE(test_hopper_quiet_band_advances_every_decision) {
+    bool dwell = false;
+    uint8_t timeout = 0;
+    for(int i = 0; i < 5; i++) {
+        ASSERT_TRUE(sub_rec_hopper_decide(&dwell, &timeout, 3, false));
+    }
+    ASSERT_TRUE(!dwell);
+    ASSERT_TRUE(timeout == 0);
+}
+
+TEST_CASE(test_hopper_loud_band_dwells_then_advances_once) {
+    bool dwell = false;
+    uint8_t timeout = 0;
+    // First loud decision starts the dwell without advancing.
+    ASSERT_TRUE(!sub_rec_hopper_decide(&dwell, &timeout, 3, true));
+    ASSERT_TRUE(dwell);
+    ASSERT_TRUE(timeout == 3);
+    // The countdown burns three decisions. `above` stays true throughout on
+    // purpose: the regression this pins is a dwell that re-arms itself while
+    // the carrier is up, which pinned the radio to one frequency forever.
+    for(int i = 0; i < 3; i++) {
+        ASSERT_TRUE(!sub_rec_hopper_decide(&dwell, &timeout, 3, true));
+    }
+    ASSERT_TRUE(timeout == 0);
+    // Expiry advances unconditionally, without consulting `above` at all.
+    ASSERT_TRUE(sub_rec_hopper_decide(&dwell, &timeout, 3, true));
+    ASSERT_TRUE(!dwell);
+    // And the next loud decision starts a fresh dwell.
+    ASSERT_TRUE(!sub_rec_hopper_decide(&dwell, &timeout, 3, true));
+    ASSERT_TRUE(dwell);
+}
+
+TEST_CASE(test_hopper_dwell_ignores_rssi_until_it_expires) {
+    bool dwell = false;
+    uint8_t timeout = 0;
+    ASSERT_TRUE(!sub_rec_hopper_decide(&dwell, &timeout, 2, true));
+    // Once dwelling, `above` is ignored until the countdown runs out --
+    // stock does not even read RSSI on those ticks.
+    ASSERT_TRUE(!sub_rec_hopper_decide(&dwell, &timeout, 2, false));
+    ASSERT_TRUE(!sub_rec_hopper_decide(&dwell, &timeout, 2, false));
+    ASSERT_TRUE(sub_rec_hopper_decide(&dwell, &timeout, 2, false));
+}
+
 int main(void) {
     RUN_TEST(test_princeton_frame);
     RUN_TEST(test_keeloq_frame_no_prefix_no_spaces);
@@ -113,5 +156,8 @@ int main(void) {
     RUN_TEST(test_spaced_bytes_are_collapsed);
     RUN_TEST(test_buffers_truncate_not_overrun);
     RUN_TEST(test_empty_and_null_frames);
+    RUN_TEST(test_hopper_quiet_band_advances_every_decision);
+    RUN_TEST(test_hopper_loud_band_dwells_then_advances_once);
+    RUN_TEST(test_hopper_dwell_ignores_rssi_until_it_expires);
     return test_report();
 }

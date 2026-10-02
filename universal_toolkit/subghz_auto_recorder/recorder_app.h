@@ -454,6 +454,7 @@ typedef struct {
     uint8_t hop_idx;
     uint8_t hop_timeout;
     uint8_t hop_tick;
+    bool hop_dwell; // stock's RSSITimeOut state; see sub_rec_hopper_decide()
 
     // Feedback. sound is stock's "Sound:" row: mirror the RX data to the
     // speaker. speaker_held is the sole owner of the matching release.

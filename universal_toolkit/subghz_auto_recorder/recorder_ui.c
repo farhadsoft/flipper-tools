@@ -360,7 +360,12 @@ void sub_rec_set_scan(SubRecApp* app, uint8_t idx, int8_t dbm, uint8_t peak, boo
         {
             m->scan_dbm[idx] = dbm;
             m->scan_idx = idx;
-            if(peak) m->scan_peak = idx;
+            // The peak index, not the step index. The old `if(peak)
+            // m->scan_peak = idx` wrote the CURRENT sweep step into the
+            // model's peak on every tick, so at each repaint the hero
+            // frequency and the peak marker sat on the last table entry and
+            // never changed while the bars swept.
+            m->scan_peak = peak;
         },
         update);
 }

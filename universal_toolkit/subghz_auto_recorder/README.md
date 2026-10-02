@@ -212,7 +212,7 @@ as a 10x10 1-bit PNG with `make_icon.py`.
 | `subghz_auto_recorder.c` | App lifecycle, event router, menus, capture state machine, storage/naming, saved-signals browse/rename/delete/clear-all |
 | `recorder_app.h` | Shared structs, enums, constants — no `with_view_model()` calls |
 | `recorder_radio.c/h` | Radio session lifecycle, RAW capture mechanics, and Replay (TX) |
-| `recorder_parse.c/h` | HAL-free parser for a decoder `get_string()` frame (the live readout); pinned by `test/test_recorder_parse.c` |
+| `recorder_logic.c/h` | HAL-free domain logic: the decoder `get_string()` frame parser (live readout) and the hopper dwell decision; pinned by `test/test_recorder_logic.c` |
 | `recorder_ui.c/h` | Device UI — the only file that calls `with_view_model()` |
 | (manifest) | `universal_toolkit/application.fam` -- this module is hosted by the toolkit and has no `.fam` of its own |
 | `icon.png` / `make_icon.py` | Menu icon |

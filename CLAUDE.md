@@ -1733,12 +1733,27 @@ written:
 |Capability|Where|Notes|
 |---|---|---|
 |Keystore (KeeLoq family)|`sub_rec_keystore_load()`, gated by Settings > Keystore|stock `subghz_txrx_alloc()` order; **opt-in, default Off** — see the heap note below|
-|Live decoded readout|`sub_rec_live_snapshot()` (worker thread) + `sub_rec_live_publish()` (RSSI tick) + `recorder_parse.c`|worker-thread formatting is stock's own choice in `subghz_scene_receiver.c`; `live_mutex` guards the GUI copy-out; the parser is HAL-free and pinned by `test/test_recorder_parse.c`|
+|Live decoded readout|`sub_rec_live_snapshot()` (worker thread) + `sub_rec_live_publish()` (RSSI tick) + `recorder_logic.c`|worker-thread formatting is stock's own choice in `subghz_scene_receiver.c`; `live_mutex` guards the GUI copy-out; the parser is HAL-free and pinned by `test/test_recorder_logic.c`|
 |Add manually|`sub_rec_show_add_menu()` / `sub_rec_add_manual()`|protocol list enumerated from the firmware registry, not a hardcoded table; stock's serialize-then-overwrite-Bit/Key trick (`subghz_txrx_gen_data_protocol`); validated by a trial deserialize; `TE` forced to 400 us when the protocol has one|
 |Browse all of /ext/subghz|`sub_rec_do_browse(app, root)`, Saved > Browse SD card|the batch deletes deliberately stay `auto_rec`-scoped|
 |Hopper|`sub_rec_hopper_step()` at stock `subghz_txrx_hopper_update()`'s own numbers|list copied out of a throwaway `SubGhzSetting` which is then freed; `hop_freq` never touches the persisted frequency|
 |Sound + Alert|`sub_rec_speaker_on/off()`, `sub_rec_alert()`|stock's mirror-before-`start_async_rx` order; the alert parks the speaker and stops `rssi_timer` around `notification_message_block()` (invariant 6)|
 |Protocol ignore list|OK on the Listening screen + Settings > Ignore|the drop happens at capture end via `sub_rec_is_ignored()`, the same write-then-remove shape as dedup|
+
+**Follow-up fix, same session, user-reported as "frequency not changes when
+scanning":** two bugs, both pinned. (1) `sub_rec_set_scan()` assigned the
+*current sweep step* to the model's peak (`if(peak) m->scan_peak = idx`), so
+the Scan screen's hero frequency and peak marker sat on the last table
+entry at every repaint and never moved while the bars swept; it now stores
+the peak index it is handed. (2) The hopper dwell re-armed itself on every
+decision while RSSI stayed above the floor, so a continuous carrier -- or
+433.92's ambient −83 dBm -- pinned the radio to one frequency forever;
+stock's `subghz_txrx_hopper_update()` advances unconditionally once the
+10-decision countdown expires and does not even read RSSI on that tick. The
+decision now lives in `sub_rec_hopper_decide()` (`recorder_logic.c`, the
+renamed `recorder_parse.c`) with three known-answer cases in
+`test/test_recorder_logic.c`: quiet-band advance, loud-band
+dwell-then-advance-once, dwell-ignores-RSSI-until-expiry.
 
 **Menu rows moved.** Main menu is now Auto-record / Frequency scan /
 Settings / Saved signals / **Add manually** / Exit (Exit is row 5, was 4).
@@ -1779,7 +1794,7 @@ unverified for that reason, not for lack of trying.
 **Verified this session (host side):** `ufbt -c && ufbt` clean from
 scratch, zero warnings, `APPCHK` Target 7 / API 87.1; FAP md5-verified on
 the SD via `storage md5` against the local file; `make test` in `test/`
-green including the new `test_recorder_parse` (18 assertions, 0 failed)
+green including the new `test_recorder_logic` (40 assertions, 0 failed)
 under `-std=c11 -Wall -Wextra -Werror`; the mandated invariant greps clean
 (`view_dispatcher_stop` only in the `module_mode`-guarded Exit branch,
 `with_view_model` only in `recorder_ui.c` outside comments). RPC screen

@@ -1,6 +1,6 @@
 #include "recorder_radio.h"
 #include "recorder_ui.h"
-#include "recorder_parse.h"
+#include "recorder_logic.h"
 #undef TAG
 #include "../toolkit_app.h"
 #undef TAG
@@ -288,6 +288,7 @@ void sub_rec_listen_start(SubRecApp* app) {
     app->hop_idx = 0;
     app->hop_timeout = 0;
     app->hop_tick = 0;
+    app->hop_dwell = false;
 
     char line[24];
     sub_rec_format_freq_line(app, line, sizeof(line));
@@ -620,12 +621,14 @@ bool sub_rec_hopper_step(SubRecApp* app) {
     if(++app->hop_tick < HOP_POLL_EVERY) return false;
     app->hop_tick = 0;
 
-    if(app->hop_timeout) {
-        app->hop_timeout--;
-        return false; // still dwelling where a signal was heard
+    // RSSI is read only when not dwelling: on the tick the countdown expires
+    // sub_rec_hopper_decide() advances without it, which is what stops a
+    // continuous carrier from pinning the radio to one frequency forever.
+    bool above = false;
+    if(!app->hop_dwell) {
+        above = subghz_devices_get_rssi(app->device) > HOPPER_RSSI_FLOOR;
     }
-    if(subghz_devices_get_rssi(app->device) > HOPPER_RSSI_FLOOR) {
-        app->hop_timeout = HOPPER_DWELL_TICKS;
+    if(!sub_rec_hopper_decide(&app->hop_dwell, &app->hop_timeout, HOPPER_DWELL_TICKS, above)) {
         return false;
     }
 

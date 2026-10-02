@@ -27,22 +27,22 @@ EMVEMU_BIN := $(BUILD_DIR)/test_emv_emulate
 EMVEMU_SRCS := test_emv_emulate.c $(CARD_DIR)/emv_emulate.c
 EMVEMU_DEPS := framework/test_framework.h $(CARD_DIR)/emv_emulate.h
 
-# Test 5: subghz recorder live-readout frame parsing
+# Test 5: subghz recorder HAL-free logic (live-readout parse + hopper decide)
 REC_DIR := ../universal_toolkit/subghz_auto_recorder
-PARSE_BIN := $(BUILD_DIR)/test_recorder_parse
-PARSE_SRCS := test_recorder_parse.c $(REC_DIR)/recorder_parse.c
-PARSE_DEPS := framework/test_framework.h $(REC_DIR)/recorder_parse.h
+LOGIC_BIN := $(BUILD_DIR)/test_recorder_logic
+LOGIC_SRCS := test_recorder_logic.c $(REC_DIR)/recorder_logic.c
+LOGIC_DEPS := framework/test_framework.h $(REC_DIR)/recorder_logic.h
 
 CFLAGS := -std=c11 -Wall -Wextra -Werror -I$(BLE_DIR) $(CARD_CFLAGS) -I$(REC_DIR)
 
 .PHONY: test clean
 
-test: $(BLE_BIN) $(FIDE_BIN) $(ROUND_BIN) $(EMVEMU_BIN) $(PARSE_BIN)
+test: $(BLE_BIN) $(FIDE_BIN) $(ROUND_BIN) $(EMVEMU_BIN) $(LOGIC_BIN)
 	./$(BLE_BIN)
 	./$(FIDE_BIN)
 	./$(ROUND_BIN)
 	./$(EMVEMU_BIN)
-	./$(PARSE_BIN)
+	./$(LOGIC_BIN)
 
 $(BLE_BIN): $(BLE_SRCS) $(BLE_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $(BLE_SRCS)
@@ -56,8 +56,8 @@ $(ROUND_BIN): $(ROUND_SRCS) $(CARD_DEPS) | $(BUILD_DIR)
 $(EMVEMU_BIN): $(EMVEMU_SRCS) $(EMVEMU_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $(EMVEMU_SRCS)
 
-$(PARSE_BIN): $(PARSE_SRCS) $(PARSE_DEPS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $@ $(PARSE_SRCS)
+$(LOGIC_BIN): $(LOGIC_SRCS) $(LOGIC_DEPS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $(LOGIC_SRCS)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
