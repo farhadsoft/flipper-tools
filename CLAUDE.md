@@ -30,6 +30,16 @@ ISO15693-3, FeliCa, ST25TB and everything layered on them) and LF RFID 125 kHz.
 The two radios cannot run together, so it alternates timed phases and loops until
 a card is found, with an animated scanning UI.
 
+**UI consistency pass applied 2026-10-02** — custom-drawn screens aligned to
+`docs/ui-style-guide.md`: real battery from a model field (was a literal 0 =
+empty icon), state-name status-bar labels (`Scan`/`Reading`/`Emulating`, was
+`UNIVERSAL READER`), scanning/live glyphs, `key=action` hint grammar
+(`OK=load`, `Back=stop`), single-draw notice path, angle brackets dropped
+from band labels, idle-band line centered per the rfid expression. Build
+clean (`ufbt`, zero warnings, APPCHK Target 7 / API 87.1) and Tier-1 host
+tests green; **not verified on device** (no Flipper attached this session —
+folds into the consolidated physical-access checklist).
+
 ## Verified firmware / SDK — re-check before you build (STEP 0)
 
 Last verified **2026-08-09**: `device_info` read live over the CLI (COM4) and
@@ -738,6 +748,15 @@ extraction, phase-alternation and crash-avoidance patterns were ported into
 `rfid_multi_reader`'s backends; its raw-hex-only LF output was replaced with
 decoded fields via `protocol_dict_render_data()`.
 
+**UI consistency pass applied 2026-10-02** — custom-drawn screens aligned to
+`docs/ui-style-guide.md`: real battery from a model field (was a literal 0 =
+empty icon, incl. a notice-setter refresh so the UHF-notice-first path never
+draws the initial value), state-name status-bar labels (`Scan`/`Reading`,
+was `RFID MULTI-READER`), scanning/live glyphs, single-draw notice path,
+angle brackets dropped from `band_label`. Build clean (`ufbt`, zero
+warnings, APPCHK Target 7 / API 87.1); **not verified on device** (no
+Flipper attached this session).
+
 ## Verified firmware / SDK — re-check before you build (STEP 0)
 
 Last verified **2026-08-02**, re-checked after a firmware update (`device_info`
@@ -897,6 +916,16 @@ threshold, records it to its own RAW `.sub` file, and can browse/replay
 (TX)/rename/delete saved captures. A different radio and a different SDK
 surface from NFC/LF, so **neither `universal_card_reader/` nor
 `rfid_multi_reader/` is touched by this app.**
+
+**UI consistency pass applied 2026-10-02** — all seven `ui_status_bar` call
+sites now pass a real `m->battery` (model field refreshed in
+`sub_rec_set_rssi`/`set_state`/`set_stats`/`set_analyze`/`set_notice`;
+deliberately not in `sub_rec_set_scan`, 25 ms tick), and Analyze hints
+unified to `key=action` (`v=wave`, `^=info`; the duplicate conditional
+bottom-line hint deleted). No `with_view_model` update flag or timer
+changed. Build clean (`ufbt`, zero warnings, APPCHK Target 7 / API 87.1);
+**not verified on device** (no Flipper attached this session — Analyze
+screens still need the physical file-pick anyway).
 
 ## Verified firmware / SDK — re-check before you build (STEP 0)
 
