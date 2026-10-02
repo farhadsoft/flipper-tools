@@ -100,6 +100,7 @@ typedef enum {
 typedef struct {
     ReaderState state;
     uint8_t frame; // animation counter, bumped every ANIM_PERIOD_MS
+    uint8_t battery; // furi_hal_power_get_pct(), refreshed on anim bump
     bool lf; // true while the LF phase is active
     char notice_title[24];
     char notice_l1[32];

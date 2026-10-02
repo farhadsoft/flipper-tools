@@ -1,6 +1,7 @@
 #include "reader_ui.h"
 #include "../toolkit_ui.h"
 #include <math.h>
+#include <furi_hal_power.h>
 
 
 
@@ -51,7 +52,7 @@ static void draw_state_scanning(Canvas* canvas, const ReaderModel* m) {
     draw_radar(canvas, cx, cy, m->frame);
     draw_card_icon(canvas, cx, cy);
 
-    const char* active = m->lf ? "< 125 kHz RFID >" : "< 13.56 MHz NFC >";
+    const char* active = m->lf ? "125 kHz RFID" : "13.56 MHz NFC";
     const char* idle = m->lf ? "13.56 MHz NFC" : "125 kHz RFID";
 
     // Active band boxed, the idle one left plain underneath.
@@ -59,10 +60,8 @@ static void draw_state_scanning(Canvas* canvas, const ReaderModel* m) {
     ui_draw_centered(canvas, 53, active);
 
     int idle_w = canvas_string_width(canvas, idle);
-    canvas_draw_str(canvas, 2, 63, idle);
-    draw_dots(canvas, idle_w + 5, 62, m->frame);
-    const char* hint = "OK:load";
-    canvas_draw_str(canvas, UI_W - canvas_string_width(canvas, hint) - 2, 63, hint);
+    canvas_draw_str(canvas, (UI_W - idle_w) / 2 - 8, 63, idle);
+    draw_dots(canvas, (UI_W + idle_w) / 2 - 2, 62, m->frame);
 }
 
 static void draw_state_reading(Canvas* canvas, const ReaderModel* m) {
@@ -85,28 +84,37 @@ static void draw_state_reading(Canvas* canvas, const ReaderModel* m) {
 void reader_draw_callback(Canvas* canvas, void* model) {
     ReaderModel* m = model;
     canvas_clear(canvas);
-    ui_status_bar(canvas, "UNIVERSAL READER", NULL, 0, 0, 0);
+
+    if(m->state == ReaderStateNotice) {
+        ui_status_bar(canvas, m->notice_title, NULL, 0, m->battery, 0);
+        ui_notice(canvas, NULL, m->notice_l1, m->notice_l2);
+        return;
+    }
 
     switch(m->state) {
     case ReaderStateScanning:
+        ui_status_bar(canvas, "Scan", "OK=load", UiStatusScanning, m->battery, m->frame);
         draw_state_scanning(canvas, m);
         break;
 
     case ReaderStateReading:
+        ui_status_bar(canvas, "Reading", NULL, UiStatusLive, m->battery, m->frame);
         draw_state_reading(canvas, m);
         break;
 
-    case ReaderStateNotice:
-        ui_status_bar(canvas, m->notice_title, NULL, 0, 0, 0);
-        ui_notice(canvas, NULL, m->notice_l1, m->notice_l2);
-        break;
-
     case ReaderStateEmulating:
+        // "Emulating" + any center hint collides (ui_status_bar would drop the
+        // title), so the hint stays on the bottom line.
+        ui_status_bar(canvas, "Emulating", NULL, UiStatusLive, m->battery, m->frame);
         draw_radar(canvas, 64, 30, m->frame);
         draw_card_icon(canvas, 64, 30);
         draw_band(canvas);
         ui_draw_centered_fit(canvas, 53, m->emu_label, 100);
-        ui_draw_centered(canvas, 63, "Back: stop");
+        ui_draw_centered(canvas, 63, "Back=stop");
+        break;
+
+    default:
+        // ReaderStateNotice is handled above, before the switch.
         break;
     }
 }
@@ -147,7 +155,10 @@ ReaderState reader_get_state(ReaderApp* app) {
 }
 
 void reader_bump_frame(ReaderApp* app) {
-    with_view_model(app->view, ReaderModel * m, { m->frame++; }, true);
+    with_view_model(app->view, ReaderModel * m, {
+        m->frame++;
+        m->battery = furi_hal_power_get_pct();
+    }, true);
 }
 
 void reader_set_notice(ReaderApp* app, const char* title, const char* l1, const char* l2) {
@@ -159,6 +170,7 @@ void reader_set_notice(ReaderApp* app, const char* title, const char* l1, const 
             snprintf(m->notice_title, sizeof(m->notice_title), "%s", title);
             snprintf(m->notice_l1, sizeof(m->notice_l1), "%s", l1 ? l1 : "");
             snprintf(m->notice_l2, sizeof(m->notice_l2), "%s", l2 ? l2 : "");
+            m->battery = furi_hal_power_get_pct();
         },
         true);
 }
