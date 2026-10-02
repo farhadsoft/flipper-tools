@@ -17,6 +17,9 @@
 #include <lib/subghz/subghz_worker.h>
 #include <lib/subghz/devices/devices.h>
 #include <lib/subghz/protocols/raw.h>
+#include <lib/subghz/subghz_setting.h>
+#include <gui/modules/byte_input.h>
+#include <notification/notification.h>
 #include <lib/flipper_format/flipper_format.h>
 
 #define TAG "SubGhzAutoRec"
@@ -47,10 +50,10 @@
 #define REC_PROFILE_MAX      8
 #define REC_PROFILE_NAME_MAX 16 // spaces are the parse delimiter; see sub_rec_profile_save_result()
 #define REC_DUP_MAX 32 // dedup ring depth; ~1 uint32 comparison per entry per capture
-// sub_rec_build_settings() row order: Frequency=0, Modulation=1, Trigger=2,
-// Max captures=3, Max minutes=4, Dedup=5, Profiles=6 (D1/D2 inserted rows
-// before it).
-#define REC_SETTINGS_ROW_PROFILES 6
+// sub_rec_build_settings() row order. Only the two rows the enter callback
+// routes on are named; every other row is a plain value cycle.
+#define REC_SETTINGS_ROW_IGNORE   9
+#define REC_SETTINGS_ROW_PROFILES 10
 // storage_dir_read() truncates into a too-small buffer, and a truncated name
 // builds a path that does not exist -- storage_simply_remove() returns true
 // for an already-absent item (storage.h), so a truncated name would be
@@ -64,6 +67,41 @@
 // successful remove for a file that stays enumerable, which would otherwise
 // spin the GUI thread forever.
 #define REC_CLEAR_MAX_PASSES 8
+
+// Live decoded readout: proto is the firmware's own first get_string() line
+// ("<name> <bits>bit"), key is the same call's "Key:" line with the spaces
+// stripped, so 8 bytes -> 16 hex chars + NUL.
+#define REC_LIVE_PROTO_MAX 24
+#define REC_LIVE_KEY_MAX   17
+
+// Protocol ignore list. Compared against SubGhzProtocol::name; 24 covers
+// every shipped name ("Security+ 2.0" is the longest) without paying for a
+// FuriString per entry.
+#define REC_IGNORE_MAX      8
+#define REC_IGNORE_NAME_MAX 24
+
+// Add-manually protocol list: pointers into the firmware's own static
+// SubGhzProtocol table, never copied, so no name buffer is needed.
+#define REC_ADD_PROTO_MAX 64
+// NumberInput pre-fill for Add manually. 24 is the modal count for the
+// fixed-code families stock's own curated table offers (Princeton, CAME,
+// Nice Flo); anything else is one scroll away in a 1..64 range.
+#define REC_ADD_DEFAULT_BITS 24
+
+// Hopper, at stock subghz_txrx_hopper_update()'s own numbers: stay on a
+// frequency while its RSSI is above the floor for HOPPER_DWELL_TICKS hop
+// decisions, then advance to the next entry of the firmware's hopper list.
+// A decision runs every HOP_POLL_EVERY RSSI ticks, not every tick: each hop
+// tears async RX down and back up, which must not happen 40x a second.
+#define HOPPER_RSSI_FLOOR  (-90.0f)
+#define HOPPER_DWELL_TICKS 10
+#define HOP_POLL_EVERY     10 // 10 * RSSI_POLL_MS = 250 ms
+// Cap on the copied hopper list. The firmware's default is ~17 entries and
+// setting_user can add more; the copy is a fixed-size array because the
+// SubGhzSetting it comes from is freed again immediately (see
+// sub_rec_radio_alloc) -- keeping that object alive would cost several KB of
+// resident heap this module does not have.
+#define REC_HOP_FREQ_MAX 32
 
 #define RSSI_POLL_MS      25
 #define RSSI_REDRAW_EVERY 5 // repaint every 5th poll (~8 Hz); see recorder_ui.c
@@ -160,7 +198,18 @@ typedef enum {
     SubRecEventAnalyzePanL,
     SubRecEventAnalyzePanR,
     SubRecEventAnalyzeZoom,
-    SubRecEventProfileSlot0, // rows use +slot as their submenu index; never dispatched
+    SubRecEventSavedBrowseAll,
+    SubRecEventIgnoreAdd, // OK while listening: ignore the protocol on screen
+    SubRecEventIgnoreClear,
+    SubRecEventMenuAdd,
+    // Slot rows use +slot as their submenu index and are never dispatched
+    // directly, so each base needs an explicit value: the plain sequential
+    // enum would put IgnoreSlot0 only one id above ProfileSlot0 and the two
+    // slot ranges would overlap. Every value stays well under 256, which
+    // EVENT_MAKE's generation packing requires.
+    SubRecEventProfileSlot0 = 40, // + REC_PROFILE_MAX (8) -> 40..47
+    SubRecEventIgnoreSlot0 = 56, // + REC_IGNORE_MAX (8) -> 56..63
+    SubRecEventAddSlot0 = 72, // + REC_ADD_PROTO_MAX (64) -> 72..135
 } SubRecCustomEvent;
 
 typedef enum {
@@ -173,6 +222,9 @@ typedef enum {
     SubRecViewSaved, // Submenu: Saved-signals actions (browse / clear all)
     SubRecViewConfirm, // Submenu: destructive-action confirmation
     SubRecViewProfiles, // Submenu: saved profiles
+    SubRecViewIgnore, // Submenu: ignored protocols (OK removes)
+    SubRecViewAddProto, // Submenu: Add-manually protocol picker
+    SubRecViewByte, // ByteInput: Add-manually key entry
 } SubRecView;
 
 // Momentum's SubGhzRadioPreset appends float latitude/longitude past the
@@ -246,6 +298,7 @@ typedef struct {
     char freq_line[24];
     char last_file[REC_TEXT_LINE_MAX];
     char proto_line[REC_TEXT_LINE_MAX]; // last capture's decoded protocol; "" = none
+    char live_key[REC_LIVE_KEY_MAX]; // last decode's key hex; "" = none yet
     char notice_title[24];
     char notice_l1[REC_TEXT_LINE_MAX];
     char notice_l2[REC_TEXT_LINE_MAX];
@@ -387,6 +440,56 @@ typedef struct {
     uint32_t dup;
     uint32_t dup_hash[REC_DUP_MAX];
     uint32_t dup_n;
+
+    // Hopper. hop_freq is the frequency the radio is actually on while
+    // hopping (0 = not hopping): sub_rec_format_freq_line() prefers it, so
+    // the on-screen line and the file a capture is saved under both follow
+    // the hop without freq_idx/custom_freq -- and therefore the persisted
+    // config -- ever changing.
+    uint32_t hop_freqs[REC_HOP_FREQ_MAX]; // copied out of a throwaway SubGhzSetting
+    uint8_t hop_n;
+    bool keystore; // Settings row; gates the multi-KB resident keystore load
+    bool hopping;
+    uint32_t hop_freq;
+    uint8_t hop_idx;
+    uint8_t hop_timeout;
+    uint8_t hop_tick;
+
+    // Feedback. sound is stock's "Sound:" row: mirror the RX data to the
+    // speaker. speaker_held is the sole owner of the matching release.
+    NotificationApp* notify;
+    bool sound;
+    bool alert;
+    bool speaker_held;
+
+    // Live decoded readout. live_mutex guards live_proto/live_key/live_new:
+    // the worker thread writes all three in sub_rec_live_snapshot(), the GUI
+    // thread copies them out on the RSSI tick. Nothing else takes it, so
+    // there is no lock ordering to get wrong.
+    FuriMutex* live_mutex;
+    char live_proto[REC_LIVE_PROTO_MAX];
+    char live_key[REC_LIVE_KEY_MAX];
+    bool live_new;
+
+    // Protocol ignore list, persisted in config.
+    char ignore[REC_IGNORE_MAX][REC_IGNORE_NAME_MAX];
+    uint8_t ignore_n;
+    Submenu* ignore_menu;
+
+    // Add manually. add_names[] points into the firmware's protocol table;
+    // add_bits/add_key are the NumberInput/ByteInput targets.
+    Submenu* add_menu;
+    ByteInput* byte_input;
+    const char* add_names[REC_ADD_PROTO_MAX];
+    uint8_t add_n;
+    uint8_t add_sel;
+    uint8_t add_bits;
+    uint8_t add_key[8];
+    bool number_is_add; // which flow opened the shared NumberInput; picks Back's target
+    // Captured like freq_item/mod_item/trigger_item: the Ignore row's text is
+    // the list length, which changes from three different places, and
+    // set_current_value_index() never fires a change callback to refresh it.
+    VariableItem* ignore_item;
 
     uint32_t capture_start_tick;
     uint32_t last_above_tick;

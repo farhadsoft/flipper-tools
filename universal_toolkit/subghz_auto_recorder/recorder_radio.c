@@ -1,5 +1,6 @@
 #include "recorder_radio.h"
 #include "recorder_ui.h"
+#include "recorder_parse.h"
 #undef TAG
 #include "../toolkit_app.h"
 #undef TAG
@@ -12,6 +13,9 @@
 #include <lib/subghz/subghz_protocol_registry.h>
 #include <lib/flipper_format/flipper_format_i.h> // flipper_format_get_raw_stream
 #include <lib/toolbox/stream/stream.h>           // stream_copy_full
+#include <furi_hal.h>
+#include <furi_hal_resources.h> // gpio_speaker
+#include <notification/notification_messages.h>
 
 /* ------------------------- worker/receiver callbacks ------------------ */
 
@@ -33,6 +37,27 @@ static void sub_rec_overrun(void* context) {
     subghz_receiver_reset(app->receiver);
 }
 
+// SubGhzWorker thread, from the decode callback -- the same thread stock's
+// own Read mode formats on, and the only place it is race-free: get_string()
+// reads generic.data/data_count_bit that the next edge on this thread would
+// otherwise mutate under a reader. live_mutex exists solely so the GUI
+// thread's copy-out in sub_rec_live_publish() cannot tear.
+static void sub_rec_live_snapshot(SubRecApp* app, SubGhzProtocolDecoderBase* base) {
+    FuriString* s = furi_string_alloc();
+    if(subghz_protocol_decoder_base_get_string(base, s) &&
+       furi_mutex_acquire(app->live_mutex, FuriWaitForever) == FuriStatusOk) {
+        sub_rec_live_parse(
+            furi_string_get_cstr(s),
+            app->live_proto,
+            sizeof(app->live_proto),
+            app->live_key,
+            sizeof(app->live_key));
+        app->live_new = true; // written last: publish() copies only after seeing it
+        furi_mutex_release(app->live_mutex);
+    }
+    furi_string_free(s);
+}
+
 // Runs on the SubGhzWorker thread. SubGhzProtocolTypeDynamic == 2 is
 // fork-stable (CLAUDE.md crash rule 3). app->rolling is volatile -- see its
 // declaration in recorder_app.h for why that is required and sufficient. It
@@ -46,6 +71,7 @@ static void
         app->rolling = true;
     }
     app->decoded = base;
+    sub_rec_live_snapshot(app, base);
 }
 
 /* ---------------------------- session lifecycle ------------------------ */
@@ -54,14 +80,12 @@ static void
 // subghz_txrx_alloc().
 void sub_rec_radio_alloc(SubRecApp* app) {
     app->env = subghz_environment_alloc();
-    subghz_environment_set_protocol_registry(app->env, &subghz_protocol_registry);
-    // Rainbow-table filenames must be set even though we never load the
-    // keystore: the Came Atomo / Nice Flor-S / Alutech decoders dereference
-    // them when they fire.
     subghz_environment_set_came_atomo_rainbow_table_file_name(app->env, SUBGHZ_CAME_ATOMO_DIR_NAME);
     subghz_environment_set_alutech_at_4n_rainbow_table_file_name(
         app->env, SUBGHZ_ALUTECH_AT_4N_DIR_NAME);
     subghz_environment_set_nice_flor_s_rainbow_table_file_name(app->env, SUBGHZ_NICE_FLOR_S_DIR_NAME);
+    // Stock sets the registry last, after the keystore and the rainbow tables.
+    subghz_environment_set_protocol_registry(app->env, &subghz_protocol_registry);
 
     app->receiver = subghz_receiver_alloc_init(app->env);
     // (flag & filter) != 0 -- an OR test, lib/subghz/receiver.c -- so this
@@ -91,6 +115,22 @@ void sub_rec_radio_alloc(SubRecApp* app) {
     // subghz_devices_begin()/_end() are not called: cc1101_int_interconnect.c
     // has .begin = NULL and .end = furi_hal_subghz_shutdown, and the stock
     // app likewise skips both for the internal radio.
+
+    // The firmware's hopper frequency list, copied out of a throwaway
+    // SubGhzSetting that is freed again before this function returns:
+    // subghz_setting_alloc() keeps the whole parsed setting_user (frequency
+    // list, presets with their data blobs) resident for the life of the
+    // object, and this module's heap headroom is measured in low kilobytes.
+    // A copy of just the hopper list is at most REC_HOP_FREQ_MAX uint32s.
+    SubGhzSetting* setting = subghz_setting_alloc();
+    subghz_setting_load(setting, EXT_PATH("subghz/assets/setting_user"));
+    size_t n = subghz_setting_get_hopper_frequency_count(setting);
+    if(n > REC_HOP_FREQ_MAX) n = REC_HOP_FREQ_MAX;
+    for(size_t i = 0; i < n; i++) {
+        app->hop_freqs[i] = subghz_setting_get_hopper_frequency(setting, i);
+    }
+    app->hop_n = (uint8_t)n;
+    subghz_setting_free(setting);
 }
 
 // Run after sub_rec_listen_stop(), so the driver is in SubGhzStateIdle --
@@ -102,6 +142,108 @@ void sub_rec_radio_free(SubRecApp* app) {
     subghz_worker_free(app->worker);
     subghz_receiver_free(app->receiver);
     subghz_environment_free(app->env);
+}
+
+// GUI thread, once per session, from sub_rec_app_alloc() AFTER the config has
+// been read -- the Settings row that gates it lives there. Stock loads both
+// paths in subghz_txrx_alloc(): the shipped keeloq_mfcodes database, then the
+// user's own additions (which stock loads without checking the result).
+// Without them the whole KeeLoq family -- Came Atomo, Nice Flor-S, Alutech
+// AT-4N and every manufacture-keyed DoorHan/LiftMaster -- fails to decode AND
+// to replay; the rainbow-table filenames set in sub_rec_radio_alloc() are
+// only the second half of that support, which is why setting them without
+// this call is silently useless.
+//
+// Opt-in (Settings > Keystore, default Off) and out of sub_rec_radio_alloc()
+// for one measured reason: the parsed database is resident for the whole
+// module session and runs to several kilobytes, while this module's heap
+// minimum was measured at 2448 bytes free with the keystore NOT loaded
+// (Momentum mntm-dev, 2026-10-02). Loading it by default is how a launcher
+// module starts rebooting the device at enter. Flip the row On when the
+// KeeLoq family matters and re-measure the heap margin first.
+void sub_rec_keystore_load(SubRecApp* app) {
+    if(!subghz_environment_load_keystore(app->env, SUBGHZ_KEYSTORE_DIR_NAME)) {
+        // Not fatal: every fixed-code protocol still works. Logged because it
+        // is the only observable signal that /ext/subghz/assets is missing,
+        // and the failure would otherwise surface much later as an
+        // unexplained "TX failed / bad payload".
+        FURI_LOG_W(TAG, "keystore: %s not loaded", SUBGHZ_KEYSTORE_DIR_NAME);
+    }
+    subghz_environment_load_keystore(app->env, SUBGHZ_KEYSTORE_DIR_USER_NAME);
+}
+
+/* ------------------------- speaker + notifications --------------------- */
+
+// GUI thread. Stock subghz_txrx_speaker_on(): acquire first, mirror second,
+// and only while async RX is about to run -- the mirror pin is a CC1101 GDO
+// route, so it is meaningless (and clicky) with the radio idle.
+// acquire() takes a timeout in ms and returns false when the speaker belongs
+// to someone else; speaker_held then stays false and off() is a no-op, so the
+// release is never unpaired.
+void sub_rec_speaker_on(SubRecApp* app) {
+    if(!app->sound || app->speaker_held) return;
+    if(furi_hal_speaker_acquire(30)) {
+        subghz_devices_set_async_mirror_pin(app->device, &gpio_speaker);
+        app->speaker_held = true;
+    } else {
+        FURI_LOG_W(TAG, "speaker busy, RX audio off");
+    }
+}
+
+// Stock subghz_txrx_speaker_off(): unmirror, then release, and only while we
+// still own it -- releasing someone else's speaker would leave the
+// notification service holding a dead handle.
+void sub_rec_speaker_off(SubRecApp* app) {
+    if(!app->speaker_held) return;
+    if(furi_hal_speaker_is_mine()) {
+        subghz_devices_set_async_mirror_pin(app->device, NULL);
+        furi_hal_speaker_release();
+    }
+    app->speaker_held = false;
+}
+
+// GUI thread. _block, not the async variant, and only after parking the
+// speaker: the notification service plays no sound on a speaker it does not
+// own, and an async notification fired while we hold it would be silently
+// half-played (vibro/LED only) with no way to tell which happened.
+//
+// The rssi_timer is stopped for the duration -- a blocking call on the GUI
+// thread with a 25 ms poster left running fills the dispatcher's 16-deep
+// queue in ~400 ms (CLAUDE.md invariant 6) and a full sequence_success is
+// that long.
+void sub_rec_alert(SubRecApp* app, const NotificationSequence* seq) {
+    if(!app->alert || !app->notify) return;
+    furi_timer_stop(app->rssi_timer);
+    bool parked = app->speaker_held;
+    if(parked) sub_rec_speaker_off(app);
+    notification_message_block(app->notify, seq);
+    if(parked) sub_rec_speaker_on(app);
+    if(app->state == SubRecStateArmed || app->state == SubRecStateRecording) {
+        furi_timer_start(app->rssi_timer, furi_ms_to_ticks(RSSI_POLL_MS));
+    }
+}
+
+/* -------------------------- live decoded readout ------------------------ */
+
+// GUI thread, from the RSSI tick. live_new is read outside the mutex first:
+// it is only ever set (worker) and cleared (here), so a false negative just
+// defers the publish to the next 25 ms tick.
+void sub_rec_live_publish(SubRecApp* app) {
+    if(!app->live_new) return;
+    if(furi_mutex_acquire(app->live_mutex, FuriWaitForever) != FuriStatusOk) return;
+    app->live_new = false;
+    sub_rec_set_live(app, app->live_proto, app->live_key);
+    furi_mutex_release(app->live_mutex);
+}
+
+void sub_rec_live_clear(SubRecApp* app) {
+    if(furi_mutex_acquire(app->live_mutex, FuriWaitForever) == FuriStatusOk) {
+        app->live_new = false;
+        app->live_proto[0] = '\0';
+        app->live_key[0] = '\0';
+        furi_mutex_release(app->live_mutex);
+    }
+    sub_rec_set_live(app, "", "");
 }
 
 // GUI thread only; mirrors subghz_txrx_begin() + subghz_txrx_rx().
@@ -130,6 +272,7 @@ void sub_rec_listen_start(SubRecApp* app) {
     subghz_devices_load_preset(app->device, sub_rec_mods[app->mod_idx].preset, NULL);
     subghz_devices_set_frequency(app->device, freq);
     subghz_devices_flush_rx(app->device);
+    sub_rec_speaker_on(app); // stock: mirror before start_async_rx, not after
     subghz_devices_start_async_rx(app->device, (void*)subghz_worker_rx_callback, app->worker);
     subghz_worker_start(app->worker);
 
@@ -138,10 +281,26 @@ void sub_rec_listen_start(SubRecApp* app) {
     app->preset.base.data = NULL;
     app->preset.base.data_size = 0;
 
+    // Hopper state is per-listen-session: hop_freq 0 is what tells
+    // sub_rec_format_freq_line() (two lines below) to show the configured
+    // frequency rather than wherever the last session ended up.
+    app->hop_freq = 0;
+    app->hop_idx = 0;
+    app->hop_timeout = 0;
+    app->hop_tick = 0;
+
     char line[24];
     sub_rec_format_freq_line(app, line, sizeof(line));
     sub_rec_set_freq_line(app, line, sub_rec_triggers[app->trigger_idx]);
     sub_rec_set_proto_line(app, "");
+    // Both are per-burst state a previous listen session may have left
+    // behind. decoded is what OK-while-listening ignores and live_new is what
+    // the next tick publishes, so a stale pair would put the last session's
+    // signal on screen and let the user ignore a protocol that is not the one
+    // in front of them.
+    app->decoded = NULL;
+    app->rolling = false;
+    sub_rec_live_clear(app);
 
     furi_timer_start(app->rssi_timer, furi_ms_to_ticks(RSSI_POLL_MS));
     sub_rec_set_state(app, SubRecStateArmed, false);
@@ -186,6 +345,20 @@ static bool sub_rec_dup_seen(SubRecApp* app, uint32_t h) {
 static void sub_rec_dup_add(SubRecApp* app, uint32_t h) {
     app->dup_hash[app->dup_n % REC_DUP_MAX] = h;
     app->dup_n++;
+}
+
+// GUI thread, after the worker join in sub_rec_capture_finish() -- the same
+// synchronisation sub_rec_decoded_hash() relies on. protocol->name's offset
+// is identical in official 1.4.3 and Momentum @8ed809fb: Momentum appends
+// `filter` at the END of struct SubGhzProtocol (lib/subghz/types.h), so
+// everything before it keeps its offset.
+static bool sub_rec_is_ignored(SubRecApp* app) {
+    if(!app->decoded || app->ignore_n == 0) return false;
+    const char* name = app->decoded->protocol->name;
+    for(uint8_t i = 0; i < app->ignore_n; i++) {
+        if(strcmp(app->ignore[i], name) == 0) return true;
+    }
+    return false;
 }
 
 // GUI thread only, and only from sub_rec_capture_finish() AFTER its
@@ -262,7 +435,7 @@ static void sub_rec_save_decoded(SubRecApp* app, char* label, size_t label_size)
 // Shared by sub_rec_capture_end() and sub_rec_listen_stop(). Stop-before-
 // close ordering matches the stock firmware (subghz_scene_read_raw.c:
 // subghz_txrx_stop() then subghz_protocol_raw_save_to_file_stop()).
-static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_worker) {
+static bool sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_worker) {
     app->toolkit->gen++;
     subghz_worker_stop(app->worker);
     size_t spl = subghz_protocol_raw_get_sample_write(app->raw);
@@ -271,8 +444,12 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
     const char* final_name = "";
     char proto_label[REC_TEXT_LINE_MAX] = "";
     bool kept = spl >= MIN_RAW_SAMPLES;
+    // The ignore check runs before dedup: it is a name compare against a
+    // <=8-entry list, and skipping the hash keeps an ignored protocol out of
+    // the dedup ring so un-ignoring it takes effect on the very next burst.
+    bool ignored = kept && sub_rec_is_ignored(app);
     bool dup = false;
-    if(kept && app->dedup && app->decoded) {
+    if(kept && !ignored && app->dedup && app->decoded) {
         uint32_t h = sub_rec_decoded_hash(app);
         if(h) {
             if(sub_rec_dup_seen(app, h)) dup = true;
@@ -289,16 +466,22 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
             FURI_LOG_W(TAG, "drop: remove failed: %s", drop_path);
         }
         app->dropped++;
-    } else if(dup) {
-        // Same checked remove the drop path uses: storage_simply_remove() returns
-        // true for an already-absent file, so an unchecked call would hide a real
-        // failure. No _D sidecar was written, so there is nothing else to clean up.
+    } else if(dup || ignored) {
+        // Same checked remove the drop path uses: storage_simply_remove()
+        // returns true for an already-absent file, so an unchecked call would
+        // hide a real failure. No _D sidecar was written for either, so there
+        // is nothing else to clean up. An ignored capture counts as dropped:
+        // it is not a duplicate of anything, it was rejected on purpose.
         const char* raw_path = furi_string_get_cstr(app->capture_path);
         if(!storage_simply_remove(app->storage, raw_path)) {
-            FURI_LOG_W(TAG, "dup: remove failed: %s", raw_path);
+            FURI_LOG_W(TAG, "%s: remove failed: %s", dup ? "dup" : "ignored", raw_path);
         }
-        app->dup++;
-        FURI_LOG_I(TAG, "capture duplicate: %u samples", (unsigned)spl);
+        if(dup) {
+            app->dup++;
+        } else {
+            app->dropped++;
+        }
+        FURI_LOG_I(TAG, "capture %s: %u samples", dup ? "duplicate" : "ignored", (unsigned)spl);
     } else {
         // The rolling-code flag is only known now, after the burst has been
         // decoded -- it is the sole persistence of the warning, re-appended
@@ -333,12 +516,16 @@ static void sub_rec_capture_finish(SubRecApp* app, bool capped, bool restart_wor
     }
     sub_rec_set_state(app, SubRecStateArmed, capped);
     sub_rec_set_counts(app, app->saved, app->dropped, app->dup, final_name);
-    sub_rec_set_proto_line(app, proto_label);
-    if(!dup) {
-        // The dup branch above already logged "capture duplicate: ..." --
+    // Only a non-empty label overwrites the line: proto_line is now also the
+    // live readout (sub_rec_live_publish), and blanking it on every dropped
+    // or ignored burst would erase the last signal the user was shown.
+    if(proto_label[0]) sub_rec_set_proto_line(app, proto_label);
+    if(!dup && !ignored) {
+        // The dup/ignored branches above already logged their own line --
         // this must never also claim "saved" for a file that was removed.
         FURI_LOG_I(TAG, "capture %s: %u samples", kept ? "saved" : "dropped", (unsigned)spl);
     }
+    return kept && !dup && !ignored;
 }
 
 void sub_rec_capture_begin(SubRecApp* app) {
@@ -387,7 +574,12 @@ void sub_rec_capture_begin(SubRecApp* app) {
 }
 
 void sub_rec_capture_end(SubRecApp* app, bool capped) {
-    sub_rec_capture_finish(app, capped, true);
+    // Only the re-arming path alerts. capture_finish() is shared with
+    // sub_rec_listen_stop(), where the radio is going down and a "saved" blip
+    // would fire on the way out of the module.
+    if(sub_rec_capture_finish(app, capped, true)) {
+        sub_rec_alert(app, &sequence_success);
+    }
 }
 
 void sub_rec_listen_stop(SubRecApp* app) {
@@ -404,8 +596,72 @@ void sub_rec_listen_stop(SubRecApp* app) {
     }
     subghz_devices_stop_async_rx(app->device);
     subghz_devices_idle(app->device);
+    sub_rec_speaker_off(app);
+    app->hop_freq = 0;
     app->toolkit->gen++;
     sub_rec_set_state(app, SubRecStateIdle, false);
+}
+
+/* --------------------------------- hopper ------------------------------ */
+
+// GUI thread, from the RSSI tick while Armed. Stock
+// subghz_txrx_hopper_update() at its own numbers: dwell on a frequency whose
+// RSSI is above HOPPER_RSSI_FLOOR for HOPPER_DWELL_TICKS decisions, then
+// advance through the firmware's hopper list. HOP_POLL_EVERY decimates this
+// app's 25 ms tick to one decision per 250 ms -- a hop tears async RX down
+// and back up, so it must not run at the raw tick rate.
+//
+// Returns true when the frequency actually changed. This tick's RSSI was read
+// before the hop, so the caller must not start a capture on it.
+bool sub_rec_hopper_step(SubRecApp* app) {
+    size_t n = app->hop_n;
+    if(n == 0) return false; // no hopper list on this SD: silent no-op
+
+    if(++app->hop_tick < HOP_POLL_EVERY) return false;
+    app->hop_tick = 0;
+
+    if(app->hop_timeout) {
+        app->hop_timeout--;
+        return false; // still dwelling where a signal was heard
+    }
+    if(subghz_devices_get_rssi(app->device) > HOPPER_RSSI_FLOOR) {
+        app->hop_timeout = HOPPER_DWELL_TICKS;
+        return false;
+    }
+
+    uint8_t idx = (uint8_t)((app->hop_idx + 1) % n);
+    uint32_t f = app->hop_freqs[idx];
+    // CLAUDE.md crash rule 3. Unlike sub_rec_freqs[], this list comes from
+    // the SD's setting_user and is not compile-time-checked.
+    if(!subghz_devices_is_frequency_valid(app->device, f)) {
+        FURI_LOG_W(TAG, "hopper: %lu Hz rejected, skipping", (unsigned long)f);
+        app->hop_idx = idx;
+        return false;
+    }
+
+    // Teardown order is sub_rec_listen_stop()'s and bring-up order is
+    // sub_rec_listen_start()'s: worker stop (which joins) -> stop_async_rx ->
+    // idle -> set_frequency -> flush_rx -> speaker -> start_async_rx ->
+    // worker start. The receiver is reset as well, so a half-frame from the
+    // old frequency cannot complete on the new one (stock does the same).
+    subghz_worker_stop(app->worker);
+    subghz_devices_stop_async_rx(app->device);
+    subghz_devices_idle(app->device);
+    subghz_devices_set_frequency(app->device, f);
+    subghz_receiver_reset(app->receiver);
+    subghz_devices_flush_rx(app->device);
+    sub_rec_speaker_on(app);
+    subghz_devices_start_async_rx(app->device, (void*)subghz_worker_rx_callback, app->worker);
+    subghz_worker_start(app->worker);
+
+    app->hop_idx = idx;
+    app->hop_freq = f;
+    app->preset.base.frequency = f; // a capture opened now saves at THIS frequency
+    char line[24];
+    sub_rec_format_freq_line(app, line, sizeof(line));
+    sub_rec_set_freq_line(app, line, sub_rec_triggers[app->trigger_idx]);
+    FURI_LOG_D(TAG, "hopper: -> %lu Hz", (unsigned long)f);
+    return true;
 }
 
 /* ----------------------------- frequency scan --------------------------- */
@@ -731,5 +987,122 @@ void sub_rec_handle_tx_poll(SubRecApp* app) {
     if(timed_out && !done) FURI_LOG_W(TAG, "replay: TX timeout");
 
     sub_rec_tx_stop(app);
+    // Stock plays sequence_audiovisual_alert on a completed transmit; a
+    // timeout gets the error sequence instead so the two are tellable apart
+    // without reading the screen.
+    sub_rec_alert(app, done ? &sequence_audiovisual_alert : &sequence_error);
     sub_rec_show_notice(app, done ? "Sent" : "TX timeout", "", "", SubRecViewFileMenu, 0);
+}
+
+/* ------------------------------ add manually --------------------------- */
+
+// GUI thread. Stock subghz_txrx_gen_data_protocol()'s trick, which is the
+// only way to do this without a per-protocol table of extra fields: let the
+// firmware serialize the protocol's own decoder as-is (so TE:, Cnt:,
+// Manufacture name: and everything else a given protocol needs is written by
+// the protocol itself), then overwrite just Bit and Key.
+//
+// The bit count is the caller's, not the protocol's, so this is a superset of
+// stock's Add-manually -- which only ever generates a RANDOM key for a
+// hardcoded protocol/frequency/bit table (subghz_scene_set_type.c).
+void sub_rec_add_manual(SubRecApp* app, const char* proto, uint8_t bits, const uint8_t* key) {
+    SubGhzProtocolDecoderBase* base =
+        subghz_receiver_search_decoder_base_by_name(app->receiver, proto);
+    if(!base) {
+        FURI_LOG_W(TAG, "add: no decoder for %s", proto);
+        sub_rec_show_notice(app, "Not supported", proto, "", SubRecViewAddProto, 0);
+        return;
+    }
+
+    uint32_t freq = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
+    if(!subghz_devices_is_frequency_valid(app->device, freq)) {
+        sub_rec_show_notice(app, "Bad frequency", proto, "", SubRecViewAddProto, 0);
+        return;
+    }
+
+    // serialize() takes Frequency and Preset from the preset handed to it, so
+    // both must be current: .name is otherwise only maintained by
+    // listen_start(), which may never have run this session.
+    furi_string_set_str(app->preset.base.name, sub_rec_mods[app->mod_idx].label);
+    app->preset.base.frequency = freq;
+
+    FuriString* path = furi_string_alloc();
+    FlipperFormat* ff = flipper_format_string_alloc();
+    bool ok = subghz_protocol_decoder_base_serialize(base, ff, &app->preset.base) ==
+              SubGhzProtocolStatusOk;
+
+    uint32_t bit = bits;
+    ok = ok && flipper_format_update_uint32(ff, "Bit", &bit, 1);
+    // Key is always the full 8 bytes big-endian, exactly as
+    // subghz_block_generic_serialize() writes it; the reader masks to `Bit`.
+    ok = ok && flipper_format_update_hex(ff, "Key", key, sizeof(uint64_t));
+    // A protocol with a timing field serializes whatever te its decoder last
+    // saw -- 0 on a radio that has never decoded one, which the encoder would
+    // transmit as a zero-length pulse. 400 us is stock's own default for
+    // precisely this case (subghz_scene_set_type.c, every Princeton/CAME row).
+    if(ok && flipper_format_key_exist(ff, "TE")) {
+        uint32_t te = 400;
+        ok = flipper_format_update_uint32(ff, "TE", &te, 1);
+    }
+
+    // Validate by doing exactly what Replay will do. This catches a bit count
+    // the protocol rejects before anything reaches the SD card -- and, since
+    // it goes through the firmware's own registry lookup, it is also the
+    // fork-safe way to discover that a protocol has no usable encoder.
+    if(ok) {
+        SubGhzTransmitter* tx = subghz_transmitter_alloc_init(app->env, proto);
+        // No subghz_transmitter_stop(): nothing was ever started. Stock's own
+        // failed-deserialize path frees without stopping, too.
+        ok = tx && subghz_transmitter_deserialize(tx, ff) == SubGhzProtocolStatusOk;
+        if(tx) subghz_transmitter_free(tx);
+    }
+
+    if(ok) {
+        // A protocol name is a display string ("Security+ 2.0", "Nice
+        // Flor-S"); only the two characters that would break a path fold.
+        char stem[REC_STEM_MAX];
+        size_t w = 0;
+        for(const char* c = proto; *c && w + 1 < sizeof(stem); c++) {
+            stem[w++] = (*c == ' ' || *c == '/') ? '_' : *c;
+        }
+        stem[w] = '\0';
+
+        FuriString* name = furi_string_alloc();
+        storage_get_next_filename(app->storage, REC_DIR, stem, ".sub", name, REC_STEM_MAX);
+        furi_string_printf(path, "%s/%s.sub", REC_DIR, furi_string_get_cstr(name));
+        furi_string_free(name);
+
+        FlipperFormat* out = flipper_format_file_alloc(app->storage);
+        ok = flipper_format_file_open_always(out, furi_string_get_cstr(path)) &&
+             stream_copy_full(
+                 flipper_format_get_raw_stream(ff), flipper_format_get_raw_stream(out)) > 0;
+        flipper_format_free(out);
+    }
+
+    flipper_format_free(ff);
+
+    if(!ok) {
+        // Nothing was opened on the failure paths above, but the file-open
+        // half of the save can still have created one: never leave a
+        // half-written key file behind to be replayed later.
+        if(!storage_simply_remove(app->storage, furi_string_get_cstr(path))) {
+            FURI_LOG_W(TAG, "add: cleanup failed: %s", furi_string_get_cstr(path));
+        }
+        FURI_LOG_W(TAG, "add: %s %ubit rejected", proto, bits);
+        furi_string_free(path);
+        sub_rec_show_notice(app, "Add failed", proto, "bad bit/key", SubRecViewAddProto, 0);
+        return;
+    }
+
+    furi_string_set(app->selected_path, path);
+    const char* full = furi_string_get_cstr(path);
+    const char* base_name = strrchr(full, '/');
+    base_name = base_name ? base_name + 1 : full;
+    submenu_set_header(app->file_menu, base_name);
+    app->rc_warned = false; // a fresh pick, exactly as sub_rec_do_browse() does
+    app->note_buf[0] = '\0';
+    FURI_LOG_I(TAG, "add: %s %ubit -> %s", proto, bits, base_name);
+    furi_string_free(path);
+    // Lands on the file menu, so Replay is one OK press away.
+    sub_rec_show_notice(app, "Added", base_name, "", SubRecViewFileMenu, 0);
 }

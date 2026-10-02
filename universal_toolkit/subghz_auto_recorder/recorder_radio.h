@@ -52,3 +52,32 @@ void sub_rec_replay(SubRecApp* app);
 void sub_rec_tx_stop(SubRecApp* app);
 void sub_rec_tx_abort(SubRecApp* app);
 void sub_rec_handle_tx_poll(SubRecApp* app);
+
+// Live decoded readout. sub_rec_decoded_callback() (SubGhzWorker thread)
+// fills app->live_proto/live_key under app->live_mutex; publish copies them
+// into the view model and is called from the RSSI tick on the GUI thread.
+void sub_rec_live_publish(SubRecApp* app);
+void sub_rec_live_clear(SubRecApp* app);
+
+// Hopper: one hop decision, called from the RSSI tick while Armed. Returns
+// true when it moved the radio to a different frequency, which makes this
+// tick's RSSI reading stale -- the caller must not start a capture on it.
+bool sub_rec_hopper_step(SubRecApp* app);
+
+// RX speaker mirror (stock subghz_txrx_speaker_on/off parity). app->speaker_held
+// is the sole owner of the matching furi_hal_speaker_release().
+void sub_rec_speaker_on(SubRecApp* app);
+void sub_rec_speaker_off(SubRecApp* app);
+// Notification blip. Parks the speaker first when this app owns it: the
+// notification service cannot play a sound on a speaker it does not own.
+void sub_rec_alert(SubRecApp* app, const NotificationSequence* seq);
+
+// Add manually: build and save a .sub for `proto` from an explicit bit count
+// and 8-byte key, using the firmware's own serializer (stock
+// subghz_txrx_gen_data_protocol()'s serialize-then-update trick), and select
+// it as the current file. Raises its own notice on every failure path.
+void sub_rec_add_manual(SubRecApp* app, const char* proto, uint8_t bits, const uint8_t* key);
+
+// Opt-in KeeLoq manufacture-key database load; see its definition for why it
+// is gated and why it runs after the config load, not in sub_rec_radio_alloc().
+void sub_rec_keystore_load(SubRecApp* app);

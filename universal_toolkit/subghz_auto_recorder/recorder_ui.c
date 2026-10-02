@@ -55,12 +55,19 @@ static void draw_listening(Canvas* canvas, const SubRecModel* m) {
         (uint8_t)(clamp01((m->trigger - RSSI_FLOOR_DBM) / (RSSI_CEIL_DBM - RSSI_FLOOR_DBM)) * 255);
     ui_meter(canvas, UI_MARGIN, 32, UI_W - 2 * UI_MARGIN, level, thresh, m->anim_phase);
 
+    // Two lines while a live decode is up: the firmware's own "<name>
+    // <bits>bit" plus its key hex. y=45/54 keeps the pair clear of the meter
+    // above (rows 32-38) and of the footer glyphs below (centre y=58).
     char buf[32];
     if(recording) {
         snprintf(buf, sizeof(buf), "rec  %u spl", (unsigned)m->samples);
         ui_draw_centered(canvas, 50, buf);
     } else if(m->cooldown) {
         ui_draw_centered(canvas, 50, "carrier");
+    } else if(m->live_key[0]) {
+        ui_draw_centered_fit(canvas, 45, m->proto_line, 124);
+        snprintf(buf, sizeof(buf), "Key %s", m->live_key);
+        ui_draw_centered_fit(canvas, 54, buf, 124);
     } else if(m->proto_line[0]) {
         ui_draw_centered_fit(canvas, 50, m->proto_line, 124);
     } else {
@@ -321,6 +328,17 @@ void sub_rec_set_proto_line(SubRecApp* app, const char* proto) {
         app->view,
         SubRecModel * m,
         { snprintf(m->proto_line, sizeof(m->proto_line), "%s", proto); },
+        true);
+}
+
+void sub_rec_set_live(SubRecApp* app, const char* proto, const char* key) {
+    with_view_model(
+        app->view,
+        SubRecModel * m,
+        {
+            snprintf(m->proto_line, sizeof(m->proto_line), "%s", proto);
+            snprintf(m->live_key, sizeof(m->live_key), "%s", key);
+        },
         true);
 }
 

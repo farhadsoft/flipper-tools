@@ -20,6 +20,10 @@ void sub_rec_set_counts(SubRecApp* app, uint32_t saved, uint32_t dropped, uint32
 // meaningful (the last capture saved) across an arm/disarm cycle.
 void sub_rec_set_dup(SubRecApp* app, uint32_t dup);
 void sub_rec_set_proto_line(SubRecApp* app, const char* proto);
+// Publishes the live decoded readout (protocol label + key hex) as one pair:
+// draw_listening() only shows the key line when both arrived together, so a
+// half-updated signal can never be drawn.
+void sub_rec_set_live(SubRecApp* app, const char* proto, const char* key);
 // Sole writer of the model's `trigger` (the RSSI-bar tick position).
 void sub_rec_set_freq_line(SubRecApp* app, const char* line, float trigger);
 void sub_rec_set_scan(SubRecApp* app, uint8_t idx, int8_t dbm, uint8_t peak, bool update);

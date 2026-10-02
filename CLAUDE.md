@@ -1723,6 +1723,84 @@ until actually observed. The CLI `input send` view-switch race above
    structurally identical to the already-verified table-entry ternary,
    but the widget has never been driven).
 
+## Seven-capability session, 2026-10-01/02 — SubGHz surface completion
+
+Closed the gap between this module and the stock Sub-GHz app's capability
+set, one Settings/menu row per capability, each verified against official
+1.4.3 source (and Momentum @8ed809fb where the fork differs) before being
+written:
+
+|Capability|Where|Notes|
+|---|---|---|
+|Keystore (KeeLoq family)|`sub_rec_keystore_load()`, gated by Settings > Keystore|stock `subghz_txrx_alloc()` order; **opt-in, default Off** — see the heap note below|
+|Live decoded readout|`sub_rec_live_snapshot()` (worker thread) + `sub_rec_live_publish()` (RSSI tick) + `recorder_parse.c`|worker-thread formatting is stock's own choice in `subghz_scene_receiver.c`; `live_mutex` guards the GUI copy-out; the parser is HAL-free and pinned by `test/test_recorder_parse.c`|
+|Add manually|`sub_rec_show_add_menu()` / `sub_rec_add_manual()`|protocol list enumerated from the firmware registry, not a hardcoded table; stock's serialize-then-overwrite-Bit/Key trick (`subghz_txrx_gen_data_protocol`); validated by a trial deserialize; `TE` forced to 400 us when the protocol has one|
+|Browse all of /ext/subghz|`sub_rec_do_browse(app, root)`, Saved > Browse SD card|the batch deletes deliberately stay `auto_rec`-scoped|
+|Hopper|`sub_rec_hopper_step()` at stock `subghz_txrx_hopper_update()`'s own numbers|list copied out of a throwaway `SubGhzSetting` which is then freed; `hop_freq` never touches the persisted frequency|
+|Sound + Alert|`sub_rec_speaker_on/off()`, `sub_rec_alert()`|stock's mirror-before-`start_async_rx` order; the alert parks the speaker and stops `rssi_timer` around `notification_message_block()` (invariant 6)|
+|Protocol ignore list|OK on the Listening screen + Settings > Ignore|the drop happens at capture end via `sub_rec_is_ignored()`, the same write-then-remove shape as dedup|
+
+**Menu rows moved.** Main menu is now Auto-record / Frequency scan /
+Settings / Saved signals / **Add manually** / Exit (Exit is row 5, was 4).
+Saved signals is now Browse captures / **Browse SD card** / Stats / Clear
+all / Delete RAW / Delete decoded / Delete _RC / Back. Settings gained
+Hopping / Sound / Alert (rows 3-5) and Keystore (last row), with Ignore at
+row 9 and Profiles at row 10 (`REC_SETTINGS_ROW_*`). Every blind
+`down`-counting sequence recorded earlier in this file for this module is
+off by one or more past those points — re-derive, don't reuse.
+
+**Heap margin is this module's real constraint, measured 2026-10-02**
+(Momentum `mntm-dev` 8ed809fb, `free` over CLI at the module's own menu,
+baseline build): `Free heap 16488 / Minimum 2448`. The parsed KeeLoq
+database is resident for the whole module session and runs to several KB,
+so loading it by default would push the enter path through a near-zero
+margin — which is what the one enter-time reboot observed this session
+looked like. Hence Keystore is a row, default Off, loaded after the config
+read rather than in `sub_rec_radio_alloc()`. The hopper list is copied
+into a fixed 32-entry array and the `SubGhzSetting` freed for the same
+reason. **Re-measure `free` at the module menu before turning Keystore On,
+and again after any new resident allocation in this module.**
+
+**macOS host findings (this session; the testing notes above assume the
+Windows COM port).** The device is `/dev/cu.usbmodemflip_Farhad1`.
+**Opening that port with DTR asserted resets the board** — every plain
+pyserial open is a cold boot, which is why early single-connection probes
+"worked" and why multi-connection scripts saw phantom reboots. Open with
+`serial.Serial()` + set `port`/`baudrate`/`timeout` + `s.dtr=False;
+s.rts=False` + `s.open()`. An abandoned RPC session (process exit
+mid-session, or a `log debug` stream killed by a port close) leaves the
+CLI deaf afterwards; `\x03` does not recover it. Worst case observed:
+after several abandoned RPC/screen-stream sessions the device boots to
+the logo and the CLI never answers again on either port node. **At the
+end of this session the device is in exactly that state and needs a
+physical reset / SD reseat**; everything marked unverified below is
+unverified for that reason, not for lack of trying.
+
+**Verified this session (host side):** `ufbt -c && ufbt` clean from
+scratch, zero warnings, `APPCHK` Target 7 / API 87.1; FAP md5-verified on
+the SD via `storage md5` against the local file; `make test` in `test/`
+green including the new `test_recorder_parse` (18 assertions, 0 failed)
+under `-std=c11 -Wall -Wextra -Werror`; the mandated invariant greps clean
+(`view_dispatcher_stop` only in the `module_mode`-guarded Exit branch,
+`with_view_model` only in `recorder_ui.c` outside comments). RPC screen
+captures (page-tiled decode) confirmed the launcher and GPIO module render
+and that RPC input injection navigates menus, and confirmed the *baseline*
+build enters this module and survives a screen snapshot.
+
+**Not verified on device (device unreachable at session end):** every
+behavioural item — hopper `log debug` lines, the ignore add/drop round
+trip, an Add-manually file on the SD, the live readout on screen,
+Sound/Alert's audible/visible effect, a Browse-SD-card pick, a keystore
+load with the row On, and the whole hygiene block (`top` thread
+disjointness, `free` minimum with the new resident allocations,
+enter/exit-cycle uptime). The single enter-time reboot seen on the
+keystore-On build is **reported, not root-caused**: the heap-margin
+mechanism above fits the measurements but is a hypothesis, and the
+serial/RPC fragility documented above means some of this session's reboot
+observations may be host-side artifacts rather than app faults. Re-run the
+physical-access checklist below with the Keystore row Off and On before
+trusting either reading.
+
 ---
 
 # Universal Toolkit

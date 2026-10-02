@@ -27,15 +27,22 @@ EMVEMU_BIN := $(BUILD_DIR)/test_emv_emulate
 EMVEMU_SRCS := test_emv_emulate.c $(CARD_DIR)/emv_emulate.c
 EMVEMU_DEPS := framework/test_framework.h $(CARD_DIR)/emv_emulate.h
 
-CFLAGS := -std=c11 -Wall -Wextra -Werror -I$(BLE_DIR) $(CARD_CFLAGS)
+# Test 5: subghz recorder live-readout frame parsing
+REC_DIR := ../universal_toolkit/subghz_auto_recorder
+PARSE_BIN := $(BUILD_DIR)/test_recorder_parse
+PARSE_SRCS := test_recorder_parse.c $(REC_DIR)/recorder_parse.c
+PARSE_DEPS := framework/test_framework.h $(REC_DIR)/recorder_parse.h
+
+CFLAGS := -std=c11 -Wall -Wextra -Werror -I$(BLE_DIR) $(CARD_CFLAGS) -I$(REC_DIR)
 
 .PHONY: test clean
 
-test: $(BLE_BIN) $(FIDE_BIN) $(ROUND_BIN) $(EMVEMU_BIN)
+test: $(BLE_BIN) $(FIDE_BIN) $(ROUND_BIN) $(EMVEMU_BIN) $(PARSE_BIN)
 	./$(BLE_BIN)
 	./$(FIDE_BIN)
 	./$(ROUND_BIN)
 	./$(EMVEMU_BIN)
+	./$(PARSE_BIN)
 
 $(BLE_BIN): $(BLE_SRCS) $(BLE_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $(BLE_SRCS)
@@ -48,6 +55,9 @@ $(ROUND_BIN): $(ROUND_SRCS) $(CARD_DEPS) | $(BUILD_DIR)
 
 $(EMVEMU_BIN): $(EMVEMU_SRCS) $(EMVEMU_DEPS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $(EMVEMU_SRCS)
+
+$(PARSE_BIN): $(PARSE_SRCS) $(PARSE_DEPS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $(PARSE_SRCS)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)

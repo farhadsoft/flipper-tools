@@ -22,6 +22,7 @@
 #include <dialogs/dialogs.h>
 #include <lib/subghz/blocks/generic.h>
 #include <lib/toolbox/strint.h>
+#include <lib/subghz/subghz_protocol_registry.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,7 +61,13 @@ static const char* const sub_rec_max_min_labels[] =
     {"Off", "1 min", "5 min", "10 min", "30 min", "60 min"};
 
 void sub_rec_format_freq_line(SubRecApp* app, char* out, size_t out_size) {
-    uint32_t f = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
+    // hop_freq wins while hopping: it is the frequency the radio is actually
+    // on, so the on-screen line and the file a capture is saved under agree.
+    // It is deliberately NOT written back to freq_idx/custom_freq -- those are
+    // what the config persists, and a hopping session must not silently
+    // change the user's configured frequency.
+    uint32_t f = app->hop_freq;
+    if(!f) f = app->custom_freq ? app->custom_freq : sub_rec_freqs[app->freq_idx];
     snprintf(
         out,
         out_size,
@@ -214,6 +221,10 @@ static void sub_rec_handle_rssi_tick(SubRecApp* app) {
     app->last_above = above;
     app->last_state = app->state;
     sub_rec_set_rssi(app, rssi, redraw && !app->notice_active);
+    // Live decoded readout: publish whatever the worker thread decoded since
+    // the last tick. Placed before the notice check so a message overlaying
+    // the status view cannot stall the signal line underneath it.
+    sub_rec_live_publish(app);
 
     // A notice overlays the status view; never start a capture behind it.
     if(app->notice_active) return;
@@ -226,6 +237,12 @@ static void sub_rec_handle_rssi_tick(SubRecApp* app) {
         // on a torn-down radio -- exactly the truncated-capture-on-limit bug
         // this feature exists to prevent.
         if(app->state != SubRecStateArmed) return;
+        // A hop moves the radio to a different frequency, so this tick's
+        // `above` was measured on the old one: return rather than capture on a
+        // stale reading (invariant 7's shape again). sub_rec_hopper_step()
+        // only ever runs from here, so it cannot hop during Recording -- a
+        // capture in flight is untouchable -- nor during the post-cap cooldown.
+        if(app->hopping && !app->cooldown && sub_rec_hopper_step(app)) return;
         if(app->cooldown) {
             // The previous capture was ended by CAPTURE_MAX_MS while the
             // carrier was still up. Re-arm only on a real sub-threshold
@@ -363,16 +380,28 @@ static void sub_rec_read_note(SubRecApp* app) {
 // dispatcher's 16-deep queue and blocks the TimersSrv thread for the whole
 // dialog. Nothing here is periodic that fast, but the same rule applies to
 // rssi_timer's 25 ms tick even more directly.
-static void sub_rec_do_browse(SubRecApp* app) {
+//
+// `base` scopes the browser: REC_DIR for this app's own captures,
+// SUBGHZ_APP_FOLDER for the whole /ext/subghz tree -- which is what makes the
+// stock Sub-GHz app's own saved signals replayable and analyzable here.
+// Everything past the pick (Replay/Analyze/Label/Rename/Delete) works on the
+// absolute path in app->selected_path, so none of it cares which root the
+// file came from; the batch deletes stay REC_DIR-scoped on purpose, since
+// they were never meant to reach into the stock app's own saves.
+static void sub_rec_do_browse(SubRecApp* app, const char* root) {
     furi_timer_stop(app->rssi_timer);
     furi_timer_stop(app->tx_timer);
     furi_timer_stop(app->notice_timer);
     sub_rec_ensure_dir(app);
 
-    FuriString* path = furi_string_alloc_set_str(REC_DIR);
+    // `root`, not `base`: this function's tail already has a local `base`
+    // meaning "basename of the picked file", and shadowing it with a
+    // different-meaning parameter of the same name is how paths get built
+    // from the wrong half.
+    FuriString* path = furi_string_alloc_set_str(root);
     DialogsFileBrowserOptions opts;
     dialog_file_browser_set_basic_options(&opts, ".sub", NULL); // initialises every field
-    opts.base_path = REC_DIR;
+    opts.base_path = root;
 
     DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
     bool picked = dialog_file_browser_show(dialogs, path, path, &opts);
@@ -1094,6 +1123,42 @@ static void sub_rec_dedup_changed(VariableItem* item) {
     variable_item_set_current_value_text(item, sub_rec_onoff[idx]);
 }
 
+// All three are stock receiver-config rows with stock's own two-state
+// semantics. None takes effect until the next listen session starts, which
+// is exactly when sub_rec_listen_start() reads them -- changing Hopping or
+// Sound mid-session would mean tearing down a radio that is possibly
+// recording, for no benefit.
+static void sub_rec_hopping_changed(VariableItem* item) {
+    SubRecApp* app = variable_item_get_context(item);
+    size_t idx = variable_item_get_current_value_index(item);
+    app->hopping = (idx != 0);
+    variable_item_set_current_value_text(item, sub_rec_onoff[idx]);
+}
+
+static void sub_rec_sound_changed(VariableItem* item) {
+    SubRecApp* app = variable_item_get_context(item);
+    size_t idx = variable_item_get_current_value_index(item);
+    app->sound = (idx != 0);
+    variable_item_set_current_value_text(item, sub_rec_onoff[idx]);
+}
+
+static void sub_rec_alert_changed(VariableItem* item) {
+    SubRecApp* app = variable_item_get_context(item);
+    size_t idx = variable_item_get_current_value_index(item);
+    app->alert = (idx != 0);
+    variable_item_set_current_value_text(item, sub_rec_onoff[idx]);
+}
+
+// Off by default: the parsed database is resident for the whole module
+// session and this module's heap margin is measured in low kilobytes -- see
+// sub_rec_keystore_load()'s own comment for the number.
+static void sub_rec_keystore_changed(VariableItem* item) {
+    SubRecApp* app = variable_item_get_context(item);
+    size_t idx = variable_item_get_current_value_index(item);
+    app->keystore = (idx != 0);
+    variable_item_set_current_value_text(item, sub_rec_onoff[idx]);
+}
+
 /* --------------------------- dispatcher wiring -------------------------- */
 
 // Back that no view consumed. Runs on the GUI thread (input path), so
@@ -1153,14 +1218,29 @@ bool sub_rec_navigation_callback(void* context) {
         return true;
     }
 
-    if(app->current_view == SubRecViewProfiles) {
-        sub_rec_switch_view(app, SubRecViewSettings); // entered from Settings
+    if(app->current_view == SubRecViewProfiles || app->current_view == SubRecViewIgnore) {
+        sub_rec_switch_view(app, SubRecViewSettings); // both entered from Settings
         return true;
     }
 
-    if(app->current_view == SubRecViewSettings || app->current_view == SubRecViewNumber ||
-       app->current_view == SubRecViewFileMenu || app->current_view == SubRecViewText ||
-       app->current_view == SubRecViewSaved) {
+    // Add manually backs out one step at a time: key editor to the protocol
+    // picker, picker to the main menu. Both row sets are still populated, so
+    // this is a plain view switch with nothing to rebuild.
+    if(app->current_view == SubRecViewByte) {
+        sub_rec_switch_view(app, SubRecViewAddProto);
+        return true;
+    }
+
+    // The NumberInput is shared by two flows -- custom frequency and the
+    // add-manually bit count -- so Back has to return to whichever opened it.
+    if(app->current_view == SubRecViewNumber) {
+        sub_rec_switch_view(app, app->number_is_add ? SubRecViewAddProto : SubRecViewMenu);
+        return true;
+    }
+
+    if(app->current_view == SubRecViewSettings || app->current_view == SubRecViewFileMenu ||
+       app->current_view == SubRecViewText || app->current_view == SubRecViewSaved ||
+       app->current_view == SubRecViewAddProto) {
         sub_rec_switch_view(app, SubRecViewMenu);
         return true;
     }
@@ -1218,6 +1298,17 @@ static bool sub_rec_status_input_callback(InputEvent* event, void* context) {
         }
         if(id == 0) return false; // Back must keep falling through to the nav callback
         view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_MAKE(id, app->toolkit->gen));
+        return true;
+    }
+
+    // OK while listening ignores the protocol on screen -- the one gesture
+    // that matters here, because the noise protocol you want gone is the one
+    // you are looking at. Back, and every other key, still falls through to
+    // the navigation callback, which is what stops the radio.
+    if((app->state == SubRecStateArmed || app->state == SubRecStateRecording) &&
+       event->key == InputKeyOk) {
+        view_dispatcher_send_custom_event(
+            app->view_dispatcher, EVENT_MAKE(SubRecEventIgnoreAdd, app->toolkit->gen));
         return true;
     }
     return false;
@@ -1286,6 +1377,40 @@ static void sub_rec_config_load(SubRecApp* app) {
         flipper_format_rewind(ff);
         bool dedup = false;
         if(flipper_format_read_bool(ff, "Dedup", &dedup, 1)) app->dedup = dedup;
+        flipper_format_rewind(ff);
+        bool keystore = false;
+        if(flipper_format_read_bool(ff, "Keystore", &keystore, 1)) app->keystore = keystore;
+
+        flipper_format_rewind(ff);
+        bool hopping = false;
+        if(flipper_format_read_bool(ff, "Hopping", &hopping, 1)) app->hopping = hopping;
+        flipper_format_rewind(ff);
+        bool sound = false;
+        if(flipper_format_read_bool(ff, "Sound", &sound, 1)) app->sound = sound;
+        flipper_format_rewind(ff);
+        bool alert = false;
+        if(flipper_format_read_bool(ff, "Alert", &alert, 1)) app->alert = alert;
+
+        // Repeated key, one protocol name per row. Unlike the Profile rows
+        // above there is no field splitting: FlipperFormat reads a string
+        // value to the end of the line, so a name with spaces in it
+        // ("Security+ 2.0") round-trips and is compared verbatim against
+        // SubGhzProtocol::name. A version-1 file simply has none of these
+        // five keys and every one keeps its compiled default, which is why
+        // REC_CONF_VERSION did not need bumping.
+        flipper_format_rewind(ff);
+        FuriString* ign = furi_string_alloc();
+        while(app->ignore_n < REC_IGNORE_MAX && flipper_format_read_string(ff, "Ignore", ign)) {
+            if(!furi_string_empty(ign)) {
+                snprintf(
+                    app->ignore[app->ignore_n],
+                    REC_IGNORE_NAME_MAX,
+                    "%s",
+                    furi_string_get_cstr(ign));
+                app->ignore_n++;
+            }
+        }
+        furi_string_free(ign);
 
         // Repeated key, one row per saved profile: "name freq mod trigger".
         // Reading uses the same successive-flipper_format_read_string() idiom
@@ -1351,6 +1476,15 @@ static void sub_rec_config_save(SubRecApp* app) {
              flipper_format_write_uint32(ff, "MaxMinutes", &maxmin, 1);
         bool dedup = app->dedup;
         ok = ok && flipper_format_write_bool(ff, "Dedup", &dedup, 1);
+        bool hopping = app->hopping, sound = app->sound, alert = app->alert;
+        bool keystore = app->keystore;
+        ok = ok && flipper_format_write_bool(ff, "Hopping", &hopping, 1) &&
+             flipper_format_write_bool(ff, "Sound", &sound, 1) &&
+             flipper_format_write_bool(ff, "Alert", &alert, 1) &&
+             flipper_format_write_bool(ff, "Keystore", &keystore, 1);
+        for(uint8_t i = 0; ok && i < app->ignore_n; i++) {
+            ok = flipper_format_write_string_cstr(ff, "Ignore", app->ignore[i]);
+        }
 
         char line[REC_PROFILE_NAME_MAX + 24];
         for(uint8_t i = 0; ok && i < app->profile_n; i++) {
@@ -1488,6 +1622,189 @@ static void sub_rec_profile_save_start(SubRecApp* app) {
     sub_rec_switch_view(app, SubRecViewText);
 }
 
+
+/* --------------------------- protocol ignore list ----------------------- */
+
+// The Ignore row's text is the list length, and three paths change it.
+static void sub_rec_ignore_sync(SubRecApp* app) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%u", app->ignore_n);
+    variable_item_set_current_value_text(app->ignore_item, buf);
+}
+
+// GUI thread. Adds the protocol of the last decode -- the one on screen -- to
+// the ignore list. A capture that decodes as an ignored protocol is removed
+// at capture end (recorder_radio.c: sub_rec_is_ignored()), so the RAW file is
+// still written first: the same write-then-remove shape the dedup gate uses,
+// which is what keeps a false decode on noise from ever costing a real
+// capture that happened to share the burst.
+static void sub_rec_ignore_add_current(SubRecApp* app) {
+    if(app->ignore_n >= REC_IGNORE_MAX) {
+        sub_rec_show_notice(app, "Ignore full", "remove one first", "", SubRecViewStatus, 0);
+        return;
+    }
+    // app->decoded is written on the SubGhzWorker thread but only ever points
+    // at one of the receiver's own decoder instances, which live exactly as
+    // long as the receiver does; protocol->name is a static string in the
+    // firmware's protocol table. sub_rec_listen_start() clears it, so a
+    // session that has decoded nothing yet cannot ignore an invisible one.
+    const char* name = app->decoded ? app->decoded->protocol->name : NULL;
+    if(!name || !name[0]) {
+        sub_rec_show_notice(app, "No signal yet", "nothing to ignore", "", SubRecViewStatus, 0);
+        return;
+    }
+    for(uint8_t i = 0; i < app->ignore_n; i++) {
+        if(strcmp(app->ignore[i], name) == 0) {
+            sub_rec_show_notice(app, "Already ignored", name, "", SubRecViewStatus, 0);
+            return;
+        }
+    }
+    snprintf(app->ignore[app->ignore_n], REC_IGNORE_NAME_MAX, "%s", name);
+    app->ignore_n++;
+    sub_rec_config_save(app); // persist now: a crash must not resurrect the noise
+    sub_rec_ignore_sync(app);
+    FURI_LOG_I(TAG, "ignore: +%s (%u)", name, app->ignore_n);
+    sub_rec_show_notice(app, "Ignoring", name, "its captures drop", SubRecViewStatus, 0);
+}
+
+// Row rebuild only, no view switch -- so the remove/clear paths below can
+// refresh the list before a notice covers it, and the notice's return to
+// SubRecViewIgnore lands on correct rows instead of stale ones.
+static void sub_rec_ignore_rows(SubRecApp* app) {
+    submenu_reset(app->ignore_menu);
+    submenu_set_header(app->ignore_menu, "OK=un-ignore");
+    for(uint8_t i = 0; i < app->ignore_n; i++) {
+        submenu_add_item(
+            app->ignore_menu,
+            app->ignore[i],
+            SubRecEventIgnoreSlot0 + i,
+            sub_rec_menu_callback,
+            app);
+    }
+    submenu_add_item(
+        app->ignore_menu, "Clear all", SubRecEventIgnoreClear, sub_rec_menu_callback, app);
+    // Reuses the Settings row's own handler, exactly as sub_rec_show_profiles()
+    // does, so the Back row and the Back button agree on the destination.
+    submenu_add_item(
+        app->ignore_menu, "Back", SubRecEventMenuSettings, sub_rec_menu_callback, app);
+    submenu_set_selected_item(app->ignore_menu, 0);
+}
+
+static void sub_rec_show_ignore(SubRecApp* app) {
+    sub_rec_ignore_rows(app);
+    sub_rec_switch_view(app, SubRecViewIgnore);
+}
+
+// `index` is SubRecEventIgnoreSlot0 + slot, matched as a range in
+// sub_rec_custom_event_callback().
+static void sub_rec_ignore_remove(SubRecApp* app, uint32_t index) {
+    uint8_t slot = (uint8_t)(index - SubRecEventIgnoreSlot0);
+    if(slot >= app->ignore_n) return; // list shrank under a stale press
+    char name[REC_IGNORE_NAME_MAX];
+    snprintf(name, sizeof(name), "%s", app->ignore[slot]);
+    for(uint8_t i = slot; i + 1 < app->ignore_n; i++) {
+        memcpy(app->ignore[i], app->ignore[i + 1], REC_IGNORE_NAME_MAX);
+    }
+    app->ignore_n--;
+    sub_rec_config_save(app);
+    sub_rec_ignore_sync(app);
+    sub_rec_ignore_rows(app);
+    FURI_LOG_I(TAG, "ignore: -%s (%u)", name, app->ignore_n);
+    sub_rec_show_notice(app, "Un-ignored", name, "", SubRecViewIgnore, 0);
+}
+
+// No confirmation, unlike the capture wipes: nothing on the SD is touched and
+// re-adding a name is one OK press away on the listening screen.
+static void sub_rec_ignore_clear(SubRecApp* app) {
+    uint8_t n = app->ignore_n;
+    app->ignore_n = 0;
+    sub_rec_config_save(app);
+    sub_rec_ignore_sync(app);
+    sub_rec_ignore_rows(app);
+    FURI_LOG_I(TAG, "ignore: cleared %u", n);
+    sub_rec_show_notice(app, "Ignore cleared", "", "", SubRecViewIgnore, 0);
+}
+
+/* ------------------------------ add manually --------------------------- */
+
+static void sub_rec_add_key_result(void* context) {
+    SubRecApp* app = context;
+    sub_rec_add_manual(app, app->add_names[app->add_sel], app->add_bits, app->add_key);
+}
+
+static void sub_rec_add_bits_result(void* context, int32_t number) {
+    SubRecApp* app = context;
+    // NumberInput clamps to the range it was given, but the bound is enforced
+    // here too rather than trusted: a bit count above 64 cannot be expressed
+    // in the 8-byte Key field the .sub format fixes, and would be written as
+    // a silently truncated key.
+    if(number < 1) number = 1;
+    if(number > 64) number = 64;
+    app->add_bits = (uint8_t)number;
+    memset(app->add_key, 0, sizeof(app->add_key));
+    byte_input_set_header_text(app->byte_input, app->add_names[app->add_sel]);
+    byte_input_set_result_callback(
+        app->byte_input,
+        sub_rec_add_key_result,
+        NULL,
+        app,
+        app->add_key,
+        (uint8_t)sizeof(app->add_key));
+    sub_rec_switch_view(app, SubRecViewByte);
+}
+
+static void sub_rec_handle_add_pick(SubRecApp* app, uint32_t index) {
+    uint8_t slot = (uint8_t)(index - SubRecEventAddSlot0);
+    if(slot >= app->add_n) return; // list rebuilt under a stale press
+    app->add_sel = slot;
+    app->number_is_add = true; // Back from the bit count returns to the picker
+    number_input_set_header_text(app->number, app->add_names[slot]);
+    number_input_set_result_callback(
+        app->number, sub_rec_add_bits_result, app, REC_ADD_DEFAULT_BITS, 1, 64);
+    sub_rec_switch_view(app, SubRecViewNumber);
+}
+
+// Enumerated from the firmware's own registry rather than a hardcoded table,
+// so the list cannot go stale against a fork that ships more protocols --
+// which is exactly the drift CLAUDE.md's STEP 0 block documents for
+// NfcProtocol and LFRFIDProtocol.
+//
+// The encodability test is deliberately the fork-safe one. SubGhzProtocol's
+// `encoder` POINTER offset is identical in official 1.4.3 and Momentum
+// @8ed809fb (Momentum appends `filter` at the END of the struct,
+// lib/subghz/types.h), but the SubGhzProtocolEncoder behind it is a fork
+// surface -- so this only ever compares that pointer to NULL and never
+// dereferences it. A protocol that passes here and still cannot encode is
+// caught by sub_rec_add_manual()'s own deserialize validation, which goes
+// through the firmware's registry lookup instead of our struct layout.
+static void sub_rec_show_add_menu(SubRecApp* app) {
+    app->add_n = 0;
+    size_t total = subghz_protocol_registry_count(&subghz_protocol_registry);
+    for(size_t i = 0; i < total && app->add_n < REC_ADD_PROTO_MAX; i++) {
+        const SubGhzProtocol* p =
+            subghz_protocol_registry_get_by_index(&subghz_protocol_registry, i);
+        if(!p || !p->name || !p->encoder) continue;
+        if((p->flag & SubGhzProtocolFlag_Send) != SubGhzProtocolFlag_Send) continue;
+        // sub_rec_add_manual() builds the file by serializing this decoder, so
+        // a protocol this receiver does not hold cannot be added at all.
+        if(!subghz_receiver_search_decoder_base_by_name(app->receiver, p->name)) continue;
+        app->add_names[app->add_n++] = p->name;
+    }
+
+    submenu_reset(app->add_menu);
+    submenu_set_header(app->add_menu, "Add manually");
+    for(uint8_t i = 0; i < app->add_n; i++) {
+        submenu_add_item(
+            app->add_menu, app->add_names[i], SubRecEventAddSlot0 + i, sub_rec_menu_callback, app);
+    }
+    // No Back row: the Back button reaches the main menu through the
+    // navigation callback, and stock's own protocol picker has no Back row
+    // either.
+    submenu_set_selected_item(app->add_menu, 0);
+    sub_rec_switch_view(app, SubRecViewAddProto);
+    FURI_LOG_I(TAG, "add: %u of %u protocols encodable", app->add_n, (unsigned)total);
+}
+
 // One callback for the whole list; index is the row's list position
 // (0 = Frequency), not its value-index. Only the Frequency row, and only
 // when its current value is the "Custom" slot, routes anywhere.
@@ -1507,9 +1824,11 @@ static void sub_rec_settings_enter_callback(void* context, uint32_t index) {
             (int32_t)(current / 1000),
             300000,
             928000);
+        app->number_is_add = false; // Back must return here, not to Add manually
         sub_rec_switch_view(app, SubRecViewNumber);
         return;
     }
+    if(index == REC_SETTINGS_ROW_IGNORE) sub_rec_show_ignore(app);
     if(index == REC_SETTINGS_ROW_PROFILES) sub_rec_show_profiles(app);
 }
 
@@ -1543,6 +1862,22 @@ static void sub_rec_build_settings(SubRecApp* app) {
     variable_item_set_current_value_text(item, sub_rec_trigger_labels[app->trigger_idx]);
     app->trigger_item = item;
 
+    // Stock's three receiver-config rows, at stock's own two-state semantics.
+    item = variable_item_list_add(
+        app->settings, "Hopping", (uint8_t)COUNT_OF(sub_rec_onoff), sub_rec_hopping_changed, app);
+    variable_item_set_current_value_index(item, app->hopping ? 1 : 0);
+    variable_item_set_current_value_text(item, sub_rec_onoff[app->hopping ? 1 : 0]);
+
+    item = variable_item_list_add(
+        app->settings, "Sound", (uint8_t)COUNT_OF(sub_rec_onoff), sub_rec_sound_changed, app);
+    variable_item_set_current_value_index(item, app->sound ? 1 : 0);
+    variable_item_set_current_value_text(item, sub_rec_onoff[app->sound ? 1 : 0]);
+
+    item = variable_item_list_add(
+        app->settings, "Alert", (uint8_t)COUNT_OF(sub_rec_onoff), sub_rec_alert_changed, app);
+    variable_item_set_current_value_index(item, app->alert ? 1 : 0);
+    variable_item_set_current_value_text(item, sub_rec_onoff[app->alert ? 1 : 0]);
+
     item = variable_item_list_add(
         app->settings,
         "Max captures",
@@ -1569,16 +1904,40 @@ static void sub_rec_build_settings(SubRecApp* app) {
     // values_count 1, not 0: variable_item_list_process_right() compares
     // against (values_count - 1) as uint8_t, so 0 would underflow to 255.
     // With 1 the value cannot move and the row acts as a plain enter-row.
+    app->ignore_item = variable_item_list_add(app->settings, "Ignore", 1, NULL, app);
+    sub_rec_ignore_sync(app);
+
     item = variable_item_list_add(app->settings, "Profiles", 1, NULL, app);
     variable_item_set_current_value_text(item, ">");
+
+    item = variable_item_list_add(
+        app->settings, "Keystore", (uint8_t)COUNT_OF(sub_rec_onoff), sub_rec_keystore_changed, app);
+    variable_item_set_current_value_index(item, app->keystore ? 1 : 0);
+    variable_item_set_current_value_text(item, sub_rec_onoff[app->keystore ? 1 : 0]);
 
     variable_item_list_set_enter_callback(app->settings, sub_rec_settings_enter_callback, app);
 }
 
 bool sub_rec_custom_event_callback(void* context, uint32_t event) {
     SubRecApp* app = context;
+    uint32_t id = EVENT_ID(event);
 
-    switch(EVENT_ID(event)) {
+    // Slot rows carry their index inside the event id itself (the
+    // SubRecEvent*Slot0 bases in recorder_app.h), so they are ranges and the
+    // switch below -- which can only match one exact id -- cannot serve them.
+    // The three ranges are disjoint and none of them reaches 256, which
+    // EVENT_MAKE's generation packing requires. SubRecEventProfileSlot0 needs
+    // no range here: its rows post SubRecEventProfilePick instead.
+    if(id >= SubRecEventIgnoreSlot0 && id < SubRecEventIgnoreSlot0 + REC_IGNORE_MAX) {
+        sub_rec_ignore_remove(app, id);
+        return true;
+    }
+    if(id >= SubRecEventAddSlot0 && id < SubRecEventAddSlot0 + REC_ADD_PROTO_MAX) {
+        sub_rec_handle_add_pick(app, id);
+        return true;
+    }
+
+    switch(id) {
     case SubRecEventRssiTick:
         sub_rec_handle_rssi_tick(app);
         return true;
@@ -1647,7 +2006,10 @@ bool sub_rec_custom_event_callback(void* context, uint32_t event) {
         sub_rec_switch_view(app, SubRecViewMenu);
         return true;
     case SubRecEventSavedBrowse:
-        sub_rec_do_browse(app);
+        sub_rec_do_browse(app, REC_DIR);
+        return true;
+    case SubRecEventSavedBrowseAll:
+        sub_rec_do_browse(app, SUBGHZ_APP_FOLDER);
         return true;
     case SubRecEventSavedClearAll:
         sub_rec_clear_start(app, REC_CLEAR_ALL);
@@ -1672,6 +2034,15 @@ bool sub_rec_custom_event_callback(void* context, uint32_t event) {
         return true;
     case SubRecEventConfirmNo:
         sub_rec_show_saved_menu(app);
+        return true;
+    case SubRecEventMenuAdd:
+        sub_rec_show_add_menu(app);
+        return true;
+    case SubRecEventIgnoreAdd:
+        sub_rec_ignore_add_current(app);
+        return true;
+    case SubRecEventIgnoreClear:
+        sub_rec_ignore_clear(app);
         return true;
     default:
         return false;
@@ -1710,6 +2081,7 @@ SubRecApp* sub_rec_app_alloc(ViewDispatcher* view_dispatcher) {
     submenu_add_item(app->menu, "Frequency scan", SubRecEventMenuScan, sub_rec_menu_callback, app);
     submenu_add_item(app->menu, "Settings", SubRecEventMenuSettings, sub_rec_menu_callback, app);
     submenu_add_item(app->menu, "Saved signals", SubRecEventMenuSaved, sub_rec_menu_callback, app);
+    submenu_add_item(app->menu, "Add manually", SubRecEventMenuAdd, sub_rec_menu_callback, app);
     submenu_add_item(app->menu, "Exit", SubRecEventMenuExit, sub_rec_menu_callback, app);
 
     app->file_menu = submenu_alloc();
@@ -1729,7 +2101,11 @@ SubRecApp* sub_rec_app_alloc(ViewDispatcher* view_dispatcher) {
         app->view_dispatcher, app->view_base + SubRecViewSaved, submenu_get_view(app->saved_menu));
     submenu_set_header(app->saved_menu, "Saved signals");
     submenu_add_item(
-        app->saved_menu, "Browse files", SubRecEventSavedBrowse, sub_rec_menu_callback, app);
+        app->saved_menu, "Browse captures", SubRecEventSavedBrowse, sub_rec_menu_callback, app);
+    // The whole /ext/subghz tree, which is what makes the stock Sub-GHz app's
+    // own saves replayable and analyzable here.
+    submenu_add_item(
+        app->saved_menu, "Browse SD card", SubRecEventSavedBrowseAll, sub_rec_menu_callback, app);
     submenu_add_item(app->saved_menu, "Stats", SubRecEventSavedStats, sub_rec_menu_callback, app);
     submenu_add_item(
         app->saved_menu, "Clear all", SubRecEventSavedClearAll, sub_rec_menu_callback, app);
@@ -1765,6 +2141,29 @@ SubRecApp* sub_rec_app_alloc(ViewDispatcher* view_dispatcher) {
         app->view_base + SubRecViewProfiles,
         submenu_get_view(app->profiles_menu));
 
+    // Rows are added per entry by sub_rec_show_ignore(), same reason as the
+    // profiles menu above.
+    app->ignore_menu = submenu_alloc();
+    view_dispatcher_add_view(
+        app->view_dispatcher,
+        app->view_base + SubRecViewIgnore,
+        submenu_get_view(app->ignore_menu));
+
+    // Rows are added per entry by sub_rec_show_add_menu(): the encodable
+    // protocol list comes from the firmware's registry, so it is not a
+    // compile-time row set.
+    app->add_menu = submenu_alloc();
+    view_dispatcher_add_view(
+        app->view_dispatcher,
+        app->view_base + SubRecViewAddProto,
+        submenu_get_view(app->add_menu));
+
+    app->byte_input = byte_input_alloc();
+    view_dispatcher_add_view(
+        app->view_dispatcher,
+        app->view_base + SubRecViewByte,
+        byte_input_get_view(app->byte_input));
+
     app->settings = variable_item_list_alloc();
     view_dispatcher_add_view(
         app->view_dispatcher,
@@ -1792,6 +2191,14 @@ SubRecApp* sub_rec_app_alloc(ViewDispatcher* view_dispatcher) {
     app->capture_path = furi_string_alloc();
     app->selected_path = furi_string_alloc();
 
+    // Guards live_proto/live_key/live_new between the SubGhzWorker thread
+    // (sub_rec_live_snapshot) and the GUI thread (sub_rec_live_publish).
+    // Allocated before sub_rec_radio_alloc() below: that is what starts the
+    // worker whose callback takes it, so it must already exist.
+    app->live_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    furi_check(app->live_mutex);
+    app->notify = furi_record_open(RECORD_NOTIFICATION);
+
     app->freq_idx = SUB_REC_FREQ_DEFAULT_IDX;
     app->mod_idx = 0;
     app->trigger_idx = SUB_REC_TRIGGER_DEFAULT_IDX;
@@ -1800,6 +2207,10 @@ SubRecApp* sub_rec_app_alloc(ViewDispatcher* view_dispatcher) {
 
     sub_rec_radio_alloc(app);
     sub_rec_config_load(app);
+    // After the config load on purpose: the row that gates this is read there,
+    // and the load is several KB of resident heap the module only pays for
+    // when the user asked for the KeeLoq family.
+    if(app->keystore) sub_rec_keystore_load(app);
     sub_rec_build_settings(app);
 
     return app;
@@ -1843,10 +2254,23 @@ void sub_rec_app_free(SubRecApp* app) {
     number_input_free(app->number);
     view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewText);
     text_input_free(app->text);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewIgnore);
+    submenu_free(app->ignore_menu);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewAddProto);
+    submenu_free(app->add_menu);
+    view_dispatcher_remove_view(app->view_dispatcher, app->view_base + SubRecViewByte);
+    byte_input_free(app->byte_input);
 
     furi_string_free(app->capture_path);
     furi_string_free(app->selected_path);
     furi_string_free(app->preset.base.name);
+    // No sub_rec_speaker_off() here on purpose: sub_rec_radio_free() above has
+    // already run subghz_devices_deinit(), so touching app->device past this
+    // point would be a use-after-deinit. sub_rec_app_free() always calls
+    // sub_rec_listen_stop() first, and that is the sole path that can leave
+    // speaker_held set.
+    furi_mutex_free(app->live_mutex);
+    furi_record_close(RECORD_NOTIFICATION);
 
     sub_rec_config_save(app);
     furi_record_close(RECORD_STORAGE);

@@ -14,7 +14,7 @@ App(
     fap_category="Tools",
     fap_description="Launcher shell for the Flipper Zero tool modules in this repo.",
     fap_author="farhadsoft",
-    fap_version="0.2",
+    fap_version="0.3",
     fap_icon="icon.png",
     sources=[
         "toolkit.c",
